@@ -1,0 +1,113 @@
+/* Grade Tracker - History view (append-only change log).
+ * Colors come only from the custom properties in css/base.css (light + dark). */
+
+.hist-explain { display: flex; gap: 8px; align-items: flex-start; margin: -4px 0 0; font-size: 13px; }
+.hist-explain .icon { margin-top: 2px; color: var(--info); }
+
+/* ------------------------------------------------------------------ filters */
+
+.hist-filters .card-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 16px; }
+.hist-filter-row { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-end; }
+.hist-groups { flex-wrap: wrap; }
+.hist-seg-count {
+  font-size: 11px; font-weight: 650; color: var(--text-faint); margin-left: 5px; font-variant-numeric: tabular-nums;
+}
+.hist-groups button[aria-pressed="true"] .hist-seg-count { color: var(--text-muted); }
+.hist-f-search .search input { width: 240px; }
+.hist-f-student select { max-width: 280px; }
+.hist-filter-row input[type="date"] { min-width: 140px; height: 32px; }
+.hist-filter-row select, .hist-filter-row input[type="search"] { height: 32px; }
+.hist-clear[hidden] { display: none; }
+
+/* ------------------------------------------------------------------ count line, paging */
+
+.hist-count { font-size: 13px; color: var(--text-muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-height: 20px; }
+.hist-count strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.hist-warn { display: inline-flex; align-items: center; gap: 4px; color: var(--warn); font-weight: 600; }
+.hist-more { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
+.hist-more:empty { display: none; }
+.hist-empty-host:empty { display: none; }
+.hist-empty-host .empty-state { padding: 36px 20px; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); background: var(--bg-elev); }
+
+/* ------------------------------------------------------------------ table */
+
+/* position: relative keeps the .sr-only helpers inside the scroll box (no page-wide horizontal scroll on phones). */
+.hist-wrap { position: relative; max-height: max(360px, calc(100vh - 250px)); }
+.hist-wrap[hidden] { display: none; }
+.hist-table { min-width: 1080px; }
+.hist-table td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.hist-table .hc-when { white-space: nowrap; width: 1%; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.hist-table td.hc-when time { cursor: help; }
+.hist-table .hc-who { min-width: 180px; max-width: 240px; }
+.hist-table .hc-field { min-width: 120px; max-width: 220px; overflow-wrap: anywhere; }
+.hist-table .hc-change { min-width: 150px; max-width: 300px; overflow-wrap: anywhere; }
+.hist-table .hc-kind, .hist-table .hc-src { white-space: nowrap; width: 1%; }
+.hist-table .hc-note { min-width: 170px; max-width: 280px; }
+.hist-table .hc-user { min-width: 150px; max-width: 260px; }
+
+.hist-name { font-weight: 600; }
+.hist-sub { display: block; font-size: 12px; color: var(--text-muted); }
+.hist-team { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; }
+.hist-team .icon { color: var(--text-muted); }
+
+/* Old -> new: the old value is struck through and muted, the new value stands out. */
+.hist-old { color: var(--text-muted); text-decoration: line-through; text-decoration-color: var(--text-faint); }
+.hist-arrow { color: var(--text-faint); margin: 0 6px; }
+.hist-new { color: var(--text); font-weight: 600; }
+.hist-empty { color: var(--text-faint); font-style: italic; font-weight: 400; text-decoration: none; }
+
+.hist-note {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere;
+}
+
+/* Your note */
+.hist-un { display: flex; align-items: flex-start; gap: 6px; }
+.hist-un-icon { color: var(--accent); display: inline-flex; margin-top: 1px; }
+.hist-un-icon .icon { width: 15px; height: 15px; }
+.hist-un-text { flex: 1 1 auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; color: var(--text); }
+.hist-un-edit { margin-top: -4px; opacity: 0.55; }
+.hist-table tr:hover .hist-un-edit, .hist-un-edit:focus-visible { opacity: 1; }
+.hist-add-note { color: var(--text-faint); opacity: 0.6; margin: -4px 0; }
+.hist-table tr:hover .hist-add-note, .hist-table tr:focus-within .hist-add-note, .hist-add-note:focus-visible { opacity: 1; color: var(--text); }
+@media (hover: none) {
+  .hist-add-note, .hist-un-edit { opacity: 1; }
+}
+
+/* ------------------------------------------------------------------ kind badges (each kind its own look) */
+
+.hist-kind .icon, .hist-src .icon { width: 12px; height: 12px; }
+.badge.hk-score { background: var(--bg-elev); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-team-score { background: var(--group-3); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-late { background: var(--group-2); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-status { background: var(--group-4); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-team { background: var(--group-5); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-student { background: var(--group-6); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-settings { background: var(--bg-sunken); color: var(--text-muted); border-color: var(--border); }
+.badge.hk-bulk { background: transparent; color: var(--text-muted); border-style: dashed; border-color: var(--border-strong); }
+.badge.hk-dashed { background: transparent; border-style: dashed; }
+
+/* Source badges: outlined, so they never look like a kind. */
+.badge.hist-src { background: transparent; color: var(--text-muted); border-color: var(--border); font-weight: 600; }
+.badge.hist-src.hs-undo { color: var(--warn); border-color: var(--warn-border); }
+
+/* ------------------------------------------------------------------ note dialog summary */
+
+.hist-dlg-summary {
+  display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-sunken); font-size: 13px;
+}
+.hist-dlg-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--text-muted); font-size: 12px; }
+.hist-dlg-meta time { margin-right: 4px; }
+.hist-dlg-change { overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .hist-f-search .search input { width: 180px; }
+  .hist-wrap { max-height: none; }
+}
+
+@media print {
+  .hist-filters, .hist-more, .view-history .page-header .toolbar, .hist-add-note, .hist-un-edit { display: none !important; }
+  .hist-wrap { max-height: none; overflow: visible; }
+  .hist-table { min-width: 0; }
+}

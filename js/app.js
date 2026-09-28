@@ -161,7 +161,7 @@
       if (!w.ok) {
         out.push(banner('warn', 'alert',
           '<strong>Weights in ' + esc(c.code) + ' add up to ' + esc(util.formatNumber(w.sum, 2)) + '%, not 100%.</strong> Totals use the weights as entered.',
-          GT.views.settings ? '<button class="btn btn-sm" data-act="goto" data-view="settings">Fix in Settings</button>' : ''));
+          GT.views.settings ? '<button class="btn btn-sm" data-act="goto" data-view="settings" data-section="assessments">Fix in Settings</button>' : ''));
       }
     }
     host.innerHTML = out.join('');
@@ -374,7 +374,7 @@
         co.title = v.title.trim();
         co.term = v.term.trim();
         co.level = v.level;
-      }, { historyMode: 'none' });
+      });
     });
   }
 
@@ -472,6 +472,13 @@
       ['Enter', 'Edit cell, or save and move down'],
       ['F2', 'Edit cell without clearing it'],
       ['Type a number', 'Start editing and replace the value'],
+      ['Shift+Arrow / Shift+Click', 'Select a range of cells'],
+      ['Ctrl+A', 'Select all cells'],
+      ['Ctrl+Enter', 'Fill the selected cells with the typed value'],
+      ['Home / End', 'First / last column'],
+      ['Ctrl+Home / Ctrl+End', 'First / last cell'],
+      ['PageUp / PageDown', 'Move 10 rows'],
+      ['Ctrl+Arrow', 'Jump to the edge of the grid'],
       ['Delete / Backspace', 'Clear the selected cells'],
       ['Esc', 'Cancel editing'],
       ['Ctrl+C / Ctrl+V', 'Copy / paste a block (works with Excel)'],
@@ -529,7 +536,10 @@
       var act = a.getAttribute('data-act');
       if (act === 'backup') doBackup();
       else if (act === 'dismiss') { dismissed[a.getAttribute('data-key')] = true; requestRender(); }
-      else if (act === 'goto') app.navigate(a.getAttribute('data-view'));
+      else if (act === 'goto') {
+        var sec = a.getAttribute('data-section');
+        app.navigate(a.getAttribute('data-view'), sec ? { section: sec } : undefined);
+      }
       else if (act === 'shortcuts') showShortcuts();
       else if (act === 'download-raw' && loadProblem) {
         ui.download('grade-tracker-unreadable-backup-' + ui.fileStamp() + '.json', JSON.stringify(loadProblem.raw), 'application/json');
@@ -593,10 +603,31 @@
     } catch (e) { /* not supported on this origin */ }
   }
 
+  // ------------------------------------------------------------------ sticky header height
+
+  /** Publishes the height of the sticky header (topbar + tabs) as --head-h on <html>, so views can
+   * offset their own sticky elements and scroll targets. 0 when the header does not stick (phones). */
+  function watchHeadHeight() {
+    var head = document.querySelector('.app-head');
+    if (!head) return;
+    var last = null;
+    function update() {
+      var sticky = root.getComputedStyle(head).position === 'sticky';
+      var h = sticky ? Math.ceil(head.getBoundingClientRect().height) : 0;
+      if (h === last) return;
+      last = h;
+      document.documentElement.style.setProperty('--head-h', h + 'px');
+    }
+    update();
+    if (root.ResizeObserver) new ResizeObserver(update).observe(head);
+    root.addEventListener('resize', update);
+  }
+
   // ------------------------------------------------------------------ boot
 
   function boot() {
     ui.initPrivacyReveal();
+    watchHeadHeight();
     GT.storage.init().then(function (info) {
       return GT.storage.load().then(function (raw) {
         var state;

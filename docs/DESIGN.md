@@ -358,6 +358,8 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `updatedAt` → debounced save → notify subscribers.
 - `GT.store.undo()`, `redo()`, `canUndo()`, `canRedo()` — per course, in memory, capped at 200 steps.
   Undo/redo append history entries (source `'undo'`/`'redo'`); history itself is never rolled back.
+  Each undo step remembers its `historyMode`: undoing or redoing a `'bulk'` step (e.g. loading sample data)
+  logs one bulk entry (note `Undo of "<label>"`), not an itemized diff of every student and score.
 - `GT.store.setUi(patch)`, `GT.store.setMeta(patch)`, `GT.store.replaceState(state, source)`,
   `GT.store.subscribe(fn)`, `GT.store.flush()` (save now), `GT.store.saveStatus()`,
   `GT.store.annotateHistory(entryId, text)`, `setActiveCourse/addCourse/deleteCourse/moveCourse`.
@@ -374,5 +376,13 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
 - Keyboard: all actions reachable by keyboard; focus rings visible; dialogs use `<dialog>`.
 - Placeholder badge: `<span class="badge badge-warn">needs confirmation</span>` (yellow) wherever a
   placeholder value is shown or edited.
+- Sticky header: the topbar and the tabs sit in one sticky `.app-head` block. `app.js` publishes its height
+  as the CSS variable `--head-h` on `<html>` (0 on phones, where the header scrolls away). Views offset their
+  own page-level sticky elements with `top: calc(var(--head-h) + …)`; `html` has
+  `scroll-padding-top: calc(var(--head-h) + 8px)`, so `scrollIntoView` targets land below the header.
+  Sticky elements inside a view's own scroll box (table headers) need nothing. Page-level z-index: header 40,
+  menus 100, toasts 200; dialogs use the top layer. Keep view z-indexes below 30.
+- Cross-view links: `GT.app.navigate('settings', { section })`, `navigate('settings', { placeholder })`,
+  `navigate('history', { studentId })`, `navigate('grades', { studentId, assessmentId })`.
 - Shared widgets: `GT.ui.dialog.confirm/prompt/open`, `GT.ui.toast(message, { type })`,
   `GT.ui.download(filename, blobOrText, mime)`, `GT.ui.loadExcel()`, `GT.ui.icon(name)` (inline SVG).

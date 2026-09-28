@@ -123,7 +123,7 @@
     Array.prototype.push.apply(c.history, entries);
     if (o.undoable !== false) {
       var u = stack(undoStacks, c.id);
-      u.push({ label: label, snapshot: before });
+      u.push({ label: label, snapshot: before, mode: mode });
       if (u.length > UNDO_LIMIT) u.shift();
       redoStacks[c.id] = [];
     }
@@ -142,11 +142,18 @@
     var current = snapshot(c);
     restore(c, step.snapshot);
     var ts = util.nowIso();
-    var entries = diffEntries(current, c, ts, source);
     var note = (source === 'undo' ? 'Undo of "' : 'Redo of "') + step.label + '"';
-    entries.forEach(function (e) { e.note = e.note ? e.note + ' | ' + note : note; });
+    var entries;
+    if (step.mode === 'bulk' && GT.history && GT.history.bulkEntry) {
+      // A bulk change (e.g. loading sample data) is logged as one entry, so undoing it does too.
+      entries = [GT.history.bulkEntry({ ts: ts, source: source, field: step.label, note: note })];
+    } else {
+      entries = diffEntries(current, c, ts, source);
+      entries.forEach(function (e) { e.note = e.note ? e.note + ' | ' + note : note; });
+    }
+    if (!Array.isArray(c.history)) c.history = [];
     Array.prototype.push.apply(c.history, entries);
-    stack(toStack, c.id).push({ label: step.label, snapshot: current });
+    stack(toStack, c.id).push({ label: step.label, snapshot: current, mode: step.mode });
     c.updatedAt = ts;
     scheduleSave();
     notify({ type: source, label: step.label, entries: entries, courseId: c.id });

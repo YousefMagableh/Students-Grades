@@ -243,6 +243,8 @@ html[data-theme="dark"] {
 .xc-fields .field { min-width: 0; }
 .xc-header-field { flex: 1 1 340px; max-width: 560px; }
 .xc-header-field select, .xc-fields select { width: 100%; }
+.xc-header-check:not(:empty) { margin: 0 0 12px; }
+.xc-header-check .xc-note { margin-top: 0; max-width: 90ch; }
 .xc-preview-cap { margin: 0 0 6px; font-size: 12px; color: var(--text-faint); }
 .xc-preview-wrap { max-height: 360px; }
 .xc-preview { font-size: 12.5px; }
@@ -291,6 +293,10 @@ html[data-theme="dark"] {
 .xc-opt .segmented button { white-space: normal; text-align: left; }
 .xc-imp-options .check { align-items: flex-start; }
 .xc-imp-options .check input { margin-top: 2px; flex: none; }
+/* An option that belongs to the one above it ("Update names from the file" under "Find students by: No"). */
+.xc-opt-sub { margin: -4px 0 0; padding: 0 0 0 12px; border-left: 2px solid var(--border); }
+.xc-opt-sub .xc-help { margin: 4px 0 0; }
+@media (min-width: 721px) { .xc-opt-sub { margin-left: 202px; } }
 .xc-att-offer { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--info-soft); border: 1px solid color-mix(in srgb, var(--info) 30%, transparent); }
 .xc-att-offer .check { font-weight: 600; }
 .xc-att-offer .xc-help { color: var(--text-muted); }

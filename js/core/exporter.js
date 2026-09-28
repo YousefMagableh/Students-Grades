@@ -45,8 +45,15 @@
   var ATTENDANCE_KEYS = ['excused', 'unexcused', 'absences', 'absenceRate', 'unexcusedRate'];
   var ATTENDANCE_OFF = 'Attendance is off for this course';
   var PLACEHOLDER_LINE = 'PLACEHOLDER: not confirmed by the instructor';
+  // Notes of the static Letter Grade cells (DESIGN 8.2). The importer reads them back (DESIGN 9.1): a
+  // cell whose letter no longer matches its "Suggestion from the cutoffs: <letter>" note was changed in
+  // the spreadsheet after the export, so it holds a letter the instructor chose.
+  var MANUAL_LETTER_NOTE = 'Final letter assigned by the instructor';
+  var SUGGESTED_LETTER_NOTE = 'Suggestion from the cutoffs: ';
   var ROUNDING_LABELS = { none: 'none', hundredth: 'nearest 0.01', integer: 'nearest whole number' };
   var MIN_WIDTH = 5, MAX_WIDTH = 40, NAME_MIN_WIDTH = 14;
+  /** Computed number columns shown with the course's display decimals (besides the weighted ones). */
+  var COMPUTED_KEYS = ['total', 'percentile', 'diffAvg', 'absenceRate', 'unexcusedRate'];
 
   // ---------------------------------------------------------------- small helpers
 
@@ -156,7 +163,33 @@
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
   }
 
+  /** "2026-12-15 19:00 (local time, UTC-06:00)": the export time as the instructor's clock shows it
+   * (the file name uses the same local time). */
+  function localDateTime(iso) {
+    var d = new Date(iso);
+    if (typeof iso !== 'string' || isNaN(d.getTime())) return String(iso || '');
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    var off = -d.getTimezoneOffset();
+    var abs = Math.abs(off);
+    return localDate(iso) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) +
+      ' (local time, UTC' + (off < 0 ? '-' : '+') + p(Math.floor(abs / 60)) + ':' + p(abs % 60) + ')';
+  }
+
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+
+  /** Excel display format for computed numbers, from the course's display decimals: '0.00' for 2. The
+   * stored values keep full precision, so formulas and totals are unchanged. */
+  function numberFormat(decimals) {
+    var d = typeof decimals === 'number' && isFinite(decimals) ? Math.max(0, Math.min(6, Math.round(decimals))) : 2;
+    return d > 0 ? '0.' + new Array(d + 1).join('0') : '0';
+  }
+
+  /** The late penalty P in points (DESIGN 8.3, calc.latePenalty) of an item: also for an empty or
+   * invalid score, which counts 0 anyway, so that a score typed into the file later loses it too, as
+   * it does in the app (the entry keeps its weeks late). */
+  function penaltyOf(d, a, course) {
+    return calc.latePenalty({ weeksLate: d.weeksLate, waived: d.waived }, a, course.settings);
+  }
 
   // ---------------------------------------------------------------- column catalog
 
@@ -200,18 +233,29 @@
     return out;
   }
 
-  /** Built-in presets. The default mirrors the previous TA's sheet (E2) plus Status. */
+  /** Whether any student's effective entry of the item (own, team or override) is late, waived or not. */
+  function hasLateWork(course, a) {
+    return (Array.isArray(course.students) ? course.students : []).some(function (s) {
+      var e = calc.resolveEntry(course, s, a).entry;
+      return !!(e && typeof e.weeksLate === 'number' && e.weeksLate > 0);
+    });
+  }
+
+  /** Built-in presets. The default mirrors the previous TA's sheet (E2) plus Status, and adds the
+   * "<name>: weeks late" column of each item with late work: without it the file's raw scores would
+   * not give its totals back (an import would lose the penalty). */
   function builtInPresets(course) {
     var list = assessmentsOf(course);
     var raw = list.map(function (a) { return 'raw:' + a.id; });
     var weighted = list.map(function (a) { return 'weighted:' + a.id; });
+    var late = list.filter(function (a) { return hasLateWork(course, a); }).map(function (a) { return 'late:' + a.id; });
     var all = columnsFor(course).filter(function (c) { return c.available; }).map(function (c) { return c.key; });
     return [
       {
         id: 'builtin:previous',
         name: 'Previous sheet layout (default)',
         builtIn: true,
-        columns: ['no', 'lastName', 'firstName'].concat(raw, weighted, ['total', 'letter', 'excused', 'unexcused', 'absences', 'status'])
+        columns: ['no', 'lastName', 'firstName'].concat(raw, weighted, late, ['total', 'letter', 'excused', 'unexcused', 'absences', 'status'])
       },
       { id: 'builtin:compact', name: 'Names, total and letter', builtIn: true, columns: ['no', 'lastName', 'firstName', 'team', 'total', 'letter', 'status'] },
       { id: 'builtin:everything', name: 'Everything', builtIn: true, columns: all }
@@ -275,7 +319,7 @@
     }
     if (d.weeksLate > 0) {
       if (d.waived) notes.push(plural(d.weeksLate, 'week') + ' late, penalty waived');
-      else notes.push(plural(d.weeksLate, 'week') + ' late, −' + num(d.penalty) + ' points');
+      else notes.push(plural(d.weeksLate, 'week') + ' late, −' + num(penaltyOf(d, a, course)) + ' points');
     }
     if (d.outOfRange) notes.push('Outside 0–' + num(a.maxScore) + '; counted as entered');
     if (d.notOnList) notes.push('Not one of the list values (' + model.describeChoices(a) + '); counted as entered');
@@ -300,8 +344,9 @@
   }
 
   /** Raw expression of one assessment: MAX(0,R-P)/M*W with a penalty, else R/M*W. */
-  function weightedExpr(ref, d, a) {
-    var inner = d.penalty > 0 ? 'MAX(0,' + ref + '-' + lit(d.penalty) + ')' : ref;
+  function weightedExpr(ref, d, a, course) {
+    var pen = penaltyOf(d, a, course);
+    var inner = pen > 0 ? 'MAX(0,' + ref + '-' + lit(pen) + ')' : ref;
     return inner + '/' + lit(a.maxScore) + '*' + lit(a.weight || 0);
   }
 
@@ -340,6 +385,10 @@
     switch (col.key) {
       case 'total':
         return '= sum of weighted + curve (' + num(curveOf(course)) + '), rounding: ' + ROUNDING_LABELS[roundingOf(course)] + '. ' +
+          (ctx.staticItems.length
+            ? ctx.staticItems.join(', ') + (ctx.staticItems.length === 1 ? ' is' : ' are') + ' not in this file, so ' +
+              (ctx.staticItems.length === 1 ? 'its weighted points are' : 'their weighted points are') + ' written into the formula as fixed numbers (listed in each cell\'s note). '
+            : '') +
           (roundingOf(course) === 'hundredth'
             ? 'Written as ROUND(ROUND(total×100,8),0)/100, the same as ROUND(total,2), so every spreadsheet app rounds a half cent up like the app does.'
             : 'The ROUND(…,10) mirrors the app\'s arithmetic, so a total exactly on a cutoff gets the same letter.');
@@ -382,7 +431,7 @@
     return String(v).split('\n').reduce(function (m, line) { return Math.max(m, line.length); }, 0);
   }
 
-  /** The export as plain data (pure): { columns: [{ key, label, width, group, tint, note }],
+  /** The export as plain data (pure): { columns: [{ key, label, width, group, tint, note, numFmt }],
    * rows: [[cell]], rowMeta: [{ studentId, withdrawn }], skipped, notes }.
    * A cell is { v, f?, note?, style?: 'withdrawn'|'invalid'|'override', exact? }: v is the value
    * (numbers stay numbers, empty = null), f an Excel formula without '=' in A1 notation (row 1 is
@@ -419,7 +468,9 @@
       if (contiguous) sumRange = { lo: lo, hi: hi };
     }
 
-    var ctx = { staticLetters: staticLetters, average: res.average };
+    // Items whose weighted points go into the Total as fixed numbers (neither column exported).
+    var staticList = sumRange ? [] : weightedNeeded.filter(function (a) { return !colIndex['weighted:' + a.id] && !colIndex['raw:' + a.id]; });
+    var ctx = { staticLetters: staticLetters, average: res.average, staticItems: staticList.map(function (a) { return a.name; }) };
     var sortKey = o.sort === 'no' ? 'no' : 'name';
     var students = calc.sortStudents(course, res, sortKey, 'asc');
     var rows = [], rowMeta = [];
@@ -439,7 +490,7 @@
           var terms = weightedNeeded.map(function (a) {
             var d = r.items[a.id];
             if (colIndex['weighted:' + a.id]) return ref('weighted:' + a.id);
-            if (colIndex['raw:' + a.id]) return weightedExpr(ref('raw:' + a.id), d, a);
+            if (colIndex['raw:' + a.id]) return weightedExpr(ref('raw:' + a.id), d, a, course);
             return lit(d.weightedUnrounded); // full precision, like the app's sum
           });
           sum = terms.length ? joinTerms(terms) : '0';
@@ -461,7 +512,7 @@
             break;
           case 'weighted':
             if (colIndex['raw:' + a.id]) {
-              cell.f = weightedExpr(ref('raw:' + a.id), d, a);
+              cell.f = weightedExpr(ref('raw:' + a.id), d, a, course);
               cell.v = d.weighted;
             } else {
               cell.v = d.weighted;
@@ -474,7 +525,7 @@
           case 'late':
             if (d.weeksLate > 0) {
               cell.v = d.waived ? d.weeksLate + ' (waived)' : d.weeksLate;
-              cell.note = d.waived ? 'Penalty waived' : '−' + num(d.penalty) + ' points';
+              cell.note = d.waived ? 'Penalty waived' : '−' + num(penaltyOf(d, a, course)) + ' points';
             }
             break;
           default:
@@ -499,12 +550,18 @@
           case 'total':
             cell.f = totalFormula;
             cell.v = r.total;
+            if (staticList.length) {
+              cell.note = 'Fixed numbers in this formula: ' + staticList.map(function (a) { return a.name + ' ' + num(r.items[a.id].weighted); }).join(', ') +
+                (curve !== 0 ? '; curve ' + (curve > 0 ? '+' : '') + num(curve) : '') + '.';
+            }
             break;
           case 'letter':
             if (staticLetters || !colIndex.total) {
               cell.v = staticLetters ? r.effectiveLetter : r.letter;
               if (staticLetters && r.letterSource === 'manual') {
-                cell.note = 'Final letter assigned by the instructor' + (r.finalLetterValid ? '' : ' (not a letter of the current scale)');
+                cell.note = MANUAL_LETTER_NOTE + (r.finalLetterValid ? '' : ' (not a letter of the current scale)');
+              } else if (cell.v) {
+                cell.note = SUGGESTED_LETTER_NOTE + cell.v + '\nNo final letter assigned yet.';
               }
             } else {
               cell.f = letterFormula(course, ref('total'));
@@ -551,7 +608,9 @@
         width: width,
         group: c.group,
         tint: tinted ? tintFor(aIndex[a.id]) : null,
-        note: headerNote(c, course, a, ctx)
+        note: headerNote(c, course, a, ctx),
+        numFmt: c.group === 'weighted' || COMPUTED_KEYS.indexOf(c.key) !== -1
+          ? (c.key === 'total' && mode === 'integer' ? '0' : numberFormat(decimals)) : null
       };
     });
 
@@ -634,6 +693,7 @@
         else if (typeof cell.exact === 'number') xc.value = cell.exact;
         else xc.value = cell.v === undefined ? null : cell.v;
         if (cell.note) xc.note = cell.note;
+        if (col.numFmt) xc.numFmt = col.numFmt;
         xc.border = thinBorder();
         if (col.tint) xc.fill = fillOf(col.tint);
         var font = {};
@@ -662,7 +722,7 @@
     rows.push(['Course', model.courseLabel(course)]);
     rows.push(['Term', course.term || '']);
     rows.push(['Level', course.level || '']);
-    rows.push(['Exported', iso]);
+    rows.push(['Exported', localDateTime(iso)]);
     rows.push(['Students', active + ' active' + (withdrawn ? ', ' + withdrawn + ' withdrawn (included, Status "Withdrawn")' : '')]);
     rows.push([]);
     rows.push({ section: 'Assessments', header: ['Assessment', 'Max score', 'Weight %', 'Team-graded', 'Drop-down list'] });
@@ -818,6 +878,18 @@
       else if (ls.unassigned) info(plural(ls.unassigned, 'active student') + ' without a final letter (their suggestion is exported).');
       if (ls.invalid) warn(plural(ls.invalid, 'final letter') + ' not in the current letter scale.');
     }
+    // Review V4R2-3: a CSV has no notes, so a final letter equal to the suggestion reads back as a
+    // suggestion (the importer cannot tell them apart); the .xlsx marks it, the Final Letter column keeps it.
+    var sameAsSuggestion = students.filter(function (s) {
+      var r = res.byId[s.id];
+      return r && r.finalLetter !== null && r.finalLetter === r.letter;
+    }).length;
+    if (sameAsSuggestion) {
+      var one = sameAsSuggestion === 1;
+      info((one ? '1 final letter equals' : sameAsSuggestion + ' final letters equal') + ' the suggestion from the cutoffs. A CSV file cannot show that ' +
+        (one ? 'it is' : 'they are') + ' final: imported back, ' + (one ? 'it stays a suggestion' : 'they stay suggestions') +
+        '. The Excel file marks final letters, and the "Final Letter" column (in the "Everything" preset) keeps them in both formats.');
+    }
     var oi = Array.isArray(res.orderIssues) ? res.orderIssues.length : 0;
     if (oi) warn(plural(oi, 'pair') + ' of final letters out of order (a lower total has a higher letter).');
     if (overrides) info(plural(overrides, 'per-member override') + ' on team-graded items (noted in the file).');
@@ -831,6 +903,8 @@
 
   var api = {
     XLSX_MIME: XLSX_MIME,
+    MANUAL_LETTER_NOTE: MANUAL_LETTER_NOTE,
+    SUGGESTED_LETTER_NOTE: SUGGESTED_LETTER_NOTE,
     TINTS: TINTS.slice(),
     TINT_OTHER: TINT_OTHER,
     HEADER_FILL: HEADER_FILL,

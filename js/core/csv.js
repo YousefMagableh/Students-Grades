@@ -52,11 +52,20 @@
   /** Core RFC 4180 reader. A field is quoted only when it starts with a quote and its closing quote
    * is followed by the delimiter, a line break or the end of the text; any other quote (for example
    * 5" or an unterminated "abc) is read as plain text. A text that ends with a line break has no
-   * extra empty row (a single trailing empty line is dropped). */
-  function parseCore(s, delim) {
+   * extra empty row (a single trailing empty line is dropped).
+   * `lim` (optional) { maxRows, maxCols } bounds the memory a hostile or accidental file can take:
+   * fields after maxCols in a row are dropped and reading stops after maxRows rows; `info` gets
+   * truncatedRows / truncatedColumns = true when something that is not empty was left out. */
+  function parseCore(s, delim, lim, info) {
+    var maxRows = lim && lim.maxRows > 0 ? lim.maxRows : Infinity;
+    var maxCols = lim && lim.maxCols > 0 ? lim.maxCols : Infinity;
     var rows = [], row = [], field = '';
     var quoted = false, fieldStart = true, literalAt = -1;
     var n = s.length, i = 0;
+    var pushField = function () {
+      if (row.length < maxCols) row.push(field);
+      else if (field !== '' && info) info.truncatedColumns = true;
+    };
     while (i < n) {
       var ch = s.charAt(i);
       if (fieldStart && ch === '"' && i !== literalAt) {
@@ -83,7 +92,7 @@
       }
       fieldStart = false;
       if (ch === delim) {
-        row.push(field);
+        pushField();
         field = '';
         quoted = false;
         fieldStart = true;
@@ -91,20 +100,24 @@
         continue;
       }
       if (ch === '\r' || ch === '\n') {
-        row.push(field);
+        pushField();
         rows.push(row);
         row = [];
         field = '';
         quoted = false;
         fieldStart = true;
         i += ch === '\r' && s.charAt(i + 1) === '\n' ? 2 : 1;
+        if (rows.length >= maxRows) {
+          if (info && /[^\s",;]/.test(s.slice(i).split(delim).join(''))) info.truncatedRows = true;
+          return rows;
+        }
         continue;
       }
       field += ch;
       i++;
     }
     if (row.length || field !== '' || quoted) {
-      row.push(field);
+      pushField();
       rows.push(row);
     }
     return rows;
@@ -116,12 +129,22 @@
 
   /** Parses CSV/TSV text into rows of strings.
    * opts.delimiter: 'auto' (default), ',', ';' or '\t'. Handles quoted fields, doubled quotes,
-   * line breaks inside quotes, a UTF-8 BOM, and CRLF, LF or CR line endings. */
+   * line breaks inside quotes, a UTF-8 BOM, and CRLF, LF or CR line endings. opts.maxRows /
+   * opts.maxCols (optional) stop reading after that many rows / drop fields after that many columns. */
   function parse(text, opts) {
+    return parseTable(text, opts).rows;
+  }
+
+  /** parse() with details: { rows, delimiter, truncatedRows, truncatedColumns } (the flags are true
+   * when opts.maxRows / opts.maxCols left out something that is not empty). */
+  function parseTable(text, opts) {
     var s = stripBom(toText(text));
     var d = opts && opts.delimiter;
     if (d === 'auto' || !validDelimiter(d)) d = detectDelimiter(s);
-    return parseCore(s, d);
+    var info = { truncatedRows: false, truncatedColumns: false };
+    var lim = opts && (opts.maxRows || opts.maxCols) ? { maxRows: opts.maxRows, maxCols: opts.maxCols } : null;
+    var rows = parseCore(s, d, lim, info);
+    return { rows: rows, delimiter: d, truncatedRows: info.truncatedRows, truncatedColumns: info.truncatedColumns };
   }
 
   /** Parses clipboard text copied from Excel or Google Sheets (tab-separated) into rows of cells.
@@ -160,12 +183,18 @@
   }
 
   var FORMULA_START = /^[=+\-@\t\r]/;
+  // A ';' or a tab followed by a formula start: Excel set to a ';' list separator (most of continental
+  // Europe) splits a double-clicked .csv on ';' whether or not the field is quoted, so the text after
+  // it would start a cell of its own.
+  var SEGMENT_FORMULA = /([;\t])(?=[=+\-@\t\r])/g;
 
   /** Writes rows as CSV (or TSV with delimiter '\t').
    * opts: { delimiter = ',', bom = false, eol = '\r\n', guardFormulas = true }.
    * Fields containing the delimiter, a quote, CR or LF are quoted (quotes doubled). With
    * guardFormulas, a text cell starting with =, +, -, @, tab or CR gets a leading apostrophe so a
-   * spreadsheet does not run it as a formula (CSV injection); JS numbers are written as they are.
+   * spreadsheet does not run it as a formula (CSV injection), and so does each part of a text cell
+   * that follows a ';' or a tab ("x;=1+1" -> "x;'=1+1"), because a spreadsheet set to split on ';'
+   * would start a new cell there; JS numbers are written as they are.
    * Every row ends with the line ending, so parse(stringify(rows)) gives the rows back. */
   function stringify(rows, opts) {
     var o = opts || {};
@@ -177,7 +206,10 @@
       var cells = Array.isArray(row) ? row : [row];
       return cells.map(function (v) {
         var s = cellText(v);
-        if (guard && typeof v === 'string' && FORMULA_START.test(s)) s = "'" + s;
+        if (guard && typeof v === 'string') {
+          s = s.replace(SEGMENT_FORMULA, "$1'");
+          if (FORMULA_START.test(s)) s = "'" + s;
+        }
         if (s.indexOf(d) !== -1 || /["\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
         return s;
       }).join(d) + eol;
@@ -187,6 +219,7 @@
 
   var api = {
     parse: parse,
+    parseTable: parseTable,
     parseClipboard: parseClipboard,
     stringify: stringify,
     detectDelimiter: detectDelimiter,

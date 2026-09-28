@@ -34,13 +34,18 @@
   var DEFAULT_PRESET = 'builtin:previous';
 
   var XLS_HELP = 'Open it in Excel and use Save As \u2192 Excel Workbook (.xlsx), then import that file.';
+  /** Saving again keeps a password, so an encrypted workbook needs the password removed first. */
+  var PASSWORD_HELP = 'Open it in Excel, type the password, then choose File \u2192 Info \u2192 Protect Workbook \u2192 Encrypt with Password ' +
+    '(on a Mac: File \u2192 Passwords), clear the password, press OK and save. Then import the file again.';
 
   /** Import targets whose values are student names or notes (sample values are pii). */
   var PII_TARGETS = { lastName: true, firstName: true, fullName: true, notes: true };
   var ATTENDANCE_TARGETS = { absent: true, excused: true, absencesTotal: true };
+  var ATTENDANCE_MODE_LABELS = { off: 'Off', 'per-session': 'Per session', totals: 'Totals only' };
   var STUDENT_TARGETS = { no: true, lastName: true, firstName: true, fullName: true, team: true, status: true, notes: true };
 
-  /** Labels for the plan's counts, in display order. Unknown numeric counts are shown with their key. */
+  /** Labels for the plan's counts, in display order. An unknown numeric count gets its key spelled out in
+   * words (countWords), never the raw key. */
   var COUNT_INFO = [
     { key: 'update', label: 'students updated', one: 'student updated', icon: 'user' },
     { key: 'new', label: 'new students', one: 'new student', icon: 'plus' },
@@ -59,7 +64,17 @@
       help: 'Imported anyway (nothing is lost) and highlighted in the grid.' },
     { key: 'blocked', label: 'score changes blocked (scores are finalized)', one: 'score change blocked (scores are finalized)', icon: 'lock', warn: true,
       help: 'Unlock the scores in the Grades tab first to import them.' },
-    { key: 'lettersSkipped', label: 'final letters not in the scale', one: 'final letter not in the scale', icon: 'alert', warn: true }
+    { key: 'lettersSkipped', label: 'final letters not in the scale', one: 'final letter not in the scale', icon: 'alert', warn: true },
+    { key: 'duplicateNos', label: 'No values already in use', one: 'No value already in use', icon: 'alert', warn: true,
+      help: 'Every student keeps a different No: a No from the file that another student already has is not given (a new student gets the next free No). Each one is listed under "Values to check".' },
+    { key: 'totalsDiffer', label: 'totals that differ from the file', one: 'total that differs from the file', icon: 'alert', warn: true,
+      help: 'The file\'s Total is not the total the imported scores give here. Check for missing score or weeks-late columns, and the weights, curve and rounding in Settings. Each one is listed under "Values to check".' },
+    { key: 'lettersAsSuggestion', label: 'letters kept as suggestions', one: 'letter kept as a suggestion', icon: 'info',
+      help: 'The file comes from Grade Tracker: its letters that are only the suggestion from the cutoffs are not stored as final letters.' },
+    { key: 'teamsCreated', label: 'new teams', one: 'new team', icon: 'users',
+      help: 'Team names from the file that are not in this course ("2", "Team 02" and "Group 2" already count as "Team 2").' },
+    { key: 'scoresEmptied', label: 'team scores emptied by a team move', one: 'team score emptied by a team move', icon: 'alert', warn: true,
+      help: 'Students who move to a team that has no score yet for a team-graded item (Project I, Project II…) lose that score until the new team gets one. Each one is marked "emptied by the team move" below.' }
   ];
 
   // Small icons that GT.ui.icon does not have.
@@ -96,12 +111,13 @@
       fileName: '',
       fileSize: 0,
       kind: '',               // 'xlsx' | 'csv'
-      sheets: [],             // [{ name, hidden, rows: string[][], formulaColumns: number[] }]
+      sheets: [],             // [{ name, hidden, rows: string[][], formulaColumns: number[], finalLetterCells: [[row, col]]|null, editedLetterCells: [[row, col]]|null }]
       sheetIndex: 0,
-      headerIndex: 0,
+      headerIndex: 0,         // -1: the file has no header row (row 1 is a student)
       headerAuto: 0,
+      headerKnown: {},        // column index -> true when its header cell is not a possible student name (see remap)
       mapping: [],
-      options: { matchBy: 'name', createMissing: true, emptyCells: 'keep', overwrite: true, switchAttendanceToTotals: false },
+      options: { matchBy: 'name', createMissing: true, emptyCells: 'keep', overwrite: true, switchAttendanceToTotals: false, updateNames: false },
       plan: null,
       planError: null,
       planKey: null,
@@ -116,6 +132,11 @@
   /** A failure the page explains to the user (missing library, unreadable file): a warning, not an error. */
   function logHandled(e) { if (root.console) console.warn(errText(e)); }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
+  /** A count key that COUNT_INFO does not know, in words ("someNewCount" -> "some new count"). */
+  function countWords(key) {
+    var s = str(key).replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase();
+    return s || 'other';
+  }
   function errText(e) { return e && e.message ? e.message : String(e); }
   function privacyOn() { var st = GT.store && GT.store.state; return !!(st && st.ui && st.ui.privacy); }
   function icon(name, cls) {
@@ -259,6 +280,7 @@
   if (GT.store && GT.store.subscribe) {
     GT.store.subscribe(function (info) {
       var t = info && info.type;
+      trackImport(info);
       if (t === 'saved' || t === 'annotate' || t === 'meta') return;
       // Privacy changes which header-row choices may show text (a native select cannot be blurred).
       if (t === 'ui' && !(info.patch && (util.hasOwn(info.patch, 'privacy') || util.hasOwn(info.patch, 'exchangePrefs')))) return;
@@ -970,6 +992,18 @@
     return (Array.isArray(list) ? list : []).filter(function (i) { return typeof i === 'number' && i >= 0 && i < MAX_COLS; });
   }
 
+  /** [row, col] cells of a Grade Tracker workbook (GT.importer.readWorkbook): its finalLetterCells (the
+   * letters the importer takes as final letters: those with the note "Final letter assigned by the
+   * instructor" and those changed in the spreadsheet after the export) or its editedLetterCells (only the
+   * changed ones). null for any other file: the importer then tells final letters from suggestions as
+   * well as it can. */
+  function letterCells(list) {
+    if (!Array.isArray(list)) return null;
+    return list.filter(function (p) {
+      return Array.isArray(p) && typeof p[0] === 'number' && typeof p[1] === 'number' && p[0] >= 0 && p[1] >= 0;
+    }).map(function (p) { return [p[0], p[1]]; });
+  }
+
   /** Cells as text, at most MAX_ROWS + 1 rows and MAX_COLS columns. Only trailing empty cells and rows are
    * dropped, so column indexes stay those of the file (the mapping and formulaColumns rely on them). */
   function trimRows(rows) {
@@ -1014,9 +1048,17 @@
     if (ext === 'xlsx' || ext === 'xlsm') {
       return ui.readArrayBuffer(file).then(function (buf) {
         var head = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+        if (head.length === 4 && head[0] === 0xd0 && head[1] === 0xcf && head[2] === 0x11 && head[3] === 0xe0) {
+          // Not a zip but an OLE container: Excel stores a password-protected .xlsx this way, and old .xls files too.
+          throw friendlyError('This workbook is password-protected, or it is an old .xls file.',
+            '<ul class="xc-plain-list">' +
+              '<li><strong>If it opens in Excel only with a password:</strong> ' + esc(PASSWORD_HELP) + '</li>' +
+              '<li><strong>If it opens without a password,</strong> it is an old .xls file that was renamed. ' + esc(XLS_HELP) + '</li>' +
+            '</ul>');
+        }
         if (head.length < 2 || head[0] !== 0x50 || head[1] !== 0x4b) {
           throw friendlyError('This file is not a real .xlsx workbook.',
-            '<p>It may be an old .xls file that was renamed. ' + esc(XLS_HELP) + '</p>');
+            '<p>It may be an old .xls file or a CSV file that was renamed. ' + esc(XLS_HELP) + '</p>');
         }
         return ui.loadExcel().catch(function (e) {
           throw friendlyError('The Excel library could not be loaded.',
@@ -1025,14 +1067,16 @@
         }).then(function (ExcelJS) {
           var unreadable = function (e) {
             throw friendlyError('This Excel file could not be read.',
-              '<p>It may be damaged or password-protected. Open it in Excel, then use Save As \u2192 Excel Workbook (.xlsx) and import the new file.</p>' +
+              '<p>It may be damaged. Open it in Excel, then use Save As \u2192 Excel Workbook (.xlsx) and import the new file.</p>' +
+              '<p>If Excel asks for a password to open it: ' + esc(PASSWORD_HELP) + '</p>' +
               '<p class="muted">' + esc(errText(e)) + '</p>');
           };
           if (typeof GT.importer.readWorkbook === 'function') {
             return GT.importer.readWorkbook(ExcelJS, buf).then(function (list) {
               return (Array.isArray(list) ? list : []).map(function (x, i) {
                 return { name: str(x && x.name) || 'Sheet ' + (i + 1), hidden: !!(x && x.hidden), rows: trimRows(x && x.rows),
-                  formulaColumns: formulaCols(x && x.formulaColumns) };
+                  formulaColumns: formulaCols(x && x.formulaColumns), finalLetterCells: letterCells(x && x.finalLetterCells),
+                  editedLetterCells: letterCells(x && x.editedLetterCells) };
               });
             }, unreadable);
           }
@@ -1042,7 +1086,7 @@
             wb.eachSheet(function (ws) {
               var rows = safeCall('importer', 'rowsFromWorksheet', [ws], []);
               sheets.push({ name: str(ws.name) || 'Sheet ' + (sheets.length + 1), hidden: ws.state === 'hidden' || ws.state === 'veryHidden', rows: trimRows(rows),
-                formulaColumns: formulaCols(safeCall('importer', 'formulaColumnsOf', [ws], [])) });
+                formulaColumns: formulaCols(safeCall('importer', 'formulaColumnsOf', [ws], [])), finalLetterCells: null, editedLetterCells: null });
             });
             return sheets;
           });
@@ -1055,7 +1099,7 @@
         if (typeof GT.importer.rowsFromCsv === 'function') rows = GT.importer.rowsFromCsv(String(text));
         else if (GT.csv && typeof GT.csv.parse === 'function') rows = GT.csv.parse(String(text));
         else throw new Error('The CSV reader (js/core/csv.js) is not loaded.');
-        return [{ name: file.name, hidden: false, rows: trimRows(rows), formulaColumns: [] }];
+        return [{ name: file.name, hidden: false, rows: trimRows(rows), formulaColumns: [], finalLetterCells: null, editedLetterCells: null }];
       });
     }
     return Promise.reject(friendlyError('This type of file cannot be imported.',
@@ -1077,20 +1121,25 @@
     refresh();
     readSheets(file).then(function (sheets) {
       if (seq !== loadSeq) return;
-      var usable = sheets.filter(function (s) { return s.rows.length > 0; });
+      // Only the sheet the TA imports has to be small: a long helper sheet (a lookup list, an attendance
+      // log) is offered disabled, and its rows are not kept.
+      sheets.forEach(function (s) {
+        if (s.rows.length > MAX_ROWS) { s.tooMany = true; s.rows = []; }
+      });
+      var usable = sheets.filter(function (s) { return !s.tooMany && s.rows.length > 0; });
       if (!usable.length) {
+        if (sheets.some(function (s) { return s.tooMany; })) {
+          throw friendlyError('This file has too many rows.', '<p>Grade Tracker imports up to ' + fmtCount(MAX_ROWS) + ' rows' +
+            (sheets.length > 1 ? ' per sheet, and every sheet with data is longer' : '') + '. Choose the grade sheet of one course.</p>');
+        }
         throw friendlyError('This file has no data.', '<p>Every sheet is empty. Choose the file that holds the grades.</p>');
-      }
-      var tooMany = sheets.some(function (s) { return s.rows.length > MAX_ROWS; });
-      if (tooMany) {
-        throw friendlyError('This file has too many rows.', '<p>Grade Tracker imports up to ' + fmtCount(MAX_ROWS) + ' rows. Choose the grade sheet of one course.</p>');
       }
       imp.loading = false;
       imp.kind = extOf(file.name) === 'xlsx' || extOf(file.name) === 'xlsm' ? 'xlsx' : 'csv';
       imp.sheets = sheets;
       var first = -1;
-      for (var i = 0; i < sheets.length && first < 0; i++) { if (!sheets[i].hidden && sheets[i].rows.length > 1) first = i; }
-      for (var j = 0; j < sheets.length && first < 0; j++) { if (sheets[j].rows.length > 0) first = j; }
+      for (var i = 0; i < sheets.length && first < 0; i++) { if (!sheets[i].tooMany && !sheets[i].hidden && sheets[i].rows.length > 1) first = i; }
+      for (var j = 0; j < sheets.length && first < 0; j++) { if (!sheets[j].tooMany && sheets[j].rows.length > 0) first = j; }
       setSheet(first);
       imp.step = 2;
       focusStepHeading = true;
@@ -1119,19 +1168,58 @@
     rows.forEach(function (r) { if (r.length > n) n = r.length; });
     return n;
   }
+  /** The header row's cells ('' for every column when the file has no header row). */
   function headerCells(rows, n) {
-    var h = rows[imp.headerIndex] || [];
+    var h = imp.headerIndex >= 0 ? rows[imp.headerIndex] || [] : [];
     var out = [];
     for (var i = 0; i < n; i++) out.push(h[i] === undefined ? '' : String(h[i]));
     return out;
+  }
+
+  /** Columns whose header cell guessMapping recognizes (index -> true). */
+  function knownHeaders(cells, course) {
+    var g = safeCall('importer', 'guessMapping', [cells, course, { formulaColumns: [] }], []);
+    var out = {};
+    (Array.isArray(g) ? g : []).forEach(function (k, i) { if (typeof k === 'string' && k !== 'ignore') out[i] = true; });
+    return out;
+  }
+
+  /** How much a row looks like column names: { numbers: cells that are numbers, known: recognized names }.
+   * A "header" with numbers and no known name is most likely the first student. */
+  function headerLook(row, course) {
+    var cells = (Array.isArray(row) ? row : []).map(str);
+    var numbers = cells.filter(function (v) { return util.parseScoreInput(v).kind === 'number'; }).length;
+    return { numbers: numbers, known: Object.keys(knownHeaders(cells, course)).length };
+  }
+
+  /** Text of a header cell that may be shown in labels and notes: a cell that is not a known column name
+   * may be a student's name (a file without a header row), so it is left out in privacy mode. */
+  function shownHeader(header, i) {
+    var h = str(header[i]).trim();
+    return h && privacyOn() && !imp.headerKnown[i] ? '' : h;
+  }
+
+  /** Rows and header index for GT.importer.plan. "No header row" (-1) reaches the importer as a blank
+   * header row in front of the data, so every row of the file is read; `shift` turns the plan's row
+   * indexes back into the file's. */
+  function planInput() {
+    var rows = curRows();
+    if (imp.headerIndex >= 0) return { rows: rows, headerIndex: imp.headerIndex, shift: 0 };
+    return { rows: [[]].concat(rows), headerIndex: 0, shift: 1 };
   }
 
   function setSheet(i) {
     imp.sheetIndex = Math.max(0, Math.min(i, imp.sheets.length - 1));
     var rows = curRows();
     var h = safeCall('importer', 'detectHeaderRow', [rows], 0);
-    imp.headerIndex = typeof h === 'number' && h >= 0 && h < rows.length ? h : 0;
-    imp.headerAuto = imp.headerIndex;
+    h = typeof h === 'number' && h >= 0 && h < rows.length ? h : 0;
+    // Row 1 with numbers and no known column name is a student: the file has no header row.
+    if (h === 0 && rows.length) {
+      var look = headerLook(rows[0], GT.store.course());
+      if (look.numbers > 0 && look.known === 0) h = -1;
+    }
+    imp.headerIndex = h;
+    imp.headerAuto = h;
     remap();
   }
 
@@ -1147,7 +1235,12 @@
     var rows = curRows();
     var n = colCount(rows);
     var sheet = imp.sheets[imp.sheetIndex];
-    var guess = safeCall('importer', 'guessMapping', [headerCells(rows, n), course,
+    var cells = headerCells(rows, n);
+    // Header cells that may be shown in privacy mode: all of a row with 2+ known column names (a real
+    // header row, where "Total" is not a name either), else only the known ones.
+    imp.headerKnown = knownHeaders(cells, course);
+    if (Object.keys(imp.headerKnown).length >= 2) cells.forEach(function (c, i) { imp.headerKnown[i] = true; });
+    var guess = safeCall('importer', 'guessMapping', [cells, course,
       { formulaColumns: sheet && Array.isArray(sheet.formulaColumns) ? sheet.formulaColumns : [] }], []);
     var valid = {};
     targetList(course).forEach(function (t) { valid[t.key] = true; });
@@ -1206,7 +1299,8 @@
     imp.plan = null;
     imp.planError = null;
     try {
-      var p = GT.importer.plan(course, curRows(), imp.headerIndex, imp.mapping.slice(), planOptions());
+      var input = planInput();
+      var p = GT.importer.plan(course, input.rows, input.headerIndex, imp.mapping.slice(), planOptions());
       if (!p || !Array.isArray(p.items)) throw new Error('The import module returned no plan.');
       imp.plan = p;
     } catch (e) {
@@ -1219,8 +1313,33 @@
     var o = imp.options;
     return {
       matchBy: o.matchBy, createMissing: !!o.createMissing, emptyCells: o.emptyCells, overwrite: !!o.overwrite,
-      switchAttendanceToTotals: !!(o.switchAttendanceToTotals && hasAttendanceTarget())
+      switchAttendanceToTotals: !!(o.switchAttendanceToTotals && hasAttendanceTarget()),
+      // Matching by No: rename a student whose name in the file is spelled differently (off: such a row is skipped).
+      updateNames: o.matchBy === 'no' && !!o.updateNames,
+      finalLetterCells: planLetterCells()
     };
+  }
+
+  /** The marked final-letter cells of the current sheet, in the row indexes planInput gives the importer. */
+  function planLetterCells() {
+    var s = imp.sheets[imp.sheetIndex];
+    var cells = s && Array.isArray(s.finalLetterCells) ? s.finalLetterCells : null;
+    if (!cells) return null;
+    var shift = planInput().shift;
+    return cells.map(function (p) { return [p[0] + shift, p[1]]; });
+  }
+
+  /** A message of the plan with its "row N" in the file's numbering: without a header row, the plan
+   * counts the blank header row put in front of the data (see planInput). Quoted text from the file is
+   * left as it is. */
+  function fileRowText(text, shift) {
+    var s = str(text);
+    if (!shift) return s;
+    return s.replace(/"[^"]*"|\brow (\d+)\b/g, function (m, n) {
+      if (n === undefined) return m;
+      var v = parseInt(n, 10) - shift;
+      return v >= 1 ? 'row ' + v : m;
+    });
   }
 
   function onImportCourseChanged(course) {
@@ -1338,14 +1457,16 @@
     if (imp.sheets.length > 1) {
       out += '<div class="field"><label for="xc-sheet">Sheet</label><select id="xc-sheet" data-act="sheet">' +
         imp.sheets.map(function (s, i) {
-          return '<option value="' + i + '"' + (i === imp.sheetIndex ? ' selected' : '') + '>' + esc(s.name) + ' (' + plural(s.rows.length, 'row') +
+          return '<option value="' + i + '"' + (i === imp.sheetIndex ? ' selected' : '') + (s.tooMany ? ' disabled' : '') + '>' + esc(s.name) + ' (' +
+            (s.tooMany ? 'more than ' + fmtCount(MAX_ROWS) + ' rows: too long to import' : plural(s.rows.length, 'row')) +
             (s.hidden ? ', hidden in Excel' : '') + ')</option>';
         }).join('') + '</select></div>';
     }
     var priv = privacyOn();
     var choices = Math.min(rows.length, HEADER_CHOICES);
     if (imp.headerIndex >= choices) choices = imp.headerIndex + 1;
-    var opts = '';
+    var opts = '<option value="-1"' + (imp.headerIndex === -1 ? ' selected' : '') + '>No header row' +
+      (imp.headerAuto === -1 ? ' (found automatically)' : '') + ': row 1 is a student</option>';
     for (var r = 0; r < choices; r++) {
       var cells = (rows[r] || []).filter(function (v) { return String(v).trim() !== ''; });
       var preview = priv ? '' : cells.slice(0, 4).join(' | ');
@@ -1353,27 +1474,50 @@
       opts += '<option value="' + r + '"' + (r === imp.headerIndex ? ' selected' : '') + '>Row ' + (r + 1) +
         (r === imp.headerAuto ? ' (found automatically)' : '') + (preview ? ': ' + esc(preview) : '') + '</option>';
     }
-    out += '<div class="field xc-header-field"><label for="xc-header-row">Header row</label><select id="xc-header-row" data-act="header-row">' + opts + '</select></div>';
+    out += '<div class="field xc-header-field"><label for="xc-header-row">Header row</label><select id="xc-header-row" data-act="header-row" aria-describedby="xc-header-check">' + opts + '</select></div>';
     out += '</div>';
 
+    var noHeader = imp.headerIndex < 0;
+    var check = '';
+    if (noHeader) {
+      check = note('info', 'No header row: every row is read as a student, starting with row 1. On the next step, choose where each column goes.');
+    } else {
+      // A data row taken as the header row would never be imported, and nothing else would say so.
+      var look = headerLook(rows[imp.headerIndex], course);
+      if (look.numbers > 0 || look.known === 0) {
+        var why = [];
+        if (look.numbers) why.push(look.numbers === 1 ? 'holds a number' : 'holds numbers');
+        if (!look.known) why.push('has no column name that Grade Tracker knows');
+        check = note('alert', 'Check the header row: row ' + (imp.headerIndex + 1) + ' ' + why.join(' and ') + ', so it may be a student. ' +
+          'If the file has no header row, choose <strong>No header row</strong> above; otherwise row ' + (imp.headerIndex + 1) + ' is not imported.', 'is-warn');
+      }
+    }
+    out += '<div class="xc-header-check" id="xc-header-check">' + check + '</div>';
+
     var pii = piiColumns();
-    var last = Math.min(rows.length, imp.headerIndex + 1 + PREVIEW_ROWS);
+    var firstData = imp.headerIndex + 1;
+    var dataRows = Math.max(0, rows.length - firstData);
+    var last = Math.min(rows.length, firstData + PREVIEW_ROWS);
     var table = '<div class="table-wrap xc-preview-wrap" data-keep-scroll="preview"><table class="table xc-preview"><thead><tr><th class="xc-rownum" scope="col"><span class="sr-only">Row</span></th>';
     for (var c = 0; c < n; c++) table += '<th scope="col" class="xc-colhead">' + colLetter(c) + '</th>';
     table += '</tr></thead><tbody>';
-    for (var i = imp.headerIndex; i < last; i++) {
+    for (var i = Math.max(0, imp.headerIndex); i < last; i++) {
       var isHead = i === imp.headerIndex;
       table += '<tr' + (isHead ? ' class="xc-header-row"' : '') + '><th scope="row" class="xc-rownum">' + (i + 1) + '</th>';
       for (var k = 0; k < n; k++) {
         var v = rows[i] && rows[i][k] !== undefined ? rows[i][k] : '';
-        // No tooltip on name cells: a tooltip would show the name even in privacy mode.
-        var isPii = !isHead && pii[k] && v !== '';
-        table += '<td' + (isPii ? ' class="pii"' : ' title="' + esc(v) + '"') + '>' + esc(v) + '</td>';
+        // Name cells get no tooltip: it would show the name even in privacy mode. A header cell that is not
+        // a known column name may be a name too (a file without a header row).
+        var isPii = v !== '' && (isHead ? !imp.headerKnown[k] : pii[k]);
+        var tip = !isPii || (isHead && !priv);
+        table += '<td' + (isPii ? ' class="pii"' : '') + (tip ? ' title="' + esc(v) + '"' : '') + '>' + esc(v) + '</td>';
       }
       table += '</tr>';
     }
     table += '</tbody></table></div>';
-    out += '<p class="xc-preview-cap">Preview: the header row (highlighted) and the next ' + plural(Math.max(0, last - imp.headerIndex - 1), 'row') + ' of ' + plural(Math.max(0, rows.length - imp.headerIndex - 1), 'data row') + '.</p>';
+    out += '<p class="xc-preview-cap">' + (noHeader
+      ? 'Preview: the first ' + plural(last, 'row') + ' of ' + plural(dataRows, 'data row') + ' (no header row).'
+      : 'Preview: the header row (highlighted) and the next ' + plural(Math.max(0, last - firstData), 'row') + ' of ' + plural(dataRows, 'data row') + '.') + '</p>';
     out += table;
     out += '<div class="xc-step-foot">' +
       '<button type="button" class="btn" data-act="imp-restart">' + icon('chevron-right', 'xc-flip') + 'Back</button>' +
@@ -1430,7 +1574,9 @@
     var m = mappedSet();
 
     var out = stepHead(3, 'Match each column to where it goes',
-      'Each column of the file was matched automatically. Check the <strong>Import into</strong> column and change anything that is wrong. ' +
+      (imp.headerIndex < 0
+        ? 'The file has no header row, so nothing could be matched automatically. Use the sample values to choose where each column goes in <strong>Import into</strong>. '
+        : 'Each column of the file was matched automatically. Check the <strong>Import into</strong> column and change anything that is wrong. ') +
       'Columns set to "Do not import" are skipped. Total is always calculated by Grade Tracker, so it is never imported.');
     out += fileLine();
     if (finalized) {
@@ -1454,13 +1600,17 @@
         if (v !== '') samples.push(v);
       }
       var cls = (t === 'ignore' ? 'is-ignored' : '') + (dupKeys[t] ? ' is-dup' : '');
+      // A header cell that is not a known column name may be a student's name (a file without a header row).
+      var headText = header[i].trim()
+        ? '<span' + (imp.headerKnown[i] ? '' : ' class="pii"') + '>' + esc(header[i]) + '</span>'
+        : '<span class="muted">' + (imp.headerIndex < 0 ? '(no header row)' : '(blank)') + '</span>';
       out += '<tr class="' + cls.trim() + '" data-col="' + i + '">' +
         '<td class="xc-map-letter">' + colLetter(i) + '</td>' +
-        '<td class="xc-map-header">' + (header[i].trim() ? esc(header[i]) : '<span class="muted">(blank)</span>') + '</td>' +
+        '<td class="xc-map-header">' + headText + '</td>' +
         '<td class="xc-map-samples">' + (samples.length ? samples.map(function (s) {
           return '<span class="xc-sample' + (pii[i] ? ' pii"' : '" title="' + esc(s) + '"') + '>' + esc(s) + '</span>';
         }).join('') : '<span class="muted">(empty)</span>') + '</td>' +
-        '<td class="xc-map-target">' + targetSelect(i, t, tg, header[i].trim()) +
+        '<td class="xc-map-target">' + targetSelect(i, t, tg, shownHeader(header, i)) +
           (dupKeys[t] ? '<span class="badge badge-danger">' + icon('alert') + 'used twice</span>' : '') +
           (finalized && isScoreTarget(t) ? '<span class="badge badge-warn" title="Scores are finalized: unlock them in the Grades tab first">' + icon('lock') + 'blocked: scores are finalized</span>' : '') +
         '</td></tr>';
@@ -1475,6 +1625,7 @@
           '<button type="button" data-act="opt-match" data-key="name" aria-pressed="' + (o.matchBy === 'name') + '">Name (last + first)</button>' +
           '<button type="button" data-act="opt-match" data-key="no" aria-pressed="' + (o.matchBy === 'no') + '">No (student number)</button>' +
         '</div><span class="xc-help">Capital letters and extra spaces are ignored.</span></div>' +
+      updateNamesHtml(o) +
       '<label class="check"><input type="checkbox" id="xc-opt-create" data-act="opt-create"' + (o.createMissing ? ' checked' : '') + '> ' +
         'Add students who are not in ' + esc(course.code) + ' yet</label>' +
       '<div class="xc-opt"><span class="label" id="xc-empty-l">Empty cells in the file</span>' +
@@ -1508,27 +1659,93 @@
     return out;
   }
 
+  /** Matching by No with a name column mapped: whether a differently spelled name in the file renames
+   * the student. Off (the default), such a row is skipped, because the file may number its students in
+   * another order and its scores would land on another student. */
+  function updateNamesHtml(o) {
+    var m = mappedSet();
+    if (o.matchBy !== 'no' || !(m.lastName || m.firstName || m.fullName)) return '';
+    return '<div class="xc-opt-sub">' +
+      '<label class="check"><input type="checkbox" id="xc-opt-names" data-act="opt-update-names"' + (o.updateNames ? ' checked' : '') +
+        ' aria-describedby="xc-opt-names-h"> Update names from the file (to fix spellings)</label>' +
+      '<p class="xc-help" id="xc-opt-names-h">' + (o.updateNames
+        ? 'On: a student whose name in the file is spelled differently gets the file\'s spelling. Use this only when the file\'s No values are the students\' real numbers in this course.'
+        : 'Off: a row whose name differs from the student with that No is skipped, because the file may number its students differently.') +
+      '</p></div>';
+  }
+
   /** Plain-language notes on the current mapping (html). */
   function mappingNotes(course, header) {
     var out = [];
     var colOf = function (key) { return imp.mapping.indexOf(key); };
-    var name = function (i) { return colLetter(i) + (header[i] && header[i].trim() ? ' ("' + esc(header[i].trim()) + '")' : ''); };
+    var name = function (i) { var h = shownHeader(header, i); return colLetter(i) + (h ? ' ("' + esc(h) + '")' : ''); };
     course.assessments.forEach(function (a) {
       var r = colOf('raw:' + a.id), w = colOf('weighted:' + a.id);
       if (r >= 0 && w >= 0) {
         out.push(esc(a.name) + ': the score comes from column ' + name(r) + '. Column ' + name(w) + ' holds the same score weighted, so it is not needed and is skipped.');
       } else if (w >= 0) {
-        out.push(esc(a.name) + ': column ' + name(w) + ' holds weighted points; each value is turned back into a score (value \u00f7 ' +
-          esc(String(a.weight)) + ' \u00d7 ' + esc(String(a.maxScore)) + ').');
+        // The importer converts with the weight written in the header ("Project II 20%") when it differs
+        // from this course's weight: the file's points were computed with that weight.
+        var hw = typeof GT.importer.weightFromHeader === 'function' ? GT.importer.weightFromHeader(header[w]) : null;
+        var cw = typeof a.weight === 'number' ? a.weight : 0;
+        var differs = typeof hw === 'number' && isFinite(hw) && util.fix(hw) !== util.fix(cw);
+        if (differs && !(hw > 0)) {
+          out.push(esc(a.name) + ': column ' + name(w) + ' is skipped: its header says 0%, and a weight of 0% cannot be turned back into scores.');
+        } else {
+          var wUsed = differs ? hw : cw;
+          out.push(esc(a.name) + ': column ' + name(w) + ' holds weighted points; each value is turned back into a score (value \u00f7 ' +
+            esc(String(wUsed)) + ' \u00d7 ' + esc(String(a.maxScore)) + ').' +
+            (differs ? ' The header says ' + esc(String(hw)) + '%, but ' + esc(a.name) + ' weighs ' + esc(String(cw)) +
+              '% in this course, so the header\'s weight is used.' : ''));
+        }
       }
     });
     var fl = colOf('finalLetter');
     if (fl >= 0) {
-      out.push('Column ' + name(fl) + ' sets each student\'s <strong>final letter</strong>. If those letters were only suggestions, set it to "Do not import". Letters that are not in this course\'s scale are skipped.');
+      var sheet = imp.sheets[imp.sheetIndex];
+      // A Grade Tracker workbook lists the letters the importer takes as final letters (readWorkbook): the
+      // marked ones and those changed in the spreadsheet after the export. They are counted apart: only
+      // the first ones carry a mark the TA can find in the file.
+      var counts = sheet && Array.isArray(sheet.finalLetterCells) && !/\bfinal\b/i.test(str(header[fl]))
+        ? finalLetterCounts(sheet, fl) : null;
+      if (counts && counts.marked + counts.edited === 0) {
+        out.push('Column ' + name(fl) + ' comes from a Grade Tracker file that has no <strong>final letters</strong> yet: its letters are suggestions from the cutoffs, so none is stored as a final letter.');
+      } else if (counts) {
+        var parts = [];
+        if (counts.marked) {
+          parts.push('its ' + plural(counts.marked, 'letter') + ' marked as ' + (counts.marked === 1 ? 'a final letter' : 'final letters') + ' (assigned by the instructor)');
+        }
+        if (counts.edited) parts.push('its ' + plural(counts.edited, 'letter') + ' changed in the spreadsheet after the export');
+        var one = counts.marked + counts.edited === 1;
+        out.push('Column ' + name(fl) + ' comes from a Grade Tracker file: only ' + parts.join(' and ') + ' ' +
+          (one ? 'is imported as a <strong>final letter</strong>' : 'are imported as <strong>final letters</strong>') +
+          '. The other letters were suggestions from the cutoffs and are not stored.');
+      } else {
+        out.push('Column ' + name(fl) + ' sets each student\'s <strong>final letter</strong>. If those letters were only suggestions, set it to "Do not import". Letters that are not in this course\'s scale are skipped.');
+      }
     }
     var ab = colOf('absent'), at = colOf('absencesTotal');
     if (ab >= 0 && at >= 0) out.push('Column ' + name(at) + ' is skipped: unexcused absences come from column ' + name(ab) + '.');
-    else if (at >= 0) out.push('Column ' + name(at) + ' is one total, so it is stored as unexcused (not allowed) absences. Change the excused ones in the Attendance tab afterwards.');
+    else if (at >= 0) {
+      out.push('Column ' + name(at) + ' is one total: the excused (allowed) absences already stored stay, and the rest is stored as unexcused (not allowed) absences, so each student\'s total equals the file.');
+    }
+    return out;
+  }
+
+  /** The final letters of a Grade Tracker sheet in column col, below the header row: { marked } with
+   * the note "Final letter assigned by the instructor", { edited } changed in the spreadsheet after the
+   * export (both are in finalLetterCells; editedLetterCells tells them apart). */
+  function finalLetterCounts(sheet, col) {
+    var edited = Object.create(null);
+    (Array.isArray(sheet.editedLetterCells) ? sheet.editedLetterCells : []).forEach(function (p) {
+      if (p[1] === col) edited[p[0]] = true;
+    });
+    var out = { marked: 0, edited: 0 };
+    sheet.finalLetterCells.forEach(function (p) {
+      if (p[1] !== col || p[0] <= imp.headerIndex) return;
+      if (edited[p[0]]) out.edited++;
+      else out.marked++;
+    });
     return out;
   }
 
@@ -1568,7 +1785,17 @@
       out += '<div class="xc-step-foot"><button type="button" class="btn" data-act="imp-back">' + icon('chevron-right', 'xc-flip') + 'Back</button></div>';
       return out;
     }
+    // Row numbers of the file (the plan counts a blank header row in front when the file has none);
+    // fileRowText does the same for the "row N" inside the plan's messages.
+    var shift = planInput().shift;
+    var rowNoOf = function (it) { return typeof it.rowIndex === 'number' ? it.rowIndex + 1 - shift : ''; };
+    // The attendance mode switch is a change of its own: it is applied even when every count is the same.
+    var modeNow = attendanceMode(course);
+    var switchMode = !!(plan.options && plan.options.switchAttendanceToTotals && plan.attendanceMapped !== false) && modeNow !== 'totals';
     var tiles = [];
+    if (switchMode) {
+      tiles.push('<div class="xc-count"><span class="xc-count-n">1</span><span class="xc-count-l">course setting changed (attendance mode)</span></div>');
+    }
     COUNT_INFO.forEach(function (ci) {
       var v = counts[ci.key];
       if (typeof v !== 'number') return;
@@ -1579,7 +1806,7 @@
     Object.keys(counts).forEach(function (k) {
       if (COUNT_INFO.some(function (ci) { return ci.key === k; })) return;
       if (typeof counts[k] !== 'number' || !counts[k]) return;
-      tiles.push('<div class="xc-count"><span class="xc-count-n">' + fmtCount(counts[k]) + '</span><span class="xc-count-l">' + esc(k) + '</span></div>');
+      tiles.push('<div class="xc-count"><span class="xc-count-n">' + fmtCount(counts[k]) + '</span><span class="xc-count-l">' + esc(countWords(k)) + '</span></div>');
     });
     out += '<div class="xc-counts">' + tiles.join('') + '</div>';
     var helps = COUNT_INFO.filter(function (ci) { return ci.help && counts[ci.key]; }).map(function (ci) {
@@ -1602,6 +1829,10 @@
     // Changes (first 50)
     var changes = [];
     var total = 0;
+    if (switchMode) {
+      total++;
+      changes.push({ item: { action: 'course' }, ch: { field: 'Attendance mode', oldValue: ATTENDANCE_MODE_LABELS[modeNow], newValue: ATTENDANCE_MODE_LABELS.totals } });
+    }
     plan.items.forEach(function (it) {
       if (!it || it.action === 'skip' || !Array.isArray(it.changes)) return;
       it.changes.forEach(function (ch) {
@@ -1618,13 +1849,27 @@
       });
     });
     out += '<h4 class="xc-sub-h">Changes' + (total ? ' <span class="muted">(' + (total > CHANGE_LIMIT ? 'first ' + CHANGE_LIMIT + ' of ' + fmtCount(total) : fmtCount(total)) + ')</span>' : '') + '</h4>';
+    var used = plan.items.filter(function (it) { return it && it.action !== 'skip'; }).length;
     if (!changes.length) {
-      out += note('info', 'Nothing to change: the file matches what is already in Grade Tracker.');
+      if (!plan.items.length) {
+        out += note('alert', imp.headerIndex < 0
+          ? 'This sheet has no data rows. Choose another sheet or another file.'
+          : 'This file has no data rows under the header row (row ' + (imp.headerIndex + 1) + '). Choose another header row (Back) or another file.', 'is-warn');
+      } else if (!used) {
+        out += note('alert', 'Nothing to import: every row of the file is skipped. The reasons are listed under "Skipped rows" below.', 'is-warn');
+      } else {
+        out += note('info', 'Nothing to change: the file matches what is already in Grade Tracker' +
+          (counts.kept ? ', except for ' + plural(counts.kept, 'value') + ' kept because "Replace scores that are already entered" is off' : '') + '.');
+      }
     } else {
       out += '<div class="table-wrap xc-changes-wrap" data-keep-scroll="changes"><table class="table xc-changes"><thead><tr>' +
         '<th scope="col">Student</th><th scope="col">What</th><th scope="col">Before</th><th scope="col">After</th></tr></thead><tbody>' +
         changes.map(function (x) {
           var it = x.item, ch = x.ch || {};
+          if (it.action === 'course') {
+            return '<tr class="xc-course-change"><td><span class="muted">Whole course</span></td><td>' + esc(str(ch.field)) + '</td>' +
+              '<td class="xc-old">' + valueHtml(ch.oldValue) + '</td><td class="xc-new">' + valueHtml(ch.newValue) + '</td></tr>';
+          }
           var blocked = ch.blocked || ch.status === 'blocked';
           var flags = (it.action === 'new' ? '<span class="badge badge-accent">new</span>' : '') +
             (it.action === 'propagated' ? '<span class="badge badge-info" title="Not in the file: follows the new team score">via team score</span>' : '') +
@@ -1632,6 +1877,7 @@
             (blocked ? '<span class="badge badge-warn">' + icon('lock') + 'blocked</span>' : '') +
             (ch.invalid ? '<span class="badge badge-danger">not a number</span>' : '') +
             (ch.notOnList ? '<span class="badge badge-warn">not on the list</span>' : '') +
+            (ch.emptiedByMove ? '<span class="badge badge-warn" title="The new team has no score for this item yet">emptied by the team move</span>' : '') +
             (ch.override ? '<span class="badge badge-accent">override</span>' : '');
           var isPiiField = /name|notes/i.test(str(ch.field));
           return '<tr' + (blocked ? ' class="is-blocked"' : '') + '><td><span class="pii">' + esc(str(it.name) || '(no name)') + '</span> ' + flags + '</td>' +
@@ -1650,11 +1896,11 @@
     if (issues.length) {
       out += '<h4 class="xc-sub-h">Values to check <span class="muted">(' + fmtCount(issues.length) + ')</span></h4>' +
         '<ul class="xc-skipped xc-issues">' + issues.slice(0, SKIP_LIMIT).map(function (y) {
-          var rowNo = typeof y.item.rowIndex === 'number' ? y.item.rowIndex + 1 : '';
+          var rowNo = rowNoOf(y.item);
           return '<li><span class="xc-skip-row">Row ' + esc(rowNo) + '</span>' +
             (y.item.name ? '<span class="pii">' + esc(y.item.name) + '</span>' : '') +
             '<span class="xc-issue-field">' + esc(str(y.x.field)) + (str(y.x.value) !== '' ? ' "' + esc(str(y.x.value).slice(0, 40)) + '"' : '') + '</span>' +
-            '<span class="xc-skip-reason">' + esc(str(y.x.message)) + '</span></li>';
+            '<span class="xc-skip-reason">' + esc(fileRowText(y.x.message, shift)) + '</span></li>';
         }).join('') + (issues.length > SKIP_LIMIT ? '<li class="muted">\u2026and ' + (issues.length - SKIP_LIMIT) + ' more</li>' : '') + '</ul>';
     }
 
@@ -1663,15 +1909,15 @@
     if (skipped.length) {
       out += '<h4 class="xc-sub-h">Skipped rows <span class="muted">(' + fmtCount(skipped.length) + ')</span></h4>' +
         '<ul class="xc-skipped">' + skipped.slice(0, SKIP_LIMIT).map(function (it) {
-          var rowNo = typeof it.rowIndex === 'number' ? it.rowIndex + 1 : '';
+          var rowNo = rowNoOf(it);
           return '<li><span class="xc-skip-row">Row ' + esc(rowNo) + '</span>' +
             (it.name ? '<span class="pii">' + esc(it.name) + '</span>' : '') +
-            '<span class="xc-skip-reason">' + esc(str(it.reason) || 'Skipped') + '</span></li>';
+            '<span class="xc-skip-reason">' + esc(fileRowText(it.reason, shift) || 'Skipped') + '</span></li>';
         }).join('') + (skipped.length > SKIP_LIMIT ? '<li class="muted">\u2026and ' + (skipped.length - SKIP_LIMIT) + ' more</li>' : '') + '</ul>';
     }
 
     var realChanges = typeof counts.changes === 'number' ? counts.changes : total;
-    var importable = realChanges > 0 || (counts['new'] || 0) > 0;
+    var importable = realChanges > 0 || (counts['new'] || 0) > 0 || switchMode;
     out += '<div class="callout xc-undo-note">' + icon('undo') + '<span>The import is <strong>one step</strong>: Undo (Ctrl+Z, or the Undo button at the top) reverts the whole import. ' +
       'Every change is also written to the History tab.</span></div>';
     out += '<div class="xc-step-foot">' +
@@ -1689,7 +1935,7 @@
     var parts = [];
     if (c.update) parts.push(plural(c.update, 'student') + ' updated');
     if (c['new']) parts.push(plural(c['new'], 'new student'));
-    if (typeof c.changes === 'number') parts.push(plural(c.changes, 'change'));
+    if (typeof c.changes === 'number' && (c.changes || !r.switched)) parts.push(plural(c.changes, 'change'));
     if (c.skip) parts.push(plural(c.skip, 'row') + ' skipped');
     var sum = r.summary && typeof r.summary === 'object' ? r.summary : {};
     if (sum.teamsCreated) parts.push(plural(sum.teamsCreated, 'team') + ' created');
@@ -1702,29 +1948,74 @@
           '<button type="button" class="btn btn-primary" data-act="imp-restart">Import another file</button>' +
         '</div></div>';
     }
-    // Undone since (the import is on top of the redo stack): say so instead of "Imported".
-    var undone = !!(r.label && GT.store.redoLabel && GT.store.redoLabel() === r.label &&
-      GT.store.course() && GT.store.course().id === r.courseId);
-    if (undone) {
+    // Where the import is in the undo history (followed by trackImport).
+    var tr = r.track || { state: 'applied', later: 0 };
+    var st = GT.store;
+    var undoBtn = 'Undo (Ctrl+Z, or the Undo button at the top)';
+    var redoBtn = 'Redo (Ctrl+Y, or the Redo button at the top)';
+    if (tr.state === 'undone' || tr.state === 'discarded') {
+      var how;
+      if (tr.state === 'discarded') {
+        how = 'It can no longer be redone, because other changes were made after the undo. To bring the data in again, import the file again.';
+      } else if (tr.later) {
+        how = redoBtn + ' first re-applies the ' + plural(tr.later, 'other change') + ' you undid after it, then the whole import.';
+      } else {
+        how = st.redoLabel && st.redoLabel() === r.label ? redoBtn + ' applies it again.' : '';
+      }
       return '<div class="xc-done">' +
         '<div class="xc-done-icon is-info">' + icon('undo') + '</div>' +
         '<h3 class="xc-imp-step-h" tabindex="-1">The import was undone</h3>' +
-        '<p>Everything imported from ' + esc(imp.fileName) + ' was reverted. Redo (Ctrl+Y, or the Redo button at the top) applies it again.</p>' +
+        '<p>Everything imported from ' + esc(imp.fileName) + ' was reverted.' + (how ? ' ' + how : '') + '</p>' +
         '<div class="xc-done-actions">' +
-          '<button type="button" class="btn btn-primary" data-act="imp-restart">Import another file</button>' +
+          (tr.state === 'discarded' ? '<button type="button" class="btn btn-primary" data-act="imp-again">' + icon('upload') + 'Import this file again</button>' : '') +
+          '<button type="button" class="btn' + (tr.state === 'discarded' ? ' btn-ghost' : ' btn-primary') + '" data-act="imp-restart">Import another file</button>' +
         '</div></div>';
     }
-    var out = '<div class="xc-done">' +
+    var undoText;
+    if (tr.state === 'gone') {
+      undoText = 'The data was replaced since (a backup was restored or all data was reset), so this import can no longer be undone.';
+    } else if (tr.later) {
+      undoText = 'You made ' + plural(tr.later, 'change') + ' after the import. ' + undoBtn + ' reverts ' + (tr.later === 1 ? 'that change' : 'those changes') +
+        ' first, then the whole import in one step.';
+    } else if (st.undoLabel && st.undoLabel() === r.label) {
+      undoText = undoBtn + ' reverts the whole import in one step.';
+    } else {
+      undoText = '';
+    }
+    return '<div class="xc-done">' +
       '<div class="xc-done-icon">' + icon('check') + '</div>' +
       '<h3 class="xc-imp-step-h" tabindex="-1">Imported from ' + esc(imp.fileName) + '</h3>' +
       '<p>' + esc(parts.join(', ') || 'Done') + '.' + (r.switched ? ' Attendance now uses "Totals only": enter the number of sessions held in the Attendance tab.' : '') + '</p>' +
-      '<p class="muted">Undo (Ctrl+Z, or the Undo button at the top) reverts the whole import in one step. Every change is listed in the History tab.</p>' +
+      '<p class="muted">' + (undoText ? undoText + ' ' : '') + 'Every change is listed in the History tab.</p>' +
       '<div class="xc-done-actions">' +
         '<button type="button" class="btn btn-primary" data-act="goto-grades">' + icon('grid') + 'Open Grades</button>' +
         '<button type="button" class="btn" data-act="goto-history">' + icon('history') + 'See the changes in History</button>' +
         '<button type="button" class="btn btn-ghost" data-act="imp-restart">Import another file</button>' +
       '</div></div>';
-    return out;
+  }
+
+  /** Follows the finished import through the course's undo and redo stacks (store notifications), so the
+   * done card never claims the import is applied, or that Undo reverts it, when that is no longer true.
+   * `later` counts the steps above the import on the stack it is on. States: 'applied' (on the undo
+   * stack), 'undone' (on the redo stack), 'discarded' (undone, then another change cleared the redo
+   * stack), 'gone' (all data was replaced or the course deleted). */
+  function trackImport(info) {
+    var r = imp.result;
+    var t = r && r.track;
+    if (!t || !info) return;
+    if (info.type === 'replace' || (info.type === 'course-delete' && info.courseId === r.courseId)) { t.state = 'gone'; return; }
+    if (info.courseId !== r.courseId || t.state === 'gone' || t.state === 'discarded') return;
+    if (info.type === 'transact') {
+      // A new change goes on the undo stack and empties the redo stack.
+      if (t.state === 'applied') t.later++;
+      else { t.state = 'discarded'; t.later = 0; }
+    } else if (info.type === 'undo') {
+      if (t.state === 'applied') { if (t.later) t.later--; else t.state = 'undone'; }
+      else t.later++;
+    } else if (info.type === 'redo') {
+      if (t.state === 'undone') { if (t.later) t.later--; else t.state = 'applied'; }
+      else t.later++;
+    }
   }
 
   // ------------------------------------------------------------------ import: actions
@@ -1740,8 +2031,9 @@
   function doImport() {
     var course = GT.store.course();
     if (!course || !importerReady() || imp.step !== 4) return;
-    var rows = curRows();
-    var headerIndex = imp.headerIndex;
+    var input = planInput();
+    var rows = input.rows;
+    var headerIndex = input.headerIndex;
     var mapping = imp.mapping.slice();
     var options = planOptions();
     var usedPlan = null;
@@ -1769,17 +2061,21 @@
     // transact notifies (and so bumps the version) only when the course really changed.
     var changed = versionBefore === null ? true : GT.store.version() !== versionBefore;
     var cNow = GT.store.course();
+    var switched = (summary && summary.modeSwitched === true) || (modeBefore !== 'totals' && !!cNow && attendanceMode(cNow) === 'totals');
     imp.result = {
-      counts: counts, summary: summary, label: label, courseId: course.id, nothing: !changed,
-      switched: (summary && summary.modeSwitched === true) || (modeBefore !== 'totals' && !!cNow && attendanceMode(cNow) === 'totals')
+      counts: counts, summary: summary, label: label, courseId: course.id, nothing: !changed, switched: switched,
+      track: changed ? { state: 'applied', later: 0 } : null   // followed by trackImport from now on
     };
     imp.step = 5;
     focusStepHeading = true;
     if (!changed) {
       ui.toast('Nothing to import: the file matches what is already in Grade Tracker.', { type: 'info' });
     } else {
-      var msg = 'Imported ' + imp.fileName + ': ' + plural(counts.changes || 0, 'change') +
-        (counts['new'] ? ', ' + plural(counts['new'], 'new student') : '') + '. Undo (Ctrl+Z) reverts the whole import.';
+      var what = [];
+      if (counts.changes || !switched) what.push(plural(counts.changes || 0, 'change'));
+      if (counts['new']) what.push(plural(counts['new'], 'new student'));
+      if (switched) what.push('attendance now uses "Totals only"');
+      var msg = 'Imported ' + imp.fileName + ': ' + what.join(', ') + '. Undo (Ctrl+Z) reverts the whole import.';
       ui.toast(msg, { type: 'success', timeout: 9000, action: { label: 'Open Grades', fn: function () { if (GT.app) GT.app.navigate('grades'); } } });
     }
     announce('Import finished.');
@@ -1847,6 +2143,13 @@
         goStep(Math.min(4, imp.step + 1));
         break;
       case 'imp-import': doImport(); break;
+      case 'imp-again':
+        // The import was undone and can no longer be redone: preview the same file again on today's data.
+        if (!imp.sheets.length) break;
+        imp.result = null;
+        imp.notice = null;
+        goStep(mappingProblems(GT.store.course()).length ? 3 : 4);
+        break;
       case 'opt-match': imp.options.matchBy = key === 'no' ? 'no' : 'name'; imp.planKey = null; refresh(); break;
       case 'opt-empty': imp.options.emptyCells = key === 'clear' ? 'clear' : 'keep'; imp.planKey = null; refresh(); break;
       case 'goto-grades': if (GT.app) GT.app.navigate('grades'); break;
@@ -1869,10 +2172,15 @@
       }
       case 'opt-settings': setPrefs({ includeSettings: t.checked }); break;
       case 'opt-history': setPrefs({ includeHistory: t.checked }); break;
-      case 'sheet': setSheet(parseInt(t.value, 10) || 0); refresh(); break;
+      case 'sheet': {
+        var si = parseInt(t.value, 10) || 0;
+        if (imp.sheets[si] && !imp.sheets[si].tooMany) setSheet(si);
+        refresh();
+        break;
+      }
       case 'header-row': {
         var h = parseInt(t.value, 10);
-        if (h >= 0 && h < curRows().length) { imp.headerIndex = h; remap(); }
+        if (h >= -1 && h < curRows().length) { imp.headerIndex = h; remap(); }
         refresh();
         break;
       }
@@ -1890,6 +2198,7 @@
       case 'opt-create': imp.options.createMissing = t.checked; imp.planKey = null; refresh(); break;
       case 'opt-overwrite': imp.options.overwrite = t.checked; imp.planKey = null; refresh(); break;
       case 'opt-att': imp.options.switchAttendanceToTotals = t.checked; imp.planKey = null; refresh(); break;
+      case 'opt-update-names': imp.options.updateNames = t.checked; imp.planKey = null; refresh(); break;
       default: break;
     }
   }
@@ -1935,14 +2244,21 @@
     } catch (err) { /* old browsers */ }
   }
 
+  /** A file may be dropped on the Import card while it waits for one (step 1). */
+  function fileDropAllowed(e) {
+    var zone = e.target && e.target.closest ? e.target.closest('#xc-import') : null;
+    return !!zone && imp.step === 1 && !imp.loading;
+  }
+
   function onDragOver(e) {
     if (isFileDrag(e)) {
-      var zone = e.target.closest ? e.target.closest('#xc-import') : null;
-      if (!zone || imp.step !== 1 || imp.loading) return;
+      // Always handled: a file the page does not take would otherwise open in the tab and leave the app.
+      // Elsewhere the drop is refused ("not allowed" pointer).
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
+      var ok = fileDropAllowed(e);
+      try { e.dataTransfer.dropEffect = ok ? 'copy' : 'none'; } catch (err) { /* read-only in old browsers */ }
       var dz = boundEl.querySelector('#xc-drop');
-      if (dz) dz.classList.add('is-over');
+      if (dz) dz.classList.toggle('is-over', ok);
       return;
     }
     if (!drag) return;
@@ -1965,11 +2281,16 @@
 
   function onDrop(e) {
     if (isFileDrag(e)) {
-      var zone = e.target.closest ? e.target.closest('#xc-import') : null;
-      if (!zone) return;
-      e.preventDefault();
+      e.preventDefault(); // never let the browser open the file instead
       clearDropMarks();
-      if (imp.step !== 1 || imp.loading) return;
+      if (!fileDropAllowed(e)) {
+        if (imp.loading) return;
+        var inImport = !!(e.target && e.target.closest && e.target.closest('#xc-import'));
+        ui.toast(inImport || imp.step !== 1
+          ? 'A file is already open in the import. Press "Choose another file" first, then drop the new file.'
+          : 'To import a file, drop it on "Import from a file" below the Export card.', { type: 'info' });
+        return;
+      }
       var f = e.dataTransfer.files && e.dataTransfer.files[0];
       if (f) loadFile(f);
       return;
@@ -1991,14 +2312,21 @@
     if (boundEl) Array.prototype.forEach.call(boundEl.querySelectorAll('.is-dragging'), function (n) { n.classList.remove('is-dragging'); });
   }
 
-  // Files dropped anywhere else on the page must not open in the browser tab (the app would be left).
+  // Files dropped anywhere else on the page (tabs, header) must not open in the browser tab either: the
+  // app would be left. Inside the view, onDragOver / onDrop decide.
+  function exchangeActive() {
+    return !!(GT.store && GT.store.state && GT.store.state.ui && GT.store.state.ui.activeView === 'exchange');
+  }
   if (root.document) {
     root.document.addEventListener('dragover', function (e) {
-      if (isFileDrag(e) && GT.store && GT.store.state && GT.store.state.ui.activeView === 'exchange') e.preventDefault();
+      if (!isFileDrag(e) || !exchangeActive()) return;
+      e.preventDefault();
+      if (!(boundEl && boundEl.contains(e.target))) {
+        try { e.dataTransfer.dropEffect = 'none'; } catch (err) { /* read-only in old browsers */ }
+      }
     });
     root.document.addEventListener('drop', function (e) {
-      if (isFileDrag(e) && GT.store && GT.store.state && GT.store.state.ui.activeView === 'exchange' &&
-          !(boundEl && boundEl.contains(e.target))) e.preventDefault();
+      if (isFileDrag(e) && exchangeActive()) e.preventDefault();
     });
   }
 
@@ -2007,7 +2335,9 @@
     title: 'Import / Export',
     render: render,
     destroy: destroy,
-    /** For tests: the column keys the export would use now, and the import state. */
+    /** For tests: the column keys the export would use now, the plan counts that have their own label and
+     * help (countKeys; every count GT.importer.plan returns should be one of them), and the import state. */
+    countKeys: function () { return COUNT_INFO.map(function (ci) { return ci.key; }); },
     exportKeys: function () {
       var x = currentExport();
       return x ? exportKeys(x.st, x.cmap) : [];

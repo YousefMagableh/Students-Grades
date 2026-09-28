@@ -141,6 +141,25 @@ describe('stringify', () => {
     assert.equal(csv.stringify([['=HYPERLINK("x")']]), '"\'=HYPERLINK(""x"")"\r\n');
   });
 
+  test('formula guard in a ";" locale (review code-4): the part after a ";" or a tab is guarded too', () => {
+    assert.equal(csv.stringify([['x;=1+1;y']]), "x;'=1+1;y\r\n");
+    assert.equal(csv.stringify([['a', 'b;=cmd|\' /C calc\'!A0']]), "a,b;'=cmd|' /C calc'!A0\r\n");
+    assert.equal(csv.stringify([['met;-late', 'x\t@y', 'a; =b', 'ok;x']]), "met;'-late,x\t'@y,a; =b,ok;x\r\n");
+    assert.equal(csv.stringify([['x;=1+1']], { guardFormulas: false }), 'x;=1+1\r\n');
+    // Split on ';' as Excel would in such a locale: no part starts with a formula character.
+    const line = csv.stringify([['Student 01', 'x;=1+1;y', 'b;+2']]).trim();
+    csv.parse(line, { delimiter: ';' })[0].forEach((part) => assert.ok(!/^[=+\-@]/.test(part), part));
+  });
+
+  test('parseTable: limits on rows and columns, with flags when something is left out', () => {
+    assert.deepEqual(csv.parseTable('a,b,c\n1,2,3\n4,5,6\n', { maxRows: 2, maxCols: 2 }),
+      { rows: [['a', 'b'], ['1', '2']], delimiter: ',', truncatedRows: true, truncatedColumns: true });
+    assert.deepEqual(csv.parseTable('a;b;\n1;2;\n\n\n', { maxRows: 2, maxCols: 2 }),
+      { rows: [['a', 'b'], ['1', '2']], delimiter: ';', truncatedRows: false, truncatedColumns: false }, 'only empty cells and lines were left out');
+    assert.deepEqual(csv.parseTable('a,b'), { rows: [['a', 'b']], delimiter: ',', truncatedRows: false, truncatedColumns: false });
+    assert.equal(csv.parse('\n'.repeat(100000), { maxRows: 10 }).length, 10);
+  });
+
   test('round trip: parse(stringify(rows)) gives the rows back', () => {
     const rows = [
       ['No', 'Last Name', 'First Name', 'Notes', 'Score'],

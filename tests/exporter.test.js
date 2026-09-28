@@ -251,6 +251,34 @@ describe('presets', () => {
     assert.deepEqual(p[2].columns, exporter.columnsFor(c).map((x) => x.key));
   });
 
+  test('the default preset adds the weeks-late column of each item with late work, so the file gives its totals back (review V4R1-7)', () => {
+    const c = sampleCourse('SE4351');
+    const base = DEFAULT(c);
+    assert.ok(!base.some((k) => /^late:/.test(k)), 'the sample has no late work');
+    const s = c.students.find((x) => x.status === 'active' && typeof (model.getEntry(c.scores, x.id, 'a_t1') || {}).value === 'number');
+    model.setEntry(c.scores, s.id, 'a_t1', model.withLate(model.getEntry(c.scores, s.id, 'a_t1'), 2, false));
+    const w = c.students.find((x) => x !== s && x.status === 'active');
+    model.setEntry(c.scores, w.id, 'a_part', model.withLate(model.getEntry(c.scores, w.id, 'a_part') || { value: null }, 1, true));
+    const team = c.teams.find((t) => c.students.some((x) => x.teamId === t.id));
+    model.setEntry(c.teamScores, team.id, 'a_p2', model.withLate(model.getEntry(c.teamScores, team.id, 'a_p2'), 1, false));
+    const keys = DEFAULT(c);
+    // In assessment order, right after the weighted columns (the SUM range stays one block).
+    assert.deepEqual(keys.slice(13, 17), ['late:a_p2', 'late:a_t1', 'late:a_part', 'total']);
+    assert.deepEqual(keys.filter((k) => !/^late:/.test(k)), base);
+    const res = calc.computeCourse(c);
+    const sh = exporter.buildSheet(c, res, keys);
+    const tc = sh.columns.findIndex((x) => x.key === 'total');
+    assert.match(sh.rows[0][tc].f, /SUM\(I2:M2\)/);
+    const row = sh.rowMeta.findIndex((m) => m.studentId === s.id);
+    assert.equal(sh.rows[row][sh.columns.findIndex((x) => x.key === 'late:a_t1')].v, 2);
+    assert.equal(sh.rows[sh.rowMeta.findIndex((m) => m.studentId === w.id)][sh.columns.findIndex((x) => x.key === 'late:a_part')].v, '1 (waived)');
+    // An individual entry of a team-graded item that the team score hides does not count.
+    const c2 = sampleCourse('SE4351');
+    const member = c2.students.find((x) => x.teamId);
+    model.setEntry(c2.scores, member.id, 'a_p1', { value: 50, weeksLate: 3 });
+    assert.ok(!DEFAULT(c2).includes('late:a_p1'));
+  });
+
   test('"Everything" leaves out unavailable columns; user presets follow the built-ins', () => {
     const c = model.createCourse('SE6362');
     const every = exporter.builtInPresets(c)[2].columns;
@@ -622,6 +650,51 @@ describe('buildSheet rows and cells', () => {
     assertParity(c, res, sh, (o) => sheetFromBuild(sh, o), 'invalid');
   });
 
+  test('an empty or invalid late score keeps its penalty in the formula, so a score typed in the file later loses it too (review PARITY-1)', () => {
+    const c = sampleCourse('SE4351');
+    const list = activeIndividuals(c);
+    const a = list[0], b = list[1];
+    model.setEntry(c.scores, a.id, 'a_t1', { value: null, weeksLate: 2 });
+    model.setEntry(c.scores, b.id, 'a_t1', { value: null, text: 'late?', weeksLate: 1 });
+    const res = calc.computeCourse(c);
+    const keys = ['lastName', 'raw:a_t1', 'weighted:a_t1', 'late:a_t1', 'total'];
+    const sh = exporter.buildSheet(c, res, keys);
+    const ri = (s) => sh.rowMeta.findIndex((m) => m.studentId === s.id);
+    const ra = sh.rows[ri(a)], rb = sh.rows[ri(b)];
+    assert.equal(ra[2].f, `MAX(0,B${ri(a) + 2}-20)/100*25`);
+    assert.equal(rb[2].f, `MAX(0,B${ri(b) + 2}-10)/100*25`);
+    assert.equal(ra[1].note, '2 weeks late, −20 points');
+    assert.equal(ra[3].note, '−20 points');
+    assert.match(rb[1].note, /1 week late, −10 points/);
+    assertParity(c, res, sh, (o) => sheetFromBuild(sh, o), 'empty late');
+    // The instructor types 80 into the empty cell: the file gives what the app gives for 80.
+    const cells = {};
+    sh.rows.forEach((row, r) => row.forEach((cell, ci) => { cells[mx.refName(ci + 1, r + 2)] = cell.f ? { formula: cell.f } : cell.v; }));
+    cells['B' + (ri(a) + 2)] = 80;
+    const typed = model.entryFromInput(80, model.getEntry(c.scores, a.id, 'a_t1'), 100);
+    model.setEntry(c.scores, a.id, 'a_t1', typed);
+    const after = calc.computeCourse(c).byId[a.id];
+    const sheet = mx.createSheet(cells);
+    assert.equal(sheet.value('C' + (ri(a) + 2)), after.items.a_t1.weighted);
+    assert.equal(after.items.a_t1.weighted, 15);
+  });
+
+  test('a Total with fixed numbers says which items they are (review PARITY-3)', () => {
+    const c = sampleCourse('SE4351');
+    c.settings.curve = 2.5;
+    const res = calc.computeCourse(c);
+    const sh = exporter.buildSheet(c, res, ['lastName', 'raw:a_t1', 'weighted:a_t2', 'total']);
+    const tn = sh.columns[3].note;
+    assert.match(tn, /Project I, Project II, Class\/Project Participation are not in this file, so their weighted points are written into the formula as fixed numbers/);
+    const r = res.byId[sh.rowMeta[0].studentId];
+    assert.equal(sh.rows[0][3].note, `Fixed numbers in this formula: Project I ${util.fix(r.items.a_p1.weighted)}, Project II ${util.fix(r.items.a_p2.weighted)}, ` +
+      `Class/Project Participation ${util.fix(r.items.a_part.weighted)}; curve +2.5.`);
+    // The default layout has none.
+    const d = exporter.buildSheet(c, res, DEFAULT(c));
+    assert.ok(!/fixed numbers/.test(d.columns.find((x) => x.key === 'total').note));
+    assert.equal(d.rows[0][d.columns.findIndex((x) => x.key === 'total')].note, undefined);
+  });
+
   test('late cells: notes on the raw cell and the weeks-late column', () => {
     const c = sampleCourse('SE4351');
     const late = addLate(c);
@@ -640,6 +713,21 @@ describe('buildSheet rows and cells', () => {
     assert.equal(rowOf(activeIndividuals(c).find((s) => s.teamId !== late.team.id && s !== late.late1 && s !== late.waived))[3].v, null);
   });
 
+  test('without a Total column, Letter Grade holds plain suggestions, each with its letter in a note (review V4R2-1)', () => {
+    const c = sampleCourse('SE4351');
+    const res = calc.computeCourse(c);
+    const sh = exporter.buildSheet(c, res, ['lastName', 'firstName', 'letter']);
+    sh.rows.forEach((row, ri) => {
+      const r = res.byId[sh.rowMeta[ri].studentId];
+      assert.equal(row[2].f, undefined);
+      assert.equal(row[2].v, r.letter);
+      assert.equal(row[2].note, exporter.SUGGESTED_LETTER_NOTE + r.letter + '\nNo final letter assigned yet.');
+    });
+    // With the Total column the letter is a formula, without a note.
+    const f = exporter.buildSheet(c, res, ['lastName', 'firstName', 'total', 'letter']);
+    f.rows.forEach((row) => { assert.ok(row[3].f.startsWith('IF(')); assert.equal(row[3].note, undefined); });
+  });
+
   test('final letters: Letter Grade is the effective letter (static) with notes; Suggested stays a formula', () => {
     const c = sampleCourse('SE4351');
     const fl = addFinalLetters(c);
@@ -650,7 +738,10 @@ describe('buildSheet rows and cells', () => {
       const r = res.byId[sh.rowMeta[ri].studentId];
       assert.equal(row[3].f, undefined);
       assert.equal(row[3].v, r.effectiveLetter);
-      assert.equal(row[3].note, r.letterSource === 'manual' ? 'Final letter assigned by the instructor' : undefined);
+      // Review V4R2-1: a suggestion carries its letter in a note, so a letter typed over it in the
+      // spreadsheet is recognized on import.
+      assert.equal(row[3].note, r.letterSource === 'manual' ? 'Final letter assigned by the instructor'
+        : 'Suggestion from the cutoffs: ' + r.letter + '\nNo final letter assigned yet.');
       assert.ok(row[4].f.startsWith('IF('));
       assert.equal(row[5].v, r.finalLetter === null ? '' : r.finalLetter);
       assert.equal(row[5].f, undefined);
@@ -781,7 +872,9 @@ describe('toWorkbook (ExcelJS in Node)', () => {
     const find = (label) => rows.find((r) => r[0] === label);
     assert.equal(find('Course')[0], 'Course');
     assert.equal(rows.find((r) => r[0] === 'Course' && r[1])[1], 'SE 4351 - Requirements Engineering');
-    assert.equal(find('Exported')[1], NOW);
+    const d0 = new Date(NOW), two = (n) => String(n).padStart(2, '0');
+    assert.match(find('Exported')[1], new RegExp('^' + d0.getFullYear() + '-' + two(d0.getMonth() + 1) + '-' + two(d0.getDate()) + ' ' +
+      two(d0.getHours()) + ':' + two(d0.getMinutes()) + ' \\(local time, UTC[+-]\\d{2}:\\d{2}\\)$'));
     assert.deepEqual(find('Project I'), ['Project I', 100, 10, 'yes', '']);
     assert.deepEqual(find('Class/Project Participation'), ['Class/Project Participation', 5, 5, 'no', '0–5 in steps of 0.5']);
     assert.equal(find('Rounding of the total')[1], 'none');
@@ -800,6 +893,36 @@ describe('toWorkbook (ExcelJS in Node)', () => {
     assert.equal(rows2.find((r) => r[0] === 'Letter Grade column')[1], 'Suggestions from the cutoffs (no final letters assigned yet)');
     assert.equal(rows2.find((r) => r[0] === 'Scores finalized')[1], 'No');
     assert.equal(rows2.find((r) => r[0] === 'Attendance')[1], 'Off');
+  });
+
+  test('the export time is local, like the file name (review S4-SPEC-4, E2E-16)', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = "const m=require('./js/core/model.js'),x=require('./js/core/exporter.js');" +
+      "const c=m.createCourse('SE4351');console.log(x.settingsRows(c,null,'2026-12-16T01:00:00.000Z').find((r)=>r[0]==='Exported')[1]);";
+    const out = (tz) => execFileSync(process.execPath, ['-e', script], { cwd: require('node:path').join(__dirname, '..'), env: Object.assign({}, process.env, { TZ: tz }) }).toString().trim();
+    assert.equal(out('America/Chicago'), '2026-12-15 19:00 (local time, UTC-06:00)');
+    assert.equal(out('UTC'), '2026-12-16 01:00 (local time, UTC+00:00)');
+    assert.equal(out('Asia/Kolkata'), '2026-12-16 06:30 (local time, UTC+05:30)');
+  });
+
+  test('computed numbers get the course\'s display decimals; the values keep full precision (review PARITY-4)', async () => {
+    const c = sampleCourse('SE4351');
+    c.assessments.find((a) => a.id === 'a_t1').maxScore = 30;
+    const res = calc.computeCourse(c);
+    const keys = EVERYTHING(c);
+    const wb = await loadWorkbook(await exporter.toWorkbook(ExcelJS, c, res, keys, { now: NOW }));
+    const ws = wb.getWorksheet('Grades');
+    const sh = exporter.buildSheet(c, res, keys);
+    const at = (key) => sh.columns.findIndex((x) => x.key === key) + 1;
+    ['weighted:a_t1', 'total', 'percentile', 'diffAvg', 'absenceRate', 'unexcusedRate'].forEach((k) => assert.equal(ws.getRow(2).getCell(at(k)).numFmt, '0.00', k));
+    ['no', 'raw:a_t1', 'rank', 'excused', 'letter'].forEach((k) => assert.equal(ws.getRow(2).getCell(at(k)).numFmt, undefined, k));
+    const w = ws.getRow(2).getCell(at('weighted:a_t1')).value;
+    assert.equal(w.result, sh.rows[0][at('weighted:a_t1') - 1].v);
+    c.settings.rounding = 'integer';
+    c.settings.decimals = 1;
+    const sh2 = exporter.buildSheet(c, calc.computeCourse(c), keys);
+    assert.equal(sh2.columns.find((x) => x.key === 'total').numFmt, '0');
+    assert.equal(sh2.columns.find((x) => x.key === 'weighted:a_p1').numFmt, '0.0');
   });
 
   test('options: no Settings sheet; a Change history sheet from GT.history.toRows', async () => {
@@ -914,6 +1037,21 @@ describe('dataCheck', () => {
     assert.ok(t.includes('warn: 1 score outside 0 to the max score (counted as entered).'));
     assert.ok(t.some((x) => /^info: \d+ active students without a final letter/.test(x)));
     assert.ok(t.includes('warn: 1 pair of final letters out of order (a lower total has a higher letter).'));
+  });
+
+  test('final letters equal to the suggestion: the CSV cannot mark them as final (review V4R2-3)', () => {
+    const c = sampleCourse('SE4351');
+    const act = activeIndividuals(c);
+    const res = calc.computeCourse(c);
+    const csvLine = (t) => t.filter((x) => /A CSV file cannot show/.test(x.text));
+    assert.deepEqual(csvLine(texts(c)), [], 'no final letters');
+    model.setFinalLetter(c, act[0].id, res.byId[act[0].id].letter === 'B' ? 'B-' : 'B');
+    assert.deepEqual(csvLine(texts(c)), [], 'a final letter other than the suggestion reads back as final');
+    model.setFinalLetter(c, act[1].id, res.byId[act[1].id].letter);
+    assert.deepEqual(csvLine(texts(c)), [{ level: 'info', text: '1 final letter equals the suggestion from the cutoffs. A CSV file cannot show that it is final: ' +
+      'imported back, it stays a suggestion. The Excel file marks final letters, and the "Final Letter" column (in the "Everything" preset) keeps them in both formats.' }]);
+    model.setFinalLetter(c, act[2].id, res.byId[act[2].id].letter);
+    assert.match(csvLine(texts(c))[0].text, /^2 final letters equal the suggestion from the cutoffs\. A CSV file cannot show that they are final: imported back, they stay suggestions\./);
   });
 
   test('an empty course says so', () => {

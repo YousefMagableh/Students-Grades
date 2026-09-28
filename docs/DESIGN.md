@@ -775,9 +775,13 @@ Groups: `student`, `raw`, `weighted`, `late`, `result`, `letter`, `attendance`. 
 attendance column has `available: false`, reason "Attendance is off for this course".
 
 - `builtInPresets(course)` → `builtin:previous` "Previous sheet layout (default)": No, Last Name, First Name,
-  every raw column, every weighted column, Total, Letter Grade, Excused (allowed), Unexcused (not allowed),
-  Total absences, Status (E2 plus Status and the three absence columns of DECISIONS 6; the absence columns
-  are skipped while attendance is off); `builtin:compact` "Names, total and letter": No, Last Name, First
+  every raw column, every weighted column, the "<name>: weeks late" column of each item with late work (any
+  student's effective entry late, waived or not; none for on-time courses, so the old-sheet layout is
+  unchanged), Total, Letter Grade, Excused (allowed), Unexcused (not allowed), Total absences, Status (E2 plus
+  Status and the three absence columns of DECISIONS 6; the absence columns are skipped while attendance is
+  off). Without the weeks-late column an import of the file would lose the penalty and raise the total
+  (review V4R1-7); the late columns come after the weighted block, so the Total stays one SUM range;
+  `builtin:compact` "Names, total and letter": No, Last Name, First
   Name, Team, Total, Letter Grade, Status; `builtin:everything` "Everything": every available column.
 - User presets: `course.exportPresets = [{ id, name, columns }]`; `makePreset(name, columns)` builds one
   (id `xp_…`); the UI saves it with `GT.store.transact(…, { historyMode: 'none' })`. `allPresets(course)` →
@@ -801,7 +805,13 @@ Letter Grade holds final letters.
 Cell notes: an override "Per-member override (team score 90). An unequal split needs the team's written
 agreement."; late work "1 week late, −10 points" or "1 week late, penalty waived" (on the raw cell, else the
 weighted cell); out of range "Outside 0–100; counted as entered"; off the drop-down list "Not one of the list
-values (0–5 in steps of 0.5); counted as entered"; a manual letter "Final letter assigned by the instructor".
+values (0–5 in steps of 0.5); counted as entered"; a manual letter "Final letter assigned by the instructor";
+a plain (static) Letter Grade suggestion "Suggestion from the cutoffs: B+" and, on a second line, "No final letter
+assigned yet." (review V4R2-1: the importer compares the cell with the letter in its note, 9.1, so a letter
+the instructor types over it in the spreadsheet is recognized; typing into a cell keeps its note);
+a Total whose formula holds fixed numbers (items with neither column exported) "Fixed numbers in this formula:
+Project II 19.4, Class/Project Participation 4; curve +2.5." (the Total header note names those items too).
+Late notes use the penalty of 8.3 also for an empty or invalid score ("2 weeks late, −20 points").
 Header notes: raw "Out of 100. Team-graded: …"; weighted "= raw ÷ max × weight (Project I ÷ 100 × 10). Late
 work: …"; Total "= sum of weighted + curve (2.5), rounding: nearest 0.01. …"; Letter Grade and Suggested
 the cutoff list ("A+ ≥ 97, A ≥ 93, …, F below 60") plus "PLACEHOLDER: not confirmed by the instructor" while
@@ -815,8 +825,10 @@ and weeks-late columns: green `FFE2EFDA`, orange `FFFCE4D6`, blue `FFDDEBF7`, pi
 ### 8.3 Formulas (E3)
 
 R = the raw cell of that assessment in the same row, M = max score, W = weight, P = the late penalty in
-points (`calc.latePenalty`: weeks × points per week × M / 100; 0 when waived or on time). Every literal is
-written at full precision (`String(number)`), never rounded.
+points (`calc.latePenalty`: weeks × points per week × M / 100; 0 when waived or on time) — also for an
+empty or invalid score: `MAX(0,blank-P)` is 0 like the app, and a score typed into the file later loses P
+as it does in the app, where the entry keeps its weeks late. Every literal is written at full precision
+(`String(number)`), never rounded.
 
 - **Weighted** (when the raw column is exported): `R/M*W`, or `MAX(0,R-P)/M*W` with a penalty, e.g.
   `D2/100*10`, `MAX(0,F2-10)/100*25`, `H2/5*5`. A blank R is 0, as in the app. Team-graded items use the
@@ -842,8 +854,9 @@ written at full precision (`String(number)`), never rounded.
   Without an exported Total column: the static suggested letter.
 - **Letter Grade** (DESIGN 2.5): when **any** student of the course has a final letter, it is the static
   `effectiveLetter` for every student (the final letter, else the suggestion), manual ones with the note
-  "Final letter assigned by the instructor"; when no final letter exists yet, the nested-IF formula (static
-  without a Total column). The default preset keeps this single letter column.
+  "Final letter assigned by the instructor", suggestions with the note "Suggestion from the cutoffs:
+  <letter>" (8.2); when no final letter exists yet, the nested-IF formula (without a Total column: the static
+  suggestion with that note). The default preset keeps this single letter column.
 - Rank, percentile, difference from the average, missing scores and the attendance columns are static.
 
 Parity is tested (`tests/exporter.test.js`): for the SE4351 and SE6362 samples in every rounding mode, with
@@ -853,7 +866,10 @@ and without final letters, every Total, Suggested and Letter Grade cell of the b
 effective letter; also every cutoff of the scale reached exactly, 89.995 / 89.5 / 89.49 under each rounding
 mode, a negative total with a negative curve, and a 300-student random sweep with max scores 30, 7, 45 and 3,
 fractional weights, late work and curves 0, 2.5, 1.37 and −3. `mini-excel` evaluates each sheet twice, with
-Excel's decimal ROUND and with a naive binary ROUND.
+Excel's decimal ROUND and with a naive binary ROUND. Parity is exact to 1e-10: with rounding "none" and
+contrived inputs (scores with 5+ decimals and weights such as 1.5625, or late points of 1e-7) a weighted sum
+can sit exactly on a tie at the 11th decimal, which `util.fix` and a spreadsheet's `ROUND(…,10)` may break
+differently (letters are not affected; realistic data never reaches it).
 
 ### 8.4 Files
 
@@ -862,9 +878,12 @@ Excel's decimal ROUND and with a naive binary ROUND.
   assessment columns), with the header notes; frozen `{ state: 'frozen', ySplit: 1, xSplit: <leading
   columns among No / Last Name / First Name / Team> }`; autoFilter over the header; widths from 8.2; thin
   borders on every cell; withdrawn rows in grey italics; invalid cells red, override cells bold; formula
-  cells `{ formula, result }` with the app's value as the cached result; landscape, fit to one page wide,
+  cells `{ formula, result }` with the app's value as the cached result; weighted, Total, Percentile, Diff.
+  from average and the rates shown with the course's display decimals (number format `0.00` for 2, `0`
+  for a Total rounded to whole numbers; the values keep full precision); landscape, fit to one page wide,
   header row repeated. `workbook.calcProperties.fullCalcOnLoad = true` (Excel recalculates on opening).
-  Sheet **Settings** (`settingsRows(course, results, iso)`): course, term, level, export time, student counts;
+  Sheet **Settings** (`settingsRows(course, results, iso)`): course, term, level, export time in local time
+  like the file name ("2026-12-15 19:00 (local time, UTC-06:00)"), student counts;
   the assessments (name, max, weight %, team-graded, drop-down list) and the weight sum; rounding, curve, late
   work, passing letter; whether Letter Grade holds final letters ("Final letters assigned by the instructor
   (n of m active students) …") or suggestions; "Scores finalized: Yes, on YYYY-MM-DD (note)" or "No";
@@ -872,8 +891,10 @@ Excel's decimal ROUND and with a naive binary ROUND.
   placeholder with its note; "Generated by Grade Tracker (offline). Formulas in the Grades sheet recalculate
   if you edit raw scores." Sheet **Change history** (option): `GT.history.toRows(course.history)`.
 - `toCsv(course, results, keys, opts)`: the same columns as values only, `GT.csv.stringify(rows, { bom: true,
-  eol: '\r\n', guardFormulas: true })` (text starting with `= + - @` gets a leading apostrophe; numbers are
-  written as numbers, so a negative difference from the average is not guarded).
+  eol: '\r\n', guardFormulas: true })` (text starting with `= + - @` gets a leading apostrophe, and so does
+  the part of a text after a `;` or a tab, "x;'=1+1", because Excel in a `;` locale splits a double-clicked
+  .csv there even inside quotes; numbers are written as numbers, so a negative difference from the average
+  is not guarded). The importer removes these apostrophes again (9.1).
 - `XLSX_MIME` for the download.
 
 ### 8.5 Data check
@@ -885,7 +906,10 @@ confirmed by the instructor." (warn); per item with a weight, active students wi
 active students without a score (counts as 0).", warn) — for the participation item "Class/Project
 Participation is still empty for n active students (counts as 0 until it is set)." (warn); entries that are
 not numbers (warn); scores out of range (warn); scores not on the drop-down list (info); final letters: none
-yet (info) or n active students without one (info), letters outside the scale (warn); pairs of final letters
+yet (info) or n active students without one (info), letters outside the scale (warn); final letters equal
+to their suggestion (info, review V4R2-3: "1 final letter equals the suggestion from the cutoffs. A CSV file
+cannot show that it is final: imported back, it stays a suggestion. The Excel file marks final letters, and
+the "Final Letter" column (in the "Everything" preset) keeps them in both formats."); pairs of final letters
 out of order (`orderIssues`, warn); per-member overrides (info); withdrawn students included (info); the
 other unconfirmed placeholders (info); "This course has no students yet." (warn).
 
@@ -896,18 +920,45 @@ needed). Tests: `tests/importer.test.js`.
 
 ### 9.1 Reading
 
-- `readWorkbook(ExcelJS, arrayBuffer)` → `Promise<[{ name, hidden, rows, formulaColumns }]>`, one per
-  worksheet; a file ExcelJS cannot read rejects with "This file could not be read as an Excel workbook
-  (.xlsx). Open it in Excel and use Save As → Excel Workbook (.xlsx), then import that file."
+- `readWorkbook(ExcelJS, arrayBuffer, limits?)` → `Promise<[{ name, hidden, rows, formulaColumns,
+  finalLetterCells, editedLetterCells, truncatedRows, truncatedColumns }]>`, one per worksheet; a file ExcelJS
+  cannot read rejects with "This file could not be read as an Excel workbook (.xlsx). Open it in Excel and use
+  Save As → Excel Workbook (.xlsx), then import that file." `finalLetterCells` and `editedLetterCells` are
+  `null` unless the workbook was written by Grade Tracker (creator "Grade Tracker", or the Settings sheet's
+  "Generated by Grade Tracker" line). Then `finalLetterCells` lists the `[rowIndex, colIndex]` cells that hold
+  a letter the instructor chose (pass it to `plan` as an option, 9.3): those whose note starts with "Final
+  letter assigned by the instructor", and the letters changed in the spreadsheet after the export
+  (`editedLetterCells`, review V4R2-1): a cell whose text is no longer the letter of its "Suggestion from the
+  cutoffs: <letter>" note (case, spaces and dash variants ignored; typing into a cell keeps its note), and a
+  plain value below row 1 in a column of letter formulas (formulas with a text result) or of such notes, i.e.
+  typed or pasted over the formula or over the noted cell. A letter column with such cells is left out of
+  `formulaColumns`, so `guessMapping` maps it; its formulas and unchanged suggestions stay suggestions. A
+  suggestion left unchanged after a score was changed in the spreadsheet (the recalculated Total no longer
+  gives it) is still recognized as the export's suggestion, and so are the file's suggestions when the
+  cutoffs changed here since the export: the note, not the total, tells.
+- **Limits** (`DEFAULT_LIMITS` = `{ maxRows: 10000, maxCols: 256 }`, or `limits`): rows after `maxRows` and
+  columns after `maxCols` are never read (`findRow` / `findCell`, which create nothing), so a stray cell at
+  A1048576 or XFD2, or a CSV line of a million commas, cannot exhaust memory; `truncatedRows` /
+  `truncatedColumns` say that something not empty was left out. The UI still refuses more than 5,000 rows.
+- **Merged cells**: a merged range gives its value to its first column only, so a title merged over A1:P1
+  reads as one cell (the others ''), as Excel shows it; the cells below the first one of a vertical span
+  keep the value (a team score merged over the members' rows applies to each).
 - `rowsFromWorksheet(ws)` → `string[][]` (sheet row 1 = index 0): a number → its string (through `util.fix`,
   so 9.399999999999999 → "9.4"); a formula → its cached result (none → ''); rich text joined; a hyperlink →
   its text; a date → `YYYY-MM-DD`; a boolean → TRUE/FALSE; an error or null → ''. Trailing empty rows and
   columns are trimmed and every row has the same width. `formulaColumnsOf(ws)` → 0-based columns whose
   non-empty cells are at least half formulas.
-- `rowsFromCsv(text)` (`GT.csv.parse`: delimiter detected, BOM, quotes), tidied the same way.
+- `rowsFromCsv(text, limits?)` (`GT.csv.parseTable`: delimiter detected, BOM, quotes, the same limits),
+  tidied the same way; `readCsv(text, limits?)` → `{ rows, delimiter, truncatedRows, truncatedColumns }`.
+  Each cell as the spreadsheet showed it: the apostrophe a CSV formula guard puts before `= + - @` (Grade
+  Tracker's export, 8.4) is removed, at the start and after a `;` or tab, so names and notes come back
+  unchanged; in a `;`-separated file (Excel in comma-decimal locales) a cell like "92,5" is 92.5.
 - `fileKind(name)` → `'xlsx'` (.xlsx, .xlsm) | `'csv'` (.csv, .tsv, .txt) | `'xls'` | `'other'`;
   `XLS_MESSAGE` = "Open it in Excel and use Save As → Excel Workbook (.xlsx), then import that file."
-- `detectHeaderRow(rows)` → the first row with at least 2 non-empty cells that are not numbers, else 0.
+- `detectHeaderRow(rows, course?)` → among the first 30 rows, the one whose cells `guessMapping` recognizes
+  the most (at least 2 different targets; the first on a tie; `course` adds its assessment names), so a
+  title row ("Course:", "SE 4351") above the headers is passed over; otherwise the first row with at least
+  2 different non-empty cells that are not numbers; else 0.
 
 ### 9.2 Targets and the guessed mapping
 
@@ -919,7 +970,7 @@ else the last word), `team`, `status`, `notes`; per assessment `raw:<aid>` "<nam
 `excused`, `absencesTotal` "Total absences (stored as unexcused)". `score: true` marks the score targets
 (`isScoreTarget(key)`: raw, weighted, late), `isAttendanceTarget(key)` the attendance ones.
 
-`guessMapping(headerCells, course, { formulaColumns }?)` → a target key per column. Rules, in order:
+`guessMapping(headerCells, course, { formulaColumns, editedLetterCells }?)` → a target key per column. Rules, in order:
 
 1. Blank → `ignore`. "No" only for exactly `no`, `no.`, `#`, `number`, `student no`, `student no.`,
    `student #`, `student number`, `nr` (never "No of Absence").
@@ -935,10 +986,18 @@ else the last word), `team`, `status`, `notes`; per assessment `raw:<aid>` "<nam
    roman-numeral token** (so "project i" never matches "Project II", and an item "Project" does not match
    "Project II"); the longest run wins. Otherwise the category keywords: `participation` → the participation
    item, `paper` → the paper item. Then `late` → `late:<aid>`; a `%` token, or a trailing number equal to the
-   item's weight, → `weighted:<aid>` (`ignore` for a weight of 0); else `raw:<aid>`.
+   item's weight, → `weighted:<aid>` (`ignore` for a weight of 0, or when the header itself says 0%); else
+   `raw:<aid>`. `weightFromHeader(text)` → the number before the last `%` ("Project II 20%" → 20, "12,5 %"
+   → 12.5) or `null`: `plan` converts with it (9.3).
 5. A target claimed by two columns stays with the stronger match (ties: the first column); the other becomes
    `ignore`. With `formulaColumns`, a letter column made of formulas is left `ignore`: it holds suggestions
-   from the cutoffs (an exported file without final letters), not final letters.
+   from the cutoffs (an exported file without final letters), not final letters. (`readWorkbook` leaves out
+   of `formulaColumns` a Grade Tracker letter column in which letters were typed over the formulas, so that
+   column is mapped and its typed letters become final letters, 9.1.) With `editedLetterCells` (from
+   `readWorkbook`), a column with letters changed after the export is a `finalLetter` column even when its
+   header says "suggested", as the weakest candidate: "Suggested Letter (cutoffs)" with a typed letter is
+   mapped only when no other letter column is ("Final Letter" and "Letter Grade" win; `plan` then compares
+   the other columns, 9.3). Without it (a CSV), "Suggested Letter (cutoffs)" is never mapped.
 
 The previous TA's sheet maps exactly (tested for SE4351 and SE6362):
 
@@ -962,7 +1021,9 @@ Also: Status, Team, Notes, Name / Student (`fullName`), Term Paper (`raw:a_paper
 
 `plan(course, rows, headerIndex, mapping, options)` never changes `course`. Options: `matchBy: 'name'`
 (default) | `'no'`, `createMissing` (true), `emptyCells: 'keep'` (default) | `'clear'`, `overwrite` (true),
-`switchAttendanceToTotals` (false; ignored unless an attendance column is mapped).
+`switchAttendanceToTotals` (false; ignored unless an attendance column is mapped), `updateNames` (false:
+matching by No never renames a student, see Matching), `finalLetterCells` (from `readWorkbook`, for a
+workbook written by Grade Tracker).
 
 - **Mapping checks** (`notes`): a second column for a target is ignored ("… is already read from column …");
   when both the raw and the weighted column of an item are mapped, the raw one wins (the old sheet's weighted
@@ -975,42 +1036,116 @@ Also: Status, Team, Notes, Name / Student (`fullName`), Term Paper (`raw:a_paper
   students matching → skipped ("2 students match this name; fix the duplicate first"); a second row for the
   same student → skipped ("Same student as row 5"); a repeated header row, a row without a name ("No name"),
   a row without a match when `createMissing` is off ("No matching student in this course") are skipped;
-  empty rows are ignored. Unmatched rows with a name become **new** students (No from the file, else
-  `model.nextStudentNo`; one new student per name).
+  empty rows are ignored. Unmatched rows with a name become **new** students (No from the file, else the next
+  free No; one new student per name). A row that would be new, has no No and holds only one name cell that is
+  a summary word ("Average", "Class Average:", "Max", "Std Dev"…) is skipped as "Summary row ("Average"), not a
+  student" (with a single name column, words that are also names — Max, Min, Low — do not count).
+- **Matching by No** compares the names: a row whose name (case and spaces ignored; an empty part on either
+  side is not compared) differs from the student with that No is skipped ("No 4 is a student with another
+  name in this course; skipped …"), because a file may number its rows in another order and its scores would
+  land on another student; with `updateNames` the row is imported and the names taken from the file. An
+  empty name part is always filled. A row whose No is not in the course but whose name is is skipped too
+  ("No 12 is not in this course, but a student with this name is; skipped …"), never added a second time.
+- **No stays unique** (as in the Students tab): a file No that another student keeps, or that an earlier row
+  of the file takes, is not given; an existing student keeps its No ("No 1 is already used by another student
+  in this course; the No is not changed"), a new one gets the next free No ("… given No 60 instead"; "No 5 is
+  also given to row 5 of the file; …"), each counted in `duplicateNos` and listed as an issue. Numbers
+  swapped or moved around inside the file are fine.
 - **Values**: scores through `util.parseScoreInput` (with the max score, so "90%" of 5 is 4.5); weighted values
-  converted to raw as `util.fix(value ÷ weight × max)` (9.4 on 10% of 100 → 94). Text that is not a number is
-  stored as invalid text on a free-entry item (like typing it; counted, highlighted, counts as 0) and
-  **skipped** on an item with a drop-down list (DECISIONS 8). A number not on the list is imported and counted
+  converted to raw as `util.fix(value ÷ weight × max)` (9.4 on 10% of 100 → 94), with the weight written in
+  the column's header when it differs from the course's (a file older than a change of the weights: "Project
+  II 20%" = 17.6 gives 88 while Project II weighs 25%; a note says so; a header of 0% is ignored with a
+  note). Text that is not a number is stored as invalid text on a free-entry item (like typing it; counted,
+  highlighted, counts as 0) and **skipped** on an item with a drop-down list (DECISIONS 8). A number not on the list is imported and counted
   as `notOnList` (highlighted afterwards, `calc.scoreDetail().notOnList`). Weeks late: "2", "2 (waived)".
   Status: withdrawn / w / wd / dropped / drop / inactive → withdrawn; active / a / enrolled → active; empty →
   active for a new student (for an existing one it follows `emptyCells`); anything else is reported and
   ignored. Final letters through `model.matchLetter` ("b+" → "B+"); letters not in the scale are skipped
   and reported (`lettersSkipped`). Absence counts through `util.parseCount`; `absencesTotal` is stored as
-  unexcused, minus the excused column when that is mapped too (a total below the excused count is reported).
+  unexcused, minus the excused column when that is mapped too, or else minus the excused absences already
+  stored, so the student's total absences equal the file's (a total below the excused count is reported and
+  ignored; an emptied cell with `clear` sets both to 0).
+- **Final letters from a Grade Tracker file**: an exported "Letter Grade" column holds each student's final
+  letter or, without one, the suggestion from the cutoffs. When the letter column is headed "Letter Grade"
+  (not "Final …") and the sheet has a "Suggested Letter (cutoffs)" column or a "Status" column of only
+  "Active" / "Withdrawn", a letter equal to the student's suggestion after the import is not stored as a
+  final letter (counted in `lettersAsSuggestion`, with a note), and a letter that is already the student's
+  final letter changes nothing; other letters are final letters. With `finalLetterCells` (an .xlsx from Grade
+  Tracker) exactly the listed cells are final letters (marked by the instructor, or changed in the
+  spreadsheet after the export, 9.1); the others were suggestions and are never stored (an issue when one
+  differs from the suggestion here: "The suggestion from the cutoffs in this Grade Tracker file (not a final
+  letter); not stored. The suggestion here is B+.", or, when it does not match the file's own total either,
+  "Not marked as a final letter in this Grade Tracker file; not stored. It does not match the file's total
+  (88.5 gives B+ with this course's cutoffs): a score or the cutoffs changed after the export, or the letter
+  was typed in. If the instructor chose it, set it in the Grades tab. The suggestion here is B+."). So importing an export back changes no letter, and a
+  withdrawn student's suggestion never becomes a final letter. When the file has its own Total (below), the
+  suggestion compared is the one at the file's total (`calc.letterFor` on this course's scale), since that is
+  the suggestion the file's letter came from; so a total that differs here (weeks late left out, another
+  curve, or a file without score columns such as "Names, total and letter") never turns the old suggestion
+  into a final letter, and a final letter that happens to equal the new suggestion is kept.
+- **Letters in the other letter columns** (review V4R3-1): a Grade Tracker file can have several letter
+  columns (the "Everything" preset: "Letter Grade", "Suggested Letter (cutoffs)" and "Final Letter"), and only
+  one is mapped ("Final Letter" wins). The cells of `finalLetterCells` in a column that is not read (letters
+  typed in after the export, or marked "Final letter assigned by the instructor") are compared, row by row,
+  with the letter the mapped column gives (none when it is empty, a suggestion, or not a letter):
+  - the mapped column gives none, and the other columns give one letter → that letter is the final letter
+    (under the usual overwrite rule), counted in `lettersFromOtherColumn`, with a note per column ("Column
+    "Letter Grade": 1 letter was changed in the spreadsheet after the export. Final letters are read from column
+    "Final Letter", which is empty for that student, so the changed letter is imported as the final letter.");
+  - the same letter as the mapped column → nothing more (an untouched export imports back without a word);
+  - another letter → the mapped column wins; each other letter is an issue ("Column "Letter Grade" gives D, but
+    final letters are read from column "Final Letter", which gives C: D is not imported. If the instructor
+    chose D, set it in the Grades tab"), counted in `lettersNotImported`, with a note. Two other columns that
+    disagree while the mapped one is empty: neither is imported (issue each). So a letter typed over a final
+    letter in "Letter Grade" while "Final Letter" keeps the old one is reported, not imported;
+  - text that is not a letter of the scale → an issue, counted in `lettersSkipped`;
+  - no column mapped to Final letter → each such letter that would change the student's final letter is an
+    issue ("… but no column is set to "Final letter"; not imported"), counted in `lettersNotImported`, with a
+    note that names the column to set to "Final letter".
+  Only the file decides (never the student's current letter), so importing the same file again gives the same
+  result.
+- **The file's totals** (review V4R1-7): a column headed exactly "Total" that is not mapped (totals are never
+  imported; they are computed from the scores) is read as the file's total. When a score column is mapped,
+  each imported row whose total here (after the simulated import) differs from the file's is reported as an
+  issue (field "Total"), counted in `totalsDiffer`, with a note to check that the file has every score and
+  weeks-late column and that the weights, curve and rounding match. The comparison allows half a unit of the
+  last decimal the file shows ("85" fits 85.125, "85.13" fits 85.125) against the rounded and the unrounded
+  total, so a file from another rounding mode or with rounded display fits; empty or non-numeric totals and
+  rows with blocked (finalized) score changes are not compared.
+- **Teams** are matched by name (case and spaces ignored), else by form: "2", "Team 02", "Group 2" and
+  "team #2" are the existing "Team 2", "B" is "Team B", when exactly one team fits (`resolveTeam`); other
+  names create teams (`teamsCreated`, with a note naming them). A team-graded score that becomes empty
+  because the student moves to a team without that score is marked `emptiedByMove` and counted in
+  `scoresEmptied` (with a note).
 - **Empty cells**: `keep` changes nothing; `clear` empties the score (a blank team-graded cell hands the member
   back to the team score), the late info, the notes, the final letter, the team, sets the status to active
   and the absence counts to 0. An empty No or name never clears anything.
 - **overwrite: false** fills only empty fields: scores without a score (late info without late info), a
   missing team, empty notes, no final letter, a student without absence totals; the status is left alone.
   Values kept this way are counted in `kept`.
-- Names of existing students change only when matching by No. A team is found by name (case-insensitive)
-  or created.
+- Names of existing students change only when matching by No (see Matching).
 - **Finalized** (`model.isFinalized`): every score change (raw, weighted, weeks late, participation) is listed
   with `blocked: true` and the reason "Scores are finalized: unlock them in the Grades tab first" and not
   applied (a new student is added without scores). Text that is not a number is listed the same way, with
   the issue "Not a number; not imported because the scores are finalized". Student info and final letters are
-  imported; a team move keeps the student's visible scores (`keepScores: true`), so totals do not change.
+  imported; a team move keeps the student's visible scores (`keepScores: true`), so totals do not change —
+  where the new team's score differs they become per-member overrides, listed (the change row is marked
+  `override` even though the value stays) and counted in `overrides`. A new member of a team gets the team
+  score; the file's own score for it is then listed as blocked starting from that value (left out when equal).
 - **Exact preview**: the plan applies itself to a scratch copy of the course (without history) and lists the
   differences, so team-graded columns, team moves and propagation appear exactly as `apply` does them.
 
 Result: `{ items: [{ rowIndex, action: 'update' | 'new' | 'skip', reason?, studentId?, name, changes: [{
 field, oldValue, newValue, kind, blocked?, reason?, override?, invalid?, outOfRange?, notOnList? }], issues:
 [{ field, value, message }] }], counts: { update, new, skip, changes, overrides, invalid, blocked, notOnList,
-lettersSkipped, kept, unchanged, propagated }, propagated: [{ studentId, name, changes }], notes, errors,
-options, finalized, headerIndex, columns, attendanceMapped }`. `rowIndex` is the index in `rows` (row
-number − 1). Change fields: No, Last name, First name, Team, Status, Notes, "<assessment>", "<assessment>:
-weeks late", Final letter, Unexcused absences, Excused absences. `overrides` counts members who get a new
-override; `propagated` lists students missing from the file whose score changes through a new team score.
+lettersSkipped, lettersAsSuggestion, lettersFromOtherColumn, lettersNotImported, duplicateNos, teamsCreated,
+scoresEmptied, kept, unchanged, propagated, totalsDiffer },
+propagated: [{ studentId, name, changes }], notes, errors, options, finalized, headerIndex, columns,
+attendanceMapped }`. `rowIndex` is the index in `rows` (row number − 1). Change fields: No, Last name, First
+name, Team, Status, Notes, "<assessment>", "<assessment>: weeks late", Final letter, Unexcused absences,
+Excused absences; a change may carry `emptiedByMove`. `overrides` counts members who get a new override
+(team-graded columns and team moves); `propagated` lists students missing from the file whose score changes
+through a new team score.
 
 ### 9.4 Apply
 
@@ -1022,15 +1157,18 @@ items through `model.entryFromInput` semantics; each team-graded column through 
 `model.setTeamScoreFromMembers` call with every row that has a value — unchanged rows too, so they vote and a
 single changed member becomes an override instead of moving the whole team), attendance totals
 (`GT.attendance.setTotals`), then `setMode('totals')` with `switchAttendanceToTotals` (`totalsSessionsHeld`
-is left for the TA). Returns `{ created, updated, skipped, missing, teamsCreated, overridesCreated, scores,
-letters, attendance, modeSwitched }`.
+is left for the TA). Returns `{ created, updated, skipped, missing, teamsCreated, newTeams, overridesCreated,
+scores, letters, attendance, modeSwitched }`.
 
 Round trip (tested for SE4351 and SE6362): `toWorkbook` → ExcelJS `xlsx.load` → `rowsFromWorksheet` →
 `guessMapping` → `plan` → `apply` into an empty copy of the course (same assessments and settings, no
 students) reproduces with the Everything preset every student's effective raw scores and late work, totals,
 effective and final letters, status, No, team, notes and attendance totals (per-session counts become
-totals); with the default preset the effective raw scores, status and attendance totals, and Letter Grade
-becomes each student's final letter. Importing the same file again changes nothing.
+totals); with the default preset (CSV too, in every rounding mode, with a curve and late work) the effective
+raw scores and late work, totals, status and attendance totals, and each student's effective letter (Letter
+Grade letters that differ from the suggestion become final letters; through `readWorkbook` with
+`finalLetterCells`, exactly the original final letters). Importing the same file again, or an export (CSV or
+.xlsx) back into its own course, changes nothing.
 
 ### 9.5 The Import / Export tab (`js/ui/exchange.js`, `css/exchange.css`)
 

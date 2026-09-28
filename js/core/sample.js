@@ -7,6 +7,9 @@
   var isNode = typeof module === 'object' && module.exports;
   var util = isNode ? require('./util.js') : root.GT.util;
   var model = isNode ? require('./model.js') : root.GT.model;
+  // Tables below are keyed by assessment id; restored files may use ids such as 'toString',
+  // so every lookup checks own properties only.
+  var hasOwn = util.hasOwn;
 
   var NATO = [
     'Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Golf', 'Hotel', 'India', 'Juliett',
@@ -161,8 +164,8 @@
   }
 
   function hasIndividualScore(ctx, student, a) {
-    if (student.status === 'withdrawn' && WITHDRAWN_EMPTY[a.id]) return false;
-    if (a.id === 'a_paper' && !ctx.paperWriters[student.id]) return false;
+    if (student.status === 'withdrawn' && hasOwn(WITHDRAWN_EMPTY, a.id)) return false;
+    if (a.id === 'a_paper' && !hasOwn(ctx.paperWriters, student.id)) return false;
     return true;
   }
 
@@ -171,9 +174,9 @@
   function fillAssessment(ctx, a) {
     var course = ctx.course;
     var rng = ctx.stream('score:' + a.id);
-    var gen = GENERATORS[a.id] || otherGenerator;
+    var gen = hasOwn(GENERATORS, a.id) ? GENERATORS[a.id] : otherGenerator;
     var teamPct = {};
-    if (a.teamGraded || TEAM_WORK[a.id]) {
+    if (a.teamGraded || hasOwn(TEAM_WORK, a.id)) {
       course.teams.forEach(function (t) {
         var pct = gen(rng);
         teamPct[t.id] = pct;

@@ -43,10 +43,10 @@ These work like Excel formulas and update on every edit.
 
 - K1. Weighted points = raw / max x weight. Total = sum of weighted points.
 - K2. An empty score counts as 0, with a subtle "incomplete" indicator.
-- K3. Settings (**placeholders**):
-  - Display decimals.
-  - Rounding mode: none, nearest 0.01, or nearest integer. Default: none.
-  - Optional flat curve added to the total. Default: 0.
+- K3. Settings:
+  - Display decimals (display only; it never changes a calculated value).
+  - Rounding mode (**placeholder**): none, nearest 0.01, or nearest integer. Default: none.
+  - Optional flat curve added to the total (**placeholder**). Default: 0.
 - K4. Late work: 10 points per week late on a 100-point score, scaled proportionally when the max differs, unless pre-approved.
   - Each score has an optional "weeks late" value and a "penalty waived" checkbox.
   - Points per week is a per-course setting.

@@ -1114,7 +1114,127 @@ describe('partial-team paste (review F3, second review)', () => {
   });
 });
 
-describe('letter scale invariant: last is F with min 0 (review F7 / F4)', () => {
+describe('pasting over override members (third review V1)', () => {
+  // What the grid does: each pasted cell goes through entryFromInput(text, prev) with prev = the
+  // member's visible entry, so a non-empty cell over an override keeps override: true.
+  const cellText = (e) => (e && typeof e.value === 'number' ? String(e.value) : (e && e.text) || '');
+  function pasteRows(c, list, aid, texts) {
+    return list.map((s, i) => {
+      const prev = model.effectiveEntry(c, s, byName(c, aid));
+      const text = texts ? texts[i] : cellText(prev);
+      return { studentId: s.id, entry: model.entryFromInput(text, prev) };
+    });
+  }
+  const shown = (c, list, aid) => list.map((s) => {
+    const d = calc.scoreDetail(c, s, byName(c, aid));
+    return (d.raw === null ? '-' : String(d.raw)) + (d.source === 'override' ? '*' : '');
+  });
+  function oneTeam(n) {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const list = [];
+    for (let i = 1; i <= n; i++) list.push(addStudent(c, `Student 0${i}`, 'X', { teamId: t.id }));
+    setTeamScore(c, t, 'a_p1', 90);
+    return { c, t, list };
+  }
+
+  test('a name-sorted block over two teams pasted back unchanged changes nothing', () => {
+    const c = course('SE4351');
+    const t1 = addTeam(c, 'Team 1');
+    const t2 = addTeam(c, 'Team 2');
+    // Name order interleaves the teams: 01 T1, 02 T2, 03 T1, 04 T2, 05 T1, 06 T2.
+    const list = [1, 2, 3, 4, 5, 6].map((n) => addStudent(c, `Student 0${n}`, 'X', { teamId: n % 2 ? t1.id : t2.id }));
+    setTeamScore(c, t1, 'a_p1', 90);
+    setTeamScore(c, t2, 'a_p1', 80);
+    model.setOverride(c, list[0].id, 'a_p1', { value: 70 });
+    const before = shown(c, list, 'a_p1');
+    assert.deepEqual(before, ['70*', '80', '90', '80', '90', '80']);
+    const scoresBefore = roundTrip(c.scores);
+    const teamBefore = roundTrip(c.teamScores);
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 2), 'a_p1'));
+    assert.deepEqual(shown(c, list, 'a_p1'), before);
+    assert.deepEqual(res.propagatedTo, []);
+    assert.equal(res.overridesCreated, 0);
+    assert.deepEqual(c.scores, scoresBefore);
+    assert.deepEqual(c.teamScores, teamBefore);
+  });
+
+  test('pasting back part of one team keeps the override on the same member', () => {
+    const { c, list } = oneTeam(4);
+    model.setOverride(c, list[0].id, 'a_p1', { value: 70 });
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 2), 'a_p1'));
+    assert.deepEqual(shown(c, list, 'a_p1'), ['70*', '90', '90', '90']);
+    assert.deepEqual(res.propagatedTo, []);
+  });
+
+  test('an empty override ("no score for this member") survives its blank cell being pasted back', () => {
+    const { c, list } = oneTeam(3);
+    model.setOverride(c, list[0].id, 'a_p1', null);
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 2), 'a_p1'));
+    assert.deepEqual(shown(c, list, 'a_p1'), ['-*', '90', '90']);
+    assert.deepEqual(model.getEntry(c.scores, list[0].id, 'a_p1'), { value: null, override: true });
+    assert.deepEqual(res.propagatedTo, []);
+  });
+
+  test('an override value never becomes the team score, even when its rows outnumber the others', () => {
+    const { c, t, list } = oneTeam(4);
+    model.setOverride(c, list[0].id, 'a_p1', { value: 70 });
+    model.setOverride(c, list[1].id, 'a_p1', { value: 60 });
+    // Both override cells get 75; the one ordinary member in the rows is pasted back as 90.
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 3), 'a_p1', ['75', '75', '90']));
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 90);
+    assert.deepEqual(shown(c, list, 'a_p1'), ['75*', '75*', '90', '90']);
+    assert.equal(res.overridesCreated, 0, 'both members already had an override');
+    assert.deepEqual(res.propagatedTo, []);
+  });
+
+  test('rows that are all override rows leave the team score alone', () => {
+    const { c, t, list } = oneTeam(3);
+    model.setOverride(c, list[0].id, 'a_p1', { value: 70 });
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 1), 'a_p1', ['65']));
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 90);
+    assert.deepEqual(shown(c, list, 'a_p1'), ['65*', '90', '90']);
+    assert.equal(res.teamsSet, 0);
+    assert.deepEqual(res.propagatedTo, []);
+  });
+
+  test('the team score or a blank pasted over an override hands the member back to the team', () => {
+    const { c, list } = oneTeam(3);
+    model.setOverride(c, list[0].id, 'a_p1', { value: 70 });
+    model.setOverride(c, list[1].id, 'a_p1', { value: 60 });
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', pasteRows(c, list.slice(0, 2), 'a_p1', ['90', '']));
+    assert.deepEqual(shown(c, list, 'a_p1'), ['90', '90', '90']);
+    assert.deepEqual(c.scores, {});
+    assert.deepEqual(res.propagatedTo, []);
+  });
+
+  test('an entry flagged as an override is kept as one without voting', () => {
+    const { c, t, list } = oneTeam(3);
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: list[0].id, entry: { value: 50, override: true } },
+      { studentId: list[1].id, entry: { value: 85 } }
+    ]);
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 85);
+    assert.deepEqual(shown(c, list, 'a_p1'), ['50*', '85', '85']);
+    assert.equal(res.overridesCreated, 1);
+    assert.deepEqual(res.propagatedTo, [list[2].id]);
+  });
+
+  test('convertAssessmentToTeam ignores a stray override flag on an individual entry', () => {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const list = ['01', '02', '03'].map((n) => addStudent(c, `Student ${n}`, 'X', { teamId: t.id }));
+    setScore(c, list[0], 'a_t1', 90);
+    setScore(c, list[1], 'a_t1', 70, { override: true }); // meaningless on an individual item
+    setScore(c, list[2], 'a_t1', 70);
+    const res = model.convertAssessmentToTeam(c, 'a_t1');
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_t1').value, 70, 'the majority (70) is the team score');
+    assert.deepEqual(shown(c, list, 'a_t1'), ['90*', '70', '70']);
+    assert.equal(res.overridesCreated, 1);
+  });
+});
+
+describe('letter scale invariant: the lowest cutoff is 0, F unless the scale names its own (review F7 / F4, V2)', () => {
   test('a scale without an F row gets F 0 appended, and a low total gets F', () => {
     const c = model.normalizeCourse({ settings: { letterScale: [{ letter: 'A', min: 90 }, { letter: 'B', min: 80 }] } });
     assert.deepEqual(c.settings.letterScale, [{ letter: 'A', min: 90 }, { letter: 'B', min: 80 }, { letter: 'F', min: 0 }]);
@@ -1122,7 +1242,7 @@ describe('letter scale invariant: last is F with min 0 (review F7 / F4)', () => 
     assert.equal(calc.letterFor(85, c.settings.letterScale), 'B');
   });
 
-  test('a bottom F above 0 is moved to 0; a bottom row already at 0 or below is kept', () => {
+  test('a bottom F above 0 is moved to 0; a bottom row at 0 is kept', () => {
     assert.deepEqual(model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'F', min: 50 }]),
       [{ letter: 'A', min: 90 }, { letter: 'F', min: 0 }]);
     assert.deepEqual(model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'D-', min: 60 }]),
@@ -1130,6 +1250,38 @@ describe('letter scale invariant: last is F with min 0 (review F7 / F4)', () => 
     assert.deepEqual(model.normalizeLetterScale([{ letter: 'Pass', min: 50 }, { letter: 'Fail', min: 0 }]),
       [{ letter: 'Pass', min: 50 }, { letter: 'Fail', min: 0 }]);
     assert.deepEqual(model.normalizeLetterScale([], 'graduate'), GRAD_SCALE);
+  });
+
+  test('rows with a negative cutoff are dropped, so the lowest cutoff is 0 (third review V2)', () => {
+    const s1 = model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'D', min: -10 }]);
+    assert.deepEqual(s1, [{ letter: 'A', min: 90 }, { letter: 'F', min: 0 }]);
+    assert.equal(calc.letterFor(5, s1), 'F');
+    assert.deepEqual(model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'D', min: 60 }, { letter: 'F', min: -10 }]),
+      [{ letter: 'A', min: 90 }, { letter: 'D', min: 60 }, { letter: 'F', min: 0 }]);
+    assert.deepEqual(model.normalizeLetterScale([{ letter: 'D', min: -1 }], 'graduate'), GRAD_SCALE);
+    const z = model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'F', min: -0 }]);
+    assert.ok(Object.is(z[1].min, 0), '-0 is stored as 0');
+    const c = model.normalizeCourse({ settings: { letterScale: [{ letter: 'A', min: 90 }, { letter: 'D', min: -10 }] } });
+    assert.deepEqual(c.settings.letterScale, [{ letter: 'A', min: 90 }, { letter: 'F', min: 0 }]);
+    assert.equal(calc.studentResult(c, addStudent(c, 'Student 01', 'X')).letter, 'F');
+  });
+
+  test('every normalized scale is descending with its lowest cutoff at 0', () => {
+    const inputs = [
+      UG_SCALE, GRAD_SCALE, [], null, [{ letter: 'A', min: 90 }], [{ letter: 'F', min: 30 }],
+      [{ letter: 'A', min: 90 }, { letter: 'D', min: -10 }], [{ letter: 'B', min: -5 }, { letter: 'A', min: -1 }],
+      [{ letter: 'Pass', min: 50 }, { letter: 'Fail', min: 0 }], [{ letter: 'A', min: 1e7 }, { letter: 'B', min: NaN }]
+    ];
+    inputs.forEach((list) => {
+      const scale = model.normalizeLetterScale(list);
+      const tag = JSON.stringify(list);
+      assert.ok(scale.length >= 1, tag);
+      assert.equal(scale[scale.length - 1].min, 0, tag);
+      scale.forEach((row, i) => {
+        assert.ok(row.min >= 0, tag);
+        if (i > 0) assert.ok(scale[i - 1].min >= row.min, tag);
+      });
+    });
   });
 
   test('passingLetter falls back to a letter that exists in the scale', () => {
@@ -1281,5 +1433,82 @@ describe('override and late helpers (review F9)', () => {
     assert.equal(det(c, a).state, 'empty');
     assert.equal(det(c, b).state, 'empty');
     assert.deepEqual(model.removeTeam(c, 't_missing'), []);
+  });
+});
+
+test('convertAssessmentToIndividual is a no-op on an assessment that is already individual', () => {
+  const model = require('../js/core/model.js');
+  const calc = require('../js/core/calc.js');
+  const c = model.createCourse('SE4351');
+  const t = model.createTeam('Team 1');
+  c.teams.push(t);
+  const s1 = model.createStudent({ no: 1, lastName: 'Student 01', firstName: 'Alpha', teamId: t.id });
+  const s2 = model.createStudent({ no: 2, lastName: 'Student 02', firstName: 'Bravo', teamId: t.id });
+  c.students.push(s1, s2);
+  model.setEntry(c.scores, s1.id, 'a_t1', { value: 81 });
+  model.setEntry(c.scores, s2.id, 'a_t1', { value: 67 });
+  const a = model.findAssessment(c, 'a_t1');
+  model.convertAssessmentToIndividual(c, 'a_t1');
+  assert.equal(calc.scoreDetail(c, s1, a).raw, 81);
+  assert.equal(calc.scoreDetail(c, s2, a).raw, 67);
+  assert.equal(a.teamGraded, false);
+});
+
+test('normalizeState keeps per-view preference objects in ui', () => {
+  const model = require('../js/core/model.js');
+  const st = model.createDefaultState();
+  st.ui.gridPrefs = { sort: 'total', dir: 'desc', cols: { weighted: false } };
+  st.ui.bogus = { x: 1 };
+  const n = model.normalizeState(JSON.parse(JSON.stringify(st)));
+  assert.deepEqual(n.ui.gridPrefs, { sort: 'total', dir: 'desc', cols: { weighted: false } });
+  assert.equal(n.ui.bogus, undefined);
+});
+
+describe('stage 2 model helpers', () => {
+  const model = require('../js/core/model.js');
+  test('splitAssessment keeps scores on part 1 and adds empty parts that sum to the original weight', () => {
+    const c = model.createCourse('SE4351');
+    const s = model.createStudent({ no: 1, lastName: 'Student 01', firstName: 'Alpha' });
+    c.students.push(s);
+    model.setEntry(c.scores, s.id, 'a_p1', { value: 90 });
+    const ids = model.splitAssessment(c, 'a_p1', [{ name: 'Questionnaire I', weight: 2.5 }, { name: 'Project I deliverable', weight: 7.5 }]);
+    assert.equal(ids.length, 1);
+    assert.equal(c.assessments[0].id, 'a_p1');
+    assert.equal(c.assessments[0].name, 'Questionnaire I');
+    assert.equal(c.assessments[0].weight, 2.5);
+    assert.equal(c.assessments[1].name, 'Project I deliverable');
+    assert.equal(c.assessments[1].weight, 7.5);
+    assert.equal(c.assessments[1].teamGraded, true);
+    assert.equal(model.getEntry(c.scores, s.id, 'a_p1').value, 90);
+    assert.throws(() => model.splitAssessment(c, 'a_p2', [{ name: 'A', weight: 5 }, { name: 'B', weight: 5 }]), /add up to 10/);
+    assert.throws(() => model.splitAssessment(c, 'a_p2', [{ name: 'A', weight: 20 }]), /two parts/);
+  });
+  test('moveAssessment swaps neighbours and refuses to move past the ends', () => {
+    const c = model.createCourse('SE4351');
+    assert.equal(model.moveAssessment(c, 'a_p2', -1), true);
+    assert.deepEqual(c.assessments.map((a) => a.id).slice(0, 2), ['a_p2', 'a_p1']);
+    assert.equal(model.moveAssessment(c, 'a_p2', -1), false);
+  });
+  test('renumberByName numbers students in name order, withdrawn included', () => {
+    const c = model.createCourse('SE4351');
+    c.students.push(model.createStudent({ no: 7, lastName: 'Student 10', firstName: 'Kilo' }));
+    c.students.push(model.createStudent({ no: 3, lastName: 'Student 2', firstName: 'Bravo', status: 'withdrawn' }));
+    c.students.push(model.createStudent({ no: 9, lastName: 'student 2', firstName: 'Alpha' }));
+    model.renumberByName(c);
+    assert.deepEqual(c.students.map((s) => s.no), [3, 2, 1]);
+  });
+  test('deleteStudent removes the student, scores and attendance', () => {
+    const c = model.createCourse('SE4351');
+    const s = model.createStudent({ no: 1, lastName: 'Student 01', firstName: 'Alpha' });
+    c.students.push(s);
+    model.setEntry(c.scores, s.id, 'a_t1', { value: 70 });
+    c.attendance.records[s.id] = { ses_20260903: 'A' };
+    c.attendance.totals[s.id] = { absent: 1, excused: 0 };
+    assert.equal(model.deleteStudent(c, s.id), true);
+    assert.equal(c.students.length, 0);
+    assert.equal(c.scores[s.id], undefined);
+    assert.equal(c.attendance.records[s.id], undefined);
+    assert.equal(c.attendance.totals[s.id], undefined);
+    assert.equal(model.deleteStudent(c, s.id), false);
   });
 });

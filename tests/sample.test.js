@@ -409,3 +409,44 @@ test('calc.computeCourse runs on the sample: finite totals and a plausible avera
     assert.equal(Math.min(...ranks), 1);
   }
 });
+
+test('assessment ids such as "toString" get normal generated scores (third review V3)', () => {
+  // A restored file may use ids that are also Object.prototype names; normalize keeps them.
+  const state = model.normalizeState({
+    app: 'grade-tracker',
+    courses: [{
+      template: 'custom', level: 'undergraduate',
+      assessments: [
+        { id: 'toString', name: 'Quiz', maxScore: 100, weight: 50, teamGraded: false },
+        { id: 'valueOf', name: 'Lab', maxScore: 100, weight: 50, teamGraded: false }
+      ]
+    }]
+  });
+  const course = state.courses[0];
+  assert.deepEqual(course.assessments.map((a) => a.id), ['toString', 'valueOf']);
+  sample.loadInto(course);
+  const withdrawn = course.students.filter((s) => s.status === 'withdrawn');
+  assert.equal(withdrawn.length, 2);
+  for (const aid of ['toString', 'valueOf']) {
+    const values = [];
+    for (const s of course.students) {
+      const e = model.getEntry(course.scores, s.id, aid);
+      if (!e) continue; // one of the two incomplete students
+      assert.equal(typeof e.value, 'number', `${aid} ${s.lastName}`);
+      assert.ok(e.value >= 60 && e.value <= 100, `${aid} ${s.lastName} ${e.value}`);
+      values.push(e.value);
+    }
+    assert.ok(values.length >= course.students.length - 2, `${aid}: ${values.length} scores`);
+    // Not treated as team work or as an item withdrawn students skip.
+    for (const s of withdrawn) assert.ok(model.getEntry(course.scores, s.id, aid), `${aid} withdrawn ${s.lastName}`);
+    for (const t of course.teams) {
+      const inTeam = course.students.filter((s) => s.teamId === t.id)
+        .map((s) => model.getEntry(course.scores, s.id, aid)).filter(Boolean).map((e) => e.value);
+      assert.ok(new Set(inTeam).size > 1, `${aid}: one value per student, not per team`);
+    }
+  }
+  const results = calc.computeCourse(course);
+  const incomplete = course.students.filter((s) => results.byId[s.id].incomplete);
+  assert.equal(incomplete.length, 2);
+  for (const s of course.students) assert.ok(Number.isFinite(results.byId[s.id].total));
+});

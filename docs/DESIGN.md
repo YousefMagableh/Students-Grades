@@ -108,7 +108,7 @@ Settings = {
   rounding: 'none'|'hundredth'|'integer',
   curve: 0,                           // flat points added to the total
   latePointsPerWeek: 10,              // K4, >= 0
-  letterScale: [{ letter: 'A+', min: 97 }, …, { letter: 'F', min: 0 }],  // descending min; last is F with min 0
+  letterScale: [{ letter: 'A+', min: 97 }, …, { letter: 'F', min: 0 }],  // descending min; lowest cutoff 0 (F, or the scale's own bottom letter)
   passingLetter: 'D-'|'C'             // lowest passing letter (pass rate, ST2); always a letter of the scale
 }
 
@@ -147,7 +147,9 @@ Default state (`model.createDefaultState()`): both template courses with **no st
 `letterScale`, `rounding`, `curve`, `lateWork`, `maxScores`, `projectSplit` (every course: both syllabi
 say "approx. 10 + 20"), `termPaperWeight` (only while the course has the `a_paper` assessment, which the
 SE6362 template creates), `unexcusedThreshold`, `passingLetter`. Display decimals (K3) is display-only
-and deliberately not a placeholder. Notes quote a syllabus only for the SE4351/SE6362 templates; custom
+and deliberately not a placeholder: REQUEST.md names only rounding and curve as "not specified by the
+instructor" and lists the placeholders as rounding, late-work exceptions, max scores and project split.
+REQUIREMENTS.md K3 says the same. Notes quote a syllabus only for the SE4351/SE6362 templates; custom
 courses get generic notes.
 `model.placeholderKeys(course)` returns the keys that apply to that course.
 `model.placeholderInfo(course, key)` → `{ key, label, note, confirmed, confirmedAt }` or null;
@@ -166,11 +168,14 @@ Factories and constants:
   (ids `ses_YYYYMMDD`), `model.defaultSettings(level)`, `model.defaultAttendance(mode, sessions)`,
   `model.defaultLetterScale(level)`, `model.defaultPassingLetter(level)`, `model.ROUNDING_MODES`,
   `model.ATTENDANCE_MODES`, `model.APP_ID`, `model.SCHEMA_VERSION`.
-- `model.normalizeLetterScale(list, level)` → cleaned copy: malformed rows dropped, sorted by `min`
-  descending, and the invariant "last is F with min 0" enforced (a bottom `F` above 0 moves to 0; a scale
-  whose lowest cutoff is above 0 gets `{ letter: 'F', min: 0 }` appended; empty → level default). Settings
-  edits of the scale must go through it. `model.passingLetterFor(scale, preferred, level)` → `preferred` if
-  in the scale, else the level default if in the scale, else the lowest letter above the bottom one.
+- `model.normalizeLetterScale(list, level)` → cleaned copy: malformed rows dropped (no letter, `min` not a
+  sane number, or `min` < 0, since a negative cutoff would shadow the failing letter), sorted by `min`
+  descending, and the invariant "the lowest cutoff is 0" enforced: a bottom `F` above 0 moves to 0; a scale
+  whose lowest cutoff is above 0 gets `{ letter: 'F', min: 0 }` appended; a bottom row already at 0 keeps its
+  letter (e.g. Pass/Fail); empty → level default. Settings edits of the scale must go through it (the
+  Settings view highlights a negative cutoff instead of saving it, so the row is not silently dropped).
+  `model.passingLetterFor(scale, preferred, level)` → `preferred` if in the scale, else the level default if
+  in the scale, else the lowest letter above the bottom one.
 
 Normalize and backup (R4). Files are untrusted: ids must pass `util.isSafeKey` (not `__proto__`,
 `constructor`, `prototype`; otherwise a new id is made and data keyed by the bad id is dropped), lookups
@@ -217,20 +222,28 @@ shown with a marker (written agreement needed), so the model never creates an **
   (an explicit empty override means "no score for this member"); `model.clearOverride(course, studentId,
   assessmentId)` → true when an override was removed (the member follows the team score again).
 - `model.setTeamScoreFromMembers(course, assessmentId, rows)` (paste/import of a team-graded column):
-  `rows = [{studentId, entry}]`. Per team with rows: only rows holding a score vote (blank cells abstain);
-  withdrawn members vote only when no active member of that team has a score in `rows`. Team score = most
-  frequent vote by `entryKey` (so late info counts), ties → first in row order; no votes → team score
-  cleared. Blank rows and rows equal to the team score follow the team score (own entry and any override
-  removed); other rows keep their entry as an override. Team members **not** in `rows` are not written:
-  like typing in one member's cell, the new team score reaches every member without an override, and
+  `rows = [{studentId, entry}]`. A row is an **override row** when its member holds an override now or its
+  entry has `override: true` (what `entryFromInput(text, prev)` gives for a non-empty cell over an override).
+  Override rows never vote (an unequal split never becomes the team's score). Per team with rows: of the
+  other rows, only those holding a score vote (blank cells abstain); withdrawn members vote only when no
+  active member of that team has a score in them. Team score = most frequent vote by `entryKey` (so late info
+  counts), ties → first in row order; no votes → team score cleared; a team whose rows are all override rows
+  keeps its team score. An override row pasted back unchanged (same `entryKey` as the member's override, an
+  empty override included) is left as it is, so pasting unchanged cells back changes nothing. Other rows
+  equal to the team score follow it (own entry and any override removed); other rows with a score keep
+  their entry as an override. Blank rows follow the team score (a blank over an override hands the member
+  back, like clearing the cell). Team members **not** in `rows` are not written: like typing in one
+  member's cell, the new team score reaches every member without an override, and
   `propagatedTo` lists the non-row members whose visible score changed so the grid can report it.
   Rows for students without a team become individual entries.
-  Returns `{ overridesCreated, teamsSet, propagatedTo: [studentId] }`.
+  Returns `{ overridesCreated, teamsSet, propagatedTo: [studentId] }`: `overridesCreated` counts members
+  who had no override before; `teamsSet` counts teams whose team score was written.
 - `model.convertAssessmentToTeam(course, assessmentId)`: no-op (returns `{ overridesCreated: 0 }`) when the
-  item is already team-graded. Otherwise, for each team, the members' individual entries in name order go
-  through `setTeamScoreFromMembers`: every entered score is preserved (majority → team score, ties → first
-  member by name, the rest → overrides) and members with no score follow the team score. Students without
-  a team keep individual entries. Returns `{ overridesCreated }`.
+  item is already team-graded. Otherwise, for each team, the members' individual entries in name order
+  (stored without any stray override flag, so every member votes) go through `setTeamScoreFromMembers`:
+  every entered score is preserved (majority → team score, ties → first member by name, the rest →
+  overrides) and members with no score follow the team score. Students without a team keep individual
+  entries. Returns `{ overridesCreated }`.
 - `model.convertAssessmentToIndividual(course, assessmentId)`: every member's effective entry is copied
   into `scores` (override flags cleared); team entries for that assessment are deleted.
 - `model.moveStudentToTeam(course, studentId, newTeamId|null, { keepScores })` (G5 kind `'team-membership'`):
@@ -242,6 +255,10 @@ shown with a marker (written agreement needed), so the model never creates an **
   score is not kept as an override (the student follows the new team).
 - `model.removeTeam(course, teamId, { keepScores })` → moves every member to no team through
   `moveStudentToTeam`, deletes the team and its team scores; returns the moved student ids.
+- `model.moveAssessment(course, assessmentId, ±1)`, `model.splitAssessment(course, assessmentId, [{name, weight}, …])`
+  (A5: the original keeps its id and scores as part 1; the other parts are new and empty; weights must sum to
+  the original weight, else it throws), `model.renumberByName(course)` (No = 1..N in name order),
+  `model.deleteStudent(course, studentId)` (scores, overrides and attendance too; the UI recommends withdrawing).
 - `model.removeAssessment(course, assessmentId)` → deletes the item and every score for it (individual
   entries, overrides, team scores); returns false when it did not exist. Export presets are left alone:
   the exporter skips columns that reference a missing assessment.
@@ -327,6 +344,8 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `"From <team> team score"`). Attendance changes (stage 3) are logged per student when a transaction
   changes ≤ 5 marks, otherwise as one `'attendance'` summary entry.
 - `history.bulkEntry({ ts, source, field, note })` for summary-only transactions (e.g., loading sample data).
+- Entries may carry `userNote` / `userNoteAt`, a free-text note the TA adds later (e.g. "changed per
+  instructor email, Oct 12") via `GT.store.annotateHistory(entryId, text)`. The log is otherwise append-only.
 
 ## 5. Store (`GT.store`) and storage (`GT.storage`)
 
@@ -340,7 +359,10 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
 - `GT.store.undo()`, `redo()`, `canUndo()`, `canRedo()` — per course, in memory, capped at 200 steps.
   Undo/redo append history entries (source `'undo'`/`'redo'`); history itself is never rolled back.
 - `GT.store.setUi(patch)`, `GT.store.setMeta(patch)`, `GT.store.replaceState(state, source)`,
-  `GT.store.subscribe(fn)`, `GT.store.flush()` (save now), `GT.store.saveStatus()`.
+  `GT.store.subscribe(fn)`, `GT.store.flush()` (save now), `GT.store.saveStatus()`,
+  `GT.store.annotateHistory(entryId, text)`, `setActiveCourse/addCourse/deleteCourse/moveCourse`.
+- `ui` keeps per-view preference objects named `<view>Prefs` (e.g. `ui.gridPrefs`); `normalizeState` keeps
+  them as shallow plain objects.
 
 ## 6. UI conventions
 

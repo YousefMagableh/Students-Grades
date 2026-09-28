@@ -29,14 +29,17 @@
     return level === 'graduate' ? 'C' : 'D-';
   }
 
-  /** Cleans a letter scale (restore, Settings edits): drops malformed rows, sorts by min descending,
-   * and keeps the invariant "last is F with min 0": a bottom F above 0 is moved to 0, and a scale
-   * whose lowest cutoff is above 0 gets { letter: 'F', min: 0 } appended. An empty result falls
-   * back to the default scale for the level. Returns a new array. */
+  /** Cleans a letter scale (restore, Settings edits): drops malformed rows (including a negative
+   * min, which would shadow the failing letter), sorts by min descending, and keeps the invariant
+   * "the lowest cutoff is 0" (F unless the scale names its own bottom letter at 0, e.g. Pass/Fail):
+   * a bottom F above 0 is moved to 0, and a scale whose lowest cutoff is above 0 gets
+   * { letter: 'F', min: 0 } appended. An empty result falls back to the default scale for the
+   * level. Returns a new array. */
   function normalizeLetterScale(list, level) {
     var scale = (Array.isArray(list) ? list : []).filter(function (x) {
-      return util.isPlainObject(x) && typeof x.letter === 'string' && x.letter !== '' && util.isSaneNumber(x.min);
-    }).map(function (x) { return { letter: x.letter, min: x.min }; });
+      return util.isPlainObject(x) && typeof x.letter === 'string' && x.letter !== '' &&
+        util.isSaneNumber(x.min) && x.min >= 0;
+    }).map(function (x) { return { letter: x.letter, min: x.min === 0 ? 0 : x.min }; }); // -0 -> 0
     if (!scale.length) return defaultLetterScale(level);
     scale.sort(function (a, b) { return b.min - a.min; });
     var last = scale[scale.length - 1];
@@ -447,17 +450,23 @@
   }
 
   /** Sets team scores from per-member rows (paste/import of a team-graded column; K5).
-   * rows: [{ studentId, entry }] (entry null = empty). For each team with rows:
-   * - Only rows holding a score vote (blank cells abstain). Withdrawn members vote only when no
-   *   active member of that team has a score in `rows`.
+   * rows: [{ studentId, entry }] (entry null = empty). A row is an "override row" when its member
+   * holds an override now or its entry has override: true (entryFromInput keeps the flag when a
+   * value is typed or pasted over an override cell). For each team with rows:
+   * - Override rows never vote: an unequal split is never made the whole team's score.
+   * - Only other rows holding a score vote (blank cells abstain). Withdrawn members vote only when
+   *   no active member of that team has a score in those rows.
    * - Team score = the most frequent vote (entryKey, so late info counts; ties: first in row
-   *   order). No votes at all clears the team score.
-   * - Blank rows and rows equal to the team score follow the team score (own entry and any
-   *   override removed); other rows keep their entry as an override. No empty override is created.
+   *   order). No votes clears the team score; a team whose rows are all override rows keeps it.
+   * - An override row pasted back unchanged (same entryKey as the member's override, an empty
+   *   one included) is left as it is, so pasting unchanged cells back changes nothing.
+   * - Other rows equal to the team score follow it (own entry and any override removed); other
+   *   rows with a score keep their entry as an override. Blank rows follow the team score (a blank
+   *   over an override hands the member back, like clearing the cell). No empty override is created.
    * - Members not in `rows` are not written. Without an override they see the new team score, like
    *   typing it in one member's cell; `propagatedTo` lists those whose visible score changed.
    * Rows for students without a team are written as individual entries.
-   * Returns { overridesCreated, teamsSet, propagatedTo }. */
+   * Returns { overridesCreated (members who had no override before), teamsSet, propagatedTo }. */
   function setTeamScoreFromMembers(course, assessmentId, rows) {
     var byTeam = Object.create(null), order = [], overridesCreated = 0, teamsSet = 0, propagatedTo = [];
     rows.forEach(function (r) {
@@ -468,7 +477,12 @@
         return;
       }
       if (!byTeam[s.teamId]) { byTeam[s.teamId] = []; order.push(s.teamId); }
-      byTeam[s.teamId].push({ student: s, entry: r.entry });
+      var own = getEntry(course.scores, s.id, assessmentId);
+      var held = !!own && own.override === true;
+      byTeam[s.teamId].push({
+        student: s, entry: r.entry, own: own, held: held,
+        isOverride: held || !!(r.entry && r.entry.override === true)
+      });
     });
     order.forEach(function (teamId) {
       var list = byTeam[teamId];
@@ -477,19 +491,25 @@
       var others = teamMembers(course, teamId).filter(function (m) { return !inRows[m.id]; });
       var othersBefore = others.map(function (m) { return entryKey(memberEntry(course, m, assessmentId)); });
 
-      var voters = list.filter(function (x) { return hasScore(x.entry) && x.student.status !== 'withdrawn'; });
-      if (!voters.length) voters = list.filter(function (x) { return hasScore(x.entry); });
-      var team = majorityEntry(voters.map(function (x) { return x.entry; }));
-      var teamEntry = team ? stripOverride(team) : null;
-      setEntry(course.teamScores, teamId, assessmentId, teamEntry);
-      teamsSet++;
+      var plain = list.filter(function (x) { return !x.isOverride; });
+      var teamEntry;
+      if (plain.length) {
+        var voters = plain.filter(function (x) { return hasScore(x.entry) && x.student.status !== 'withdrawn'; });
+        if (!voters.length) voters = plain.filter(function (x) { return hasScore(x.entry); });
+        var team = majorityEntry(voters.map(function (x) { return x.entry; }));
+        teamEntry = team ? stripOverride(team) : null;
+        setEntry(course.teamScores, teamId, assessmentId, teamEntry);
+        teamsSet++;
+      } else {
+        teamEntry = getEntry(course.teamScores, teamId, assessmentId); // only override rows: keep it
+      }
       var teamKey = entryKey(teamEntry);
       list.forEach(function (x) {
+        // An override cell pasted back unchanged keeps its override (an empty one included).
+        if (x.held && entryKey(x.entry) === entryKey(x.own)) return;
         if (hasScore(x.entry) && entryKey(x.entry) !== teamKey) {
-          var o = stripOverride(x.entry);
-          o.override = true;
-          setEntry(course.scores, x.student.id, assessmentId, o);
-          overridesCreated++;
+          setOverride(course, x.student.id, assessmentId, x.entry);
+          if (!x.held) overridesCreated++;
         } else {
           // The team score now represents this member; drop any stale individual entry or override.
           setEntry(course.scores, x.student.id, assessmentId, null);
@@ -591,8 +611,11 @@
       var members = sortedMembers(course, t.id);
       if (!members.length) return;
       var rows = members.map(function (s) {
-        var e = getEntry(course.scores, s.id, assessmentId);
-        return { studentId: s.id, entry: e ? stripOverride(e) : null };
+        var e = stripOverride(getEntry(course.scores, s.id, assessmentId));
+        // An override flag means nothing on an individual item: store the entry without it, so
+        // every member votes (setTeamScoreFromMembers keeps held overrides out of the vote).
+        if (e) setEntry(course.scores, s.id, assessmentId, e);
+        return { studentId: s.id, entry: e };
       });
       var res = setTeamScoreFromMembers(course, assessmentId, rows);
       created += res.overridesCreated;
@@ -605,7 +628,8 @@
    * (team or override) entry into their individual entry. */
   function convertAssessmentToIndividual(course, assessmentId) {
     var a = findAssessment(course, assessmentId);
-    if (!a) return;
+    // Already individual: nothing to convert (and members' own entries must not be touched).
+    if (!a || !a.teamGraded) return;
     course.students.forEach(function (s) {
       var eff = s.teamId && findTeam(course, s.teamId)
         ? memberEntry(course, s, assessmentId)
@@ -621,6 +645,71 @@
   function indexById(list, id) {
     for (var i = 0; i < list.length; i++) if (list[i].id === id) return i;
     return -1;
+  }
+
+  /** Moves an assessment up (delta -1) or down (+1) in display order. Returns true when it moved. */
+  function moveAssessment(course, assessmentId, delta) {
+    var i = indexById(course.assessments, assessmentId);
+    var j = i + delta;
+    if (i === -1 || j < 0 || j >= course.assessments.length) return false;
+    var tmp = course.assessments[i];
+    course.assessments[i] = course.assessments[j];
+    course.assessments[j] = tmp;
+    return true;
+  }
+
+  /** Splits one assessment into parts (A5: e.g. Project I 10% -> Questionnaire I 2.5% + Project I 7.5%).
+   * parts: [{ name, weight }] with 2+ parts whose weights sum to the original weight.
+   * The original keeps its id and scores and becomes part 1; the other parts are new, empty, and share its
+   * max score, team-graded flag and category. Returns the new assessments' ids. Throws on invalid parts. */
+  function splitAssessment(course, assessmentId, parts) {
+    var i = indexById(course.assessments, assessmentId);
+    if (i === -1) throw new Error('Assessment not found.');
+    if (!Array.isArray(parts) || parts.length < 2) throw new Error('A split needs at least two parts.');
+    var orig = course.assessments[i];
+    var total = 0;
+    parts.forEach(function (p) {
+      if (!p || typeof p.name !== 'string' || !p.name.trim()) throw new Error('Every part needs a name.');
+      if (typeof p.weight !== 'number' || !isFinite(p.weight) || p.weight < 0) throw new Error('Every part needs a weight of 0 or more.');
+      total += p.weight;
+    });
+    if (Math.abs(util.fix(total) - (orig.weight || 0)) > 1e-9) {
+      throw new Error('The parts add up to ' + util.fix(total) + '%, but ' + orig.name + ' is worth ' + orig.weight + '%.');
+    }
+    orig.name = parts[0].name.trim();
+    orig.weight = parts[0].weight;
+    var ids = [];
+    parts.slice(1).forEach(function (p, k) {
+      var a = createAssessment({
+        name: p.name.trim(), weight: p.weight, maxScore: orig.maxScore,
+        teamGraded: orig.teamGraded, category: orig.category
+      });
+      course.assessments.splice(i + 1 + k, 0, a);
+      ids.push(a.id);
+    });
+    return ids;
+  }
+
+  /** Sets No = 1..N in name order (last name, then first name), withdrawn students included. */
+  function renumberByName(course) {
+    var list = course.students.slice().sort(function (a, b) {
+      return util.compareText(a.lastName, b.lastName) || util.compareText(a.firstName, b.firstName) ||
+        ((typeof a.no === 'number' ? a.no : Infinity) - (typeof b.no === 'number' ? b.no : Infinity)) || 0;
+    });
+    list.forEach(function (s, k) { s.no = k + 1; });
+  }
+
+  /** Permanently deletes a student with their scores, overrides and attendance.
+   * (The UI recommends withdrawing instead: withdrawn students stay in history and exports.) */
+  function deleteStudent(course, studentId) {
+    var i = indexById(course.students, studentId);
+    if (i === -1) return false;
+    course.students.splice(i, 1);
+    if (util.hasOwn(course.scores, studentId)) delete course.scores[studentId];
+    var att = course.attendance || {};
+    if (att.records && util.hasOwn(att.records, studentId)) delete att.records[studentId];
+    if (att.totals && util.hasOwn(att.totals, studentId)) delete att.totals[studentId];
+    return true;
   }
 
   /** Deletes an assessment with every score for it (individual entries, overrides, team scores).
@@ -843,7 +932,7 @@
     });
     var ui = util.isPlainObject(raw.ui) ? raw.ui : {};
     var meta = util.isPlainObject(raw.meta) ? raw.meta : {};
-    return {
+    var out = {
       app: APP_ID,
       schemaVersion: SCHEMA_VERSION,
       courses: courses,
@@ -860,6 +949,20 @@
         lastBackupAt: typeof meta.lastBackupAt === 'string' ? meta.lastBackupAt : null
       }
     };
+    // Per-view preferences (ui.gridPrefs, ui.historyPrefs, ...) survive as shallow plain objects.
+    Object.keys(ui).forEach(function (k) {
+      if (/^[a-zA-Z]+Prefs$/.test(k) && util.isPlainObject(ui[k])) {
+        var prefs = {};
+        Object.keys(ui[k]).forEach(function (pk) {
+          var v = ui[k][pk];
+          if (util.isSafeKey && !util.isSafeKey(pk)) return;
+          if (v === null || ['string', 'number', 'boolean'].indexOf(typeof v) !== -1) prefs[pk] = v;
+          else if (util.isPlainObject(v)) prefs[pk] = JSON.parse(JSON.stringify(v));
+        });
+        out.ui[k] = prefs;
+      }
+    });
+    return out;
   }
 
   // ---------------------------------------------------------------- backup files (R4)
@@ -964,6 +1067,10 @@
     convertAssessmentToIndividual: convertAssessmentToIndividual,
     removeAssessment: removeAssessment,
     removeTeam: removeTeam,
+    moveAssessment: moveAssessment,
+    splitAssessment: splitAssessment,
+    renumberByName: renumberByName,
+    deleteStudent: deleteStudent,
     normalizeCourse: normalizeCourse,
     normalizeState: normalizeState,
     wrapBackup: wrapBackup,

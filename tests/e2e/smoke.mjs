@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -300,6 +301,112 @@ function gridAbsenceMismatches() {
     });
     return { rows: rows.length, bad };
   });
+}
+
+// Stage 4 helpers: the Import / Export tab. Downloads and test files go to TMP (outside the repository).
+
+const ExcelJS = require(path.join(ROOT, 'vendor', 'exceljs.min.js'));
+const miniExcel = require(path.join(ROOT, 'tests', 'helpers', 'mini-excel.js'));
+const csvCore = require(path.join(ROOT, 'js', 'core', 'csv.js'));
+
+/** Headers of the default export preset for SE 4351: the previous TA's sheet, then the absences and Status. */
+const PREVIOUS_LAYOUT = ['No', 'Last Name', 'First Name', 'Project I', 'Project II', 'Test 1', 'Test 2', 'Class/Project Participation',
+  'Project I 10%', 'Project II 20%', 'Test 1 25%', 'Test 2 40%', 'Class/Project Participation 5%', 'Total', 'Letter Grade',
+  'Excused (allowed)', 'Unexcused (not allowed)', 'Total absences', 'Status'];
+
+/** The previous TA's sheet, column by column (the 15th header is blank). */
+const OLD_SHEET_HEADERS = ['No', 'Last Name', 'First Name', 'Final Project I', 'Final Project II', 'Test 1', 'Test 2',
+  'Project I 10%', 'Project II 20%', 'Test 1 25%', 'Test 2 40%', 'Class Participation 5%', 'Total', 'Letter Grade', '', 'No of Absence'];
+
+/** Clicks a download button of the Export card and saves the file in TMP as "<tag>-<suggested name>". */
+async function downloadFrom(sel, tag) {
+  const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 20000 }), page.click(sel)]);
+  const name = dl.suggestedFilename();
+  const file = path.join(TMP, tag + '-' + name);
+  await dl.saveAs(file);
+  return { file, name };
+}
+
+/** One entry of a .zip file (an .xlsx is a zip) as text. */
+function readZipEntry(buf, name) {
+  const b = Buffer.from(buf);
+  let eocd = b.length - 22;
+  while (eocd >= 0 && b.readUInt32LE(eocd) !== 0x06054b50) eocd--;
+  assert.ok(eocd >= 0, 'not a zip file');
+  let p = b.readUInt32LE(eocd + 16);
+  for (let i = 0, n = b.readUInt16LE(eocd + 10); i < n; i++) {
+    const method = b.readUInt16LE(p + 10), size = b.readUInt32LE(p + 20);
+    const nameLen = b.readUInt16LE(p + 28), extraLen = b.readUInt16LE(p + 30), commentLen = b.readUInt16LE(p + 32);
+    const local = b.readUInt32LE(p + 42);
+    if (b.toString('utf8', p + 46, p + 46 + nameLen) === name) {
+      const start = local + 30 + b.readUInt16LE(local + 26) + b.readUInt16LE(local + 28);
+      const data = b.subarray(start, start + size);
+      return (method === 8 ? zlib.inflateRawSync(data) : data).toString('utf8');
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  throw new Error('No ' + name + ' in the zip');
+}
+
+/** The downloaded .xlsx read back with the vendored ExcelJS: { wb, ws (sheet "Grades"), header }. */
+async function readXlsx(file) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(fs.readFileSync(file));
+  const ws = wb.getWorksheet('Grades');
+  assert.ok(ws, 'no "Grades" sheet');
+  return { wb, ws, header: ws.getRow(1).values.slice(1) };
+}
+
+/** Every cell of an ExcelJS worksheet as a mini-excel sheet (formulas stay formulas), to recalculate it. */
+function miniSheet(ws) {
+  const cells = {};
+  ws.eachRow((row) => row.eachCell((cell) => {
+    const v = cell.value;
+    cells[cell.address] = v && typeof v === 'object' && typeof v.formula === 'string' ? { formula: v.formula } : v;
+  }));
+  return miniExcel.createSheet(cells);
+}
+
+function noteText(n) {
+  if (typeof n === 'string') return n;
+  return n && Array.isArray(n.texts) ? n.texts.map((t) => t.text).join('') : '';
+}
+
+/** What the app shows for every student of the active course, in name order (the export's row order). */
+function appRows() {
+  return page.evaluate(() => {
+    const c = GT.store.course(), r = GT.store.results();
+    return GT.calc.sortStudents(c, r, 'name', 'asc').map((s) => {
+      const x = r.byId[s.id], sm = GT.attendance.summary(c, s.id);
+      return {
+        id: s.id, no: s.no, last: s.lastName, first: s.firstName, status: s.status, total: x.total, letter: x.letter,
+        effective: x.effectiveLetter, source: x.letterSource,
+        weighted: c.assessments.map((a) => x.items[a.id].weightedUnrounded),
+        att: [sm.excused, sm.unexcused, sm.totalAbsences]
+      };
+    });
+  });
+}
+
+/** Imports a file through the Import card (steps 1-4 with the guessed mapping, then Import).
+ * atMapping(state) runs on step 3 and atPreview(state) on step 4 (state = GT.views.exchange.importState()). */
+async function importThroughCard(file, { atMapping, atPreview } = {}) {
+  await gotoView('exchange');
+  await page.setInputFiles('#xc-file', file);
+  await page.locator('#xc-next-2, .xc-imp-error').first().waitFor();
+  const err = page.locator('.xc-imp-error');
+  if (await err.count()) throw new Error('import refused the file: ' + (await err.innerText()));
+  await page.click('#xc-next-2');
+  await page.locator('#xc-next-3').waitFor();
+  const mapped = await page.evaluate(() => GT.views.exchange.importState());
+  if (atMapping) await atMapping(mapped);
+  await page.click('#xc-next-3');
+  await page.locator('#xc-import-btn').waitFor();
+  const preview = await page.evaluate(() => GT.views.exchange.importState());
+  if (atPreview) await atPreview(preview);
+  await page.click('#xc-import-btn');
+  await page.locator('.xc-done').waitFor();
+  return { mapping: mapped.mapping, options: mapped.options, counts: preview.counts };
 }
 
 /** The raw value stored under a key of the app's IndexedDB object store (undefined if none). */
@@ -1269,7 +1376,12 @@ async function run() {
     assert.equal(other.code, 'SE 6362');
     assert.equal(other.mode, 'off');
     await page.selectOption('#course-select', other.id);
-    await page.waitForFunction(() => document.querySelectorAll('.gt-grid tbody tr.gr').length > 0);
+    // Wait for the rows of SE 6362 (the SE 4351 grid is still on screen until the switch re-renders it).
+    await page.waitForFunction(() => {
+      const ids = new Set(GT.store.course().students.map((s) => s.id));
+      const rows = [...document.querySelectorAll('.gt-grid tbody tr.gr')];
+      return GT.store.course().code === 'SE 6362' && rows.length === ids.size && rows.every((tr) => ids.has(tr.getAttribute('data-sid')));
+    });
     assert.equal(await page.locator('.gt-grid thead th.h-attExc, .gt-grid thead th.h-attUnx, .gt-grid thead th.h-attTot').count(), 0,
       'no absence columns while attendance is off');
     await gotoView('attendance');
@@ -1714,6 +1826,244 @@ async function run() {
     await page.fill('[data-f="tthr"]', '');
     await page.press('[data-f="tthr"]', 'Enter');
     await page.waitForFunction(() => GT.store.course().attendance.totalAbsenceThreshold === null);
+  });
+
+  // ---------------------------------------------------------------- stage 4: export and import
+
+  let exportedCsv = null; // the CSV of the next check, imported by the one after it
+
+  await check('Export: the default preset downloads an .xlsx with the previous sheet\'s columns, real formulas that give the app\'s totals and letters, a frozen header and a filter (ExcelJS from file://, offline)', async () => {
+    await resetSample();
+    const net0 = network.length;
+    await gotoView('exchange');
+    assert.equal(await page.inputValue('#xc-preset'), 'builtin:previous');
+    const keys = await page.evaluate(() => GT.views.exchange.exportKeys());
+    assert.deepEqual(keys, await page.evaluate(() => GT.exporter.builtInPresets(GT.store.course())[0].columns));
+    assert.equal(await page.evaluate(() => typeof window.ExcelJS), 'undefined', 'ExcelJS is loaded only when a workbook is made or read');
+    await page.locator('#xc-check .xc-check-list').waitFor(); // the data check is shown above the buttons
+    const x = await downloadFrom('#xc-dl-xlsx', 'suggested');
+    assert.match(x.name, /^SE4351-grades-\d{4}-\d{2}-\d{2}_\d{4}\.xlsx$/);
+    await page.locator('#xc-export-status .xc-status-ok').waitFor();
+    const lib = await page.evaluate(() => ({
+      ready: !!(window.ExcelJS && typeof ExcelJS.Workbook === 'function'),
+      src: [...document.scripts].map((s) => s.src).filter((s) => /exceljs/i.test(s))
+    }));
+    assert.ok(lib.ready, 'ExcelJS did not initialize');
+    assert.deepEqual(lib.src, [new URL('vendor/exceljs.min.js', APP_URL).href], 'ExcelJS must come from the local vendor folder');
+    assert.deepEqual(network.slice(net0), [], 'the export made network requests');
+
+    const { wb, ws, header } = await readXlsx(x.file);
+    assert.deepEqual(header, PREVIOUS_LAYOUT);
+    assert.deepEqual(wb.worksheets.map((w) => w.name), ['Grades', 'Settings']);
+    assert.deepEqual([ws.views[0].state, ws.views[0].xSplit, ws.views[0].ySplit], ['frozen', 3, 1]);
+    assert.equal(ws.autoFilter, 'A1:S1');
+    assert.match(readZipEntry(fs.readFileSync(x.file), 'xl/workbook.xml'), /<calcPr[^>]*fullCalcOnLoad="1"/);
+    const app = await appRows();
+    assert.equal(ws.actualRowCount, SAMPLE_STUDENTS + 1);
+    const sheet = miniSheet(ws);
+    const bad = [];
+    app.forEach((s, i) => {
+      const r = i + 2;
+      const row = ws.getRow(r);
+      const val = (c) => row.getCell(c).value;
+      if (val(1) !== s.no || val(2) !== s.last || val(3) !== s.first) bad.push(r + ': not ' + s.last + ', ' + s.first);
+      // Weighted = raw / max × weight (a late penalty would add MAX(0,raw-P)); each gives the app's number.
+      for (let k = 0; k < 5; k++) {
+        const f = row.getCell(9 + k).formula;
+        if (!/^(MAX\(0,)?[D-H]\d+(-[\d.]+\))?\/\d+\*\d+$/.test(f || '')) bad.push(r + ': weighted formula ' + f);
+        if (Math.abs(sheet.value('IJKLM'.charAt(k) + r) - s.weighted[k]) > 1e-9) bad.push(r + ': weighted ' + k);
+      }
+      if (row.getCell(14).formula !== 'ROUND(SUM(I' + r + ':M' + r + '),10)') bad.push(r + ': total formula ' + row.getCell(14).formula);
+      if (val(14).result !== s.total || sheet.value('N' + r) !== s.total) bad.push(r + ': total ' + sheet.value('N' + r) + ' != ' + s.total);
+      // No final letters yet: Letter Grade is the suggestion, a nested IF on the Total.
+      if (!String(row.getCell(15).formula).startsWith('IF(N' + r + '>=97,"A+",IF(N' + r + '>=93,"A",')) bad.push(r + ': letter formula');
+      if (val(15).result !== s.letter || sheet.value('O' + r) !== s.letter) bad.push(r + ': letter ' + sheet.value('O' + r) + ' != ' + s.letter);
+      if ([val(16), val(17), val(18)].join() !== s.att.join()) bad.push(r + ': absences ' + [val(16), val(17), val(18)] + ' != ' + s.att);
+      if (val(19) !== (s.status === 'withdrawn' ? 'Withdrawn' : 'Active')) bad.push(r + ': status ' + val(19));
+    });
+    assert.deepEqual(bad.slice(0, 5), []);
+    assert.ok(app.some((s) => s.status === 'withdrawn'), 'the sample has a withdrawn student, exported with Status "Withdrawn"');
+    assert.match(noteText(ws.getRow(1).getCell(9).note), /^= raw ÷ max × weight/);
+
+    // Read back through the Import card: a Letter Grade column of formulas holds suggestions, so it is not
+    // matched to the final letter (a CSV cannot tell; there it is, and the step-3 note says so).
+    await page.setInputFiles('#xc-file', x.file);
+    await page.locator('#xc-next-2').waitFor();
+    assert.equal(await page.evaluate(() => GT.views.exchange.importState().sheetIndex), 0);
+    await page.click('#xc-next-2');
+    await page.locator('#xc-next-3').waitFor();
+    const mapping = (await page.evaluate(() => GT.views.exchange.importState())).mapping;
+    assert.deepEqual(mapping.slice(0, 16), ['no', 'lastName', 'firstName', 'raw:a_p1', 'raw:a_p2', 'raw:a_t1', 'raw:a_t2', 'raw:a_part',
+      'weighted:a_p1', 'weighted:a_p2', 'weighted:a_t1', 'weighted:a_t2', 'weighted:a_part', 'ignore', 'ignore', 'excused']);
+    await page.click('#xc-imp-body [data-act="imp-restart"]');
+    await page.locator('#xc-pick').waitFor();
+    assert.deepEqual(network.slice(net0), [], 'reading the workbook made network requests');
+  });
+
+  await check('Export after final letters: Letter Grade holds each student\'s effective letter; the CSV has a BOM, the same header and the same values', async () => {
+    await resetSample();
+    const picked = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const act = GT.calc.sortStudents(c, r, 'total', 'desc').filter((s) => s.status === 'active');
+      const other = (id) => (r.byId[id].letter === 'B' ? 'B-' : 'B');
+      const set = [[act[0].id, r.byId[act[0].id].letter], [act[1].id, other(act[1].id)], [act[act.length - 1].id, 'F']];
+      GT.store.transact('Final letters', (cc) => set.forEach(([id, l]) => GT.model.setFinalLetter(cc, id, l)));
+      return set;
+    });
+    await gotoView('exchange');
+    const x = await downloadFrom('#xc-dl-xlsx', 'final');
+    const { ws, header } = await readXlsx(x.file);
+    assert.deepEqual(header, PREVIOUS_LAYOUT);
+    const app = await appRows();
+    assert.equal(app.filter((s) => s.source === 'manual').length, picked.length);
+    const bad = [];
+    app.forEach((s, i) => {
+      const cell = ws.getRow(i + 2).getCell(15);
+      if (cell.formula) bad.push(s.last + ': Letter Grade is a formula');
+      if (cell.value !== s.effective) bad.push(s.last + ': ' + cell.value + ' != ' + s.effective);
+      const manual = /Final letter assigned by the instructor/.test(noteText(cell.note));
+      if (manual !== (s.source === 'manual')) bad.push(s.last + ': note');
+      if (!ws.getRow(i + 2).getCell(14).formula) bad.push(s.last + ': Total is not a formula');
+    });
+    assert.deepEqual(bad.slice(0, 5), []);
+
+    const c = await downloadFrom('#xc-dl-csv', 'final');
+    assert.match(c.name, /^SE4351-grades-\d{4}-\d{2}-\d{2}_\d{4}\.csv$/);
+    const bytes = fs.readFileSync(c.file);
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'UTF-8 BOM (Excel reads the file as UTF-8)');
+    const text = bytes.toString('utf8');
+    assert.equal(text.slice(1).split('\r\n')[0], PREVIOUS_LAYOUT.join(','));
+    const rows = csvCore.parse(text);
+    assert.equal(rows.length, SAMPLE_STUDENTS + 1);
+    app.forEach((s, i) => {
+      const row = rows[i + 1];
+      assert.deepEqual([row[1], row[2], Number(row[13]), row[14], row[18]],
+        [s.last, s.first, s.total, s.effective, s.status === 'withdrawn' ? 'Withdrawn' : 'Active']);
+    });
+    exportedCsv = { file: c.file, name: c.name, app };
+  });
+
+  await check('Import: the exported CSV into a new empty SE 4351 course gives every student the same total and letter; one Undo reverts it', async () => {
+    assert.ok(exportedCsv, 'needs the CSV of the previous check');
+    await page.evaluate(() => GT.store.addCourse(GT.model.createCourse('SE4351', { code: 'SE 4351 copy' })));
+    await page.waitForFunction(() => GT.store.course().code === 'SE 4351 copy' && GT.store.course().students.length === 0);
+    const h0 = await historyCount();
+    const r = await importThroughCard(exportedCsv.file, {
+      atMapping: (st) => {
+        assert.deepEqual(st.mapping, ['no', 'lastName', 'firstName', 'raw:a_p1', 'raw:a_p2', 'raw:a_t1', 'raw:a_t2', 'raw:a_part',
+          'weighted:a_p1', 'weighted:a_p2', 'weighted:a_t1', 'weighted:a_t2', 'weighted:a_part', 'ignore', 'finalLetter',
+          'excused', 'absent', 'absencesTotal', 'status']);
+        assert.equal(st.options.matchBy, 'name');
+      },
+      atPreview: (st) => assert.deepEqual([st.counts.new, st.counts.update, st.counts.skip], [SAMPLE_STUDENTS, 0, 0])
+    });
+    assert.equal(r.counts.new, SAMPLE_STUDENTS);
+    const got = await appRows();
+    const want = exportedCsv.app;
+    assert.equal(got.length, want.length);
+    const key = (s) => s.last + '\u0001' + s.first;
+    const byName = new Map(got.map((s) => [key(s), s]));
+    const bad = [];
+    want.forEach((w) => {
+      const g = byName.get(key(w));
+      if (!g) { bad.push('missing ' + w.last); return; }
+      if (g.total !== w.total) bad.push(w.last + ': total ' + g.total + ' != ' + w.total);
+      if (g.effective !== w.effective) bad.push(w.last + ': letter ' + g.effective + ' != ' + w.effective);
+      if (g.status !== w.status || g.no !== w.no) bad.push(w.last + ': status or No');
+    });
+    assert.deepEqual(bad.slice(0, 5), []);
+    // Absence counts are stored as attendance totals (the new course stays per-session unless the TA switches).
+    const totals = await page.evaluate(() => {
+      const c = GT.store.course();
+      return c.students.map((s) => { const t = c.attendance.totals[s.id] || {}; return [s.lastName + '\u0001' + s.firstName, (t.excused || 0) + ',' + (t.absent || 0)]; });
+    });
+    totals.forEach(([k, t]) => { const w = want.find((s) => key(s) === k); assert.equal(t, w.att[0] + ',' + w.att[1], k); });
+    const added = await historySince(h0);
+    assert.ok(added.length > 0 && added.every((e) => e.source === 'import'), 'every history entry of the import has source "import"');
+    assert.equal(await page.evaluate(() => GT.store.undoLabel()), 'Import ' + path.basename(exportedCsv.file));
+    await page.click('#btn-undo');
+    await page.waitForFunction(() => GT.store.course().students.length === 0);
+    await page.locator('.xc-done', { hasText: 'The import was undone' }).waitFor();
+  });
+
+  await check('Import: a CSV with the previous TA\'s headers (fake names) is matched automatically; scores, final letters and absences arrive', async () => {
+    await resetSample();
+    const rows = [OLD_SHEET_HEADERS,
+      [1, 'Oldsheet', 'Student 01', 94, 88, 80, 70, 9.4, 17.6, 20, 28, 5, 80, 'B', '', 2],
+      [2, 'Oldsheet', 'Student 02', 90, 85, 92.5, 81, 9, 17, 23.125, 32.4, 4.5, 86.025, 'b+', '', 0],
+      [3, 'Oldsheet', 'Student 03', 70, 75, 55, 60, 7, 15, 13.75, 24, 3, 62.75, 'D', '', 5]];
+    const file = path.join(TMP, 'previous-sheet.csv');
+    fs.writeFileSync(file, csvCore.stringify(rows, { bom: true, eol: '\r\n' }));
+    const other = await page.evaluate(() => GT.store.state.courses[1].id);
+    await page.selectOption('#course-select', other);
+    await page.waitForFunction((id) => GT.store.course().id === id, other);
+    assert.equal(await page.evaluate(() => GT.store.course().attendance.mode), 'off');
+    await importThroughCard(file, {
+      atMapping: async (st) => {
+        assert.deepEqual(st.mapping, ['no', 'lastName', 'firstName', 'raw:a_p1', 'raw:a_p2', 'raw:a_t1', 'raw:a_t2',
+          'weighted:a_p1', 'weighted:a_p2', 'weighted:a_t1', 'weighted:a_t2', 'weighted:a_part', 'ignore', 'finalLetter', 'ignore', 'absencesTotal']);
+        // Attendance is off in SE 6362: switching it to "Totals only" is offered and ticked.
+        assert.equal(st.options.switchAttendanceToTotals, true);
+        assert.equal(await page.isChecked('#xc-opt-att'), true);
+        assert.match(await page.locator('.xc-map-notes').innerText(), /final letter/);
+      },
+      atPreview: (st) => {
+        assert.equal(st.counts.new, 3);
+        assert.equal(st.counts.lettersSkipped, 1, '"D" is not a letter of the graduate scale');
+      }
+    });
+    const got = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      return {
+        mode: c.attendance.mode,
+        students: GT.calc.sortStudents(c, r, 'name', 'asc').map((s) => {
+          const sm = GT.attendance.summary(c, s.id);
+          return [s.no, s.lastName, s.firstName, ...['a_p1', 'a_p2', 'a_t1', 'a_t2', 'a_part'].map((a) => r.byId[s.id].items[a].raw),
+            r.byId[s.id].total, s.finalLetter, sm.excused, sm.unexcused];
+        })
+      };
+    });
+    assert.equal(got.mode, 'totals');
+    assert.deepEqual(got.students, [
+      [1, 'Oldsheet', 'Student 01', 94, 88, 80, 70, 5, 80, 'B', 0, 2],
+      [2, 'Oldsheet', 'Student 02', 90, 85, 92.5, 81, 4.5, 86.025, 'B+', 0, 0],
+      [3, 'Oldsheet', 'Student 03', 70, 75, 55, 60, 3, 62.75, null, 0, 5]
+    ]);
+  });
+
+  await check('Import into a finalized course: score changes are blocked (scores unchanged), final letters still arrive', async () => {
+    await resetSample();
+    const who = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const act = GT.calc.sortStudents(c, r, 'name', 'asc').filter((s) => s.status === 'active' && typeof r.byId[s.id].items.a_t1.raw === 'number');
+      GT.store.transact('Finalize scores', (cc) => GT.model.finalize(cc, new Date().toISOString(), ''));
+      return act.slice(0, 2).map((s) => ({ id: s.id, last: s.lastName, first: s.firstName, t1: r.byId[s.id].items.a_t1.raw }));
+    });
+    const file = path.join(TMP, 'finalized.csv');
+    fs.writeFileSync(file, csvCore.stringify([['Last Name', 'First Name', 'Test 1', 'Letter Grade'],
+      [who[0].last, who[0].first, who[0].t1 === 50 ? 51 : 50, 'A'], [who[1].last, who[1].first, 'abc', 'B-']], { eol: '\r\n' }));
+    const before = await gradeSnapshot();
+    const h0 = await historyCount();
+    await importThroughCard(file, {
+      atMapping: async () => {
+        await page.locator('.xc-final-note').waitFor();
+        assert.match(await page.locator('#xc-map tr[data-col="2"]').innerText(), /blocked/);
+      },
+      atPreview: async (st) => {
+        assert.equal(st.counts.blocked, 2);
+        assert.equal(st.counts.changes, 2, 'only the two final letters change');
+        assert.equal(await page.locator('.xc-changes tr.is-blocked').count(), 2);
+      }
+    });
+    const after = await page.evaluate((ids) => {
+      const c = GT.store.course(), r = GT.store.results();
+      return ids.map((id) => [r.byId[id].items.a_t1.raw, GT.model.findStudent(c, id).finalLetter]);
+    }, who.map((w) => w.id));
+    assert.deepEqual(after, [[who[0].t1, 'A'], [who[1].t1, 'B-']]);
+    // Totals, suggested letters and ranks are untouched.
+    assert.equal(await gradeSnapshot(), before);
+    const added = await historySince(h0);
+    assert.deepEqual(added.map((e) => [e.source, e.field]), [['import', 'Final letter'], ['import', 'Final letter']]);
   });
 
   await check('privacy mode blurs every student name (.pii) in the Grades, Students and Attendance views', async () => {

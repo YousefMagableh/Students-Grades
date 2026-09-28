@@ -5,7 +5,7 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 - **Private by design:** there is no server, no account, and no internet use. Grades stay in this browser on this computer.
 - **No install:** open `index.html` in Chrome, Edge, Firefox, or Safari.
 
-> This README is being completed stage by stage. The full guide covers formulas, placeholders, export and import, and attendance, and it arrives with the final stage.
+> This README is being completed stage by stage. The full guide to formulas, placeholders and statistics arrives with the final stage.
 
 ## Open the app
 
@@ -27,7 +27,7 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 
 The letter from the cutoffs is only a **suggestion** (the "Suggested" column). The instructor picks every
 student's **Final letter** by hand, usually in bands after sorting by total. Once final letters are
-assigned, they are the grades (the export and the statistics, added in later stages, use them).
+assigned, they are the grades (the export uses them, and so will the statistics, added in a later stage).
 
 1. Enter every score. **Class/Project Participation** is out of 5 (5 = full marks, worth 5% of the total)
    and is picked from a drop-down list: 5, 4.5, 4 … 0. Typing a value from the list also works; anything else
@@ -107,6 +107,59 @@ Where the absences show up:
   every absence by date, excused or unexcused.
 - **Attendance tab**: the summary columns at the right of the grid, and a **Warnings** list with a button that
   jumps to the student's row.
+
+## Export and import
+
+Open the **Import / Export** tab. Files are made and read on this computer only; nothing is uploaded.
+
+**Export** (for the instructor):
+
+1. Choose a **preset**. The default, *Previous sheet layout*, has the columns of the previous TA's sheet:
+   No, Last Name, First Name, the scores, the weighted scores ("Project I 10%" …), Total, Letter Grade, then
+   Excused (allowed), Unexcused (not allowed), Total absences, and Status (withdrawn students are included and
+   marked). *Names, total and letter* and *Everything* are also built in.
+2. Tick, untick or reorder columns (arrow buttons, Alt+↑/↓, or drag). Columns that do not apply, such as
+   absences while attendance is off, are greyed out with the reason. **Save as preset…** keeps your choice
+   for this course (Rename and Delete work on your own presets; Ctrl+Z undoes them).
+3. Choose the row order (by name or by No) and the extra sheets of the Excel file: *Settings* (weights,
+   letter cutoffs, what is still to be confirmed; on by default) and *Change history* (off).
+4. Read the **data check** (empty scores, participation not set yet, final letters missing, placeholders…).
+   It never blocks the download.
+5. **Download Excel (.xlsx)** or **Download CSV**. Files are named like `SE4351-grades-2026-12-10_1403.xlsx`.
+
+In the Excel file the weighted scores, the Total and the letter are **real formulas**, so the instructor can
+click a cell and see how it is calculated: weighted = score ÷ max × weight (with `MAX(0, score − penalty)` for
+late work), Total = the sum of the weighted cells plus the curve, wrapped in `ROUND(…,10)` so a total exactly
+on a cutoff gets the same letter as in the app (with the chosen rounding on top), and the letter a nested `IF`
+over the cutoffs. Once any final letter is assigned, *Letter Grade* holds each student's final letter (or the
+suggestion when a student has none) as a plain value; add *Suggested Letter (cutoffs)* for the formula. The
+header row is frozen, has a filter, and the column groups are tinted like the old sheet. The CSV file has the
+same columns, values only.
+
+> **Exported files contain confidential grades.** Keep them on this computer, out of shared or synced folders
+> (OneDrive, Google Drive, Dropbox, iCloud) and out of this project folder. Delete copies you no longer need.
+
+**Import** (from an .xlsx or .csv file, for example the previous TA's sheet):
+
+1. **Choose file.** Old `.xls` files cannot be read: open them in Excel and use *Save As → Excel Workbook
+   (.xlsx)*, then import that file.
+2. **Check the sheet**: the sheet and the header row are found automatically; a preview shows the first rows.
+3. **Match columns**: every column is matched automatically (the previous TA's headers map exactly: "Final
+   Project I" → Project I, "Project I 10%" → weighted Project I, converted back to a score, "No of Absence" →
+   unexcused absences…). Change anything that is wrong, or set it to *Do not import*. Options: find students by
+   name or by No, add missing students, keep or clear values for empty cells, replace scores already entered.
+   - *Letter Grade* is imported as each student's **final letter**. If those letters were only suggestions,
+     set the column to *Do not import*. (In an Excel file from Grade Tracker without final letters, the letter
+     column holds formulas and is left out automatically.) Letters not in the course's scale are skipped.
+   - When an absence column is matched and the course does not use *Totals only* attendance, the import
+     offers to switch to it (ticked when attendance is off). Enter the number of sessions held afterwards in
+     the Attendance tab to get the rates.
+   - While the scores are **finalized**, score columns are shown but not imported (unlock them in the Grades
+     tab first). Student details and final letters are still imported.
+4. **Preview**: counts (updated, new, skipped, changes, overrides, blocked…), the first 50 changes, values to
+   check and skipped rows with the reason. Nothing changes before you press **Import**.
+
+The import is **one step**: a single Undo (Ctrl+Z) reverts all of it, and every change is logged in History.
 
 ## Development
 

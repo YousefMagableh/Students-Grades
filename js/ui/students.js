@@ -106,6 +106,13 @@
     return 'grp-' + Math.min(i + 1, 6);
   }
 
+  /** Compact placeholder badges for an assessment's weight: project split (project items) and
+   * Term Paper weight. Empty string once confirmed. */
+  function weightBadges(course, a) {
+    return (a.category === 'project' ? ui.placeholderBadge(course, 'projectSplit', { compact: true }) : '') +
+      (a.id === 'a_paper' ? ui.placeholderBadge(course, 'termPaperWeight', { compact: true }) : '');
+  }
+
   function cssKey(k) {
     if (root.CSS && root.CSS.escape) return root.CSS.escape(k);
     return String(k).replace(/["\\\[\]]/g, '\\$&');
@@ -172,14 +179,31 @@
     return s.split('\n').map(function (line) { return line.split('\t'); });
   }
 
-  /** Toast "Undo" button: undoes this change only while it is still the latest undo step of its course. */
+  /** Identifies the current latest undo step of the active course (null if courseId is not active).
+   * Labels repeat ("Edit team score", "Withdraw student"), so the mark also holds the course's history
+   * length and last entry id: every later change, undo or redo appends history entries and changes it. */
+  function undoMark(courseId) {
+    var c = GT.store.course();
+    if (!c || c.id !== courseId) return null;
+    var hist = Array.isArray(c.history) ? c.history : [];
+    var last = hist.length ? hist[hist.length - 1] : null;
+    return JSON.stringify([
+      GT.store.undoLabel(),
+      typeof GT.store.undoStepId === 'function' ? GT.store.undoStepId() : null,
+      hist.length,
+      last && last.id ? last.id : null
+    ]);
+  }
+
+  /** Toast "Undo" button. Call it right after the transact: it undoes that change only while it is still
+   * the latest undo step of its course, never a newer change that has the same label. */
   function undoAction(courseId, label) {
+    var mark = undoMark(courseId);
     return {
       label: 'Undo',
       fn: function () {
-        var c = GT.store.course();
-        if (c && c.id === courseId && (!label || GT.store.undoLabel() === label)) GT.store.undo();
-        else ui.toast('Not undone: newer changes came after it. Use Undo (Ctrl+Z) step by step.', { type: 'warn' });
+        if (mark && undoMark(courseId) === mark && (!label || GT.store.undoLabel() === label)) GT.store.undo();
+        else ui.toast('Not undone: it was already undone, or newer changes came after it. Use Undo (Ctrl+Z) step by step.', { type: 'warn' });
       }
     };
   }
@@ -812,7 +836,7 @@
       '<td class="pii st-last">' + esc(s.lastName) + '</td>' +
       '<td class="pii st-first">' + esc(s.firstName) + '</td>' +
       '<td class="st-team">' + (t ? esc(t.name) : '<span class="faint">No team</span>') + '</td>' +
-      '<td class="st-status">' + (w ? '<span class="badge">Withdrawn</span>' : '<span class="badge badge-success">Active</span>') + '</td>' +
+      '<td class="st-status">' + (w ? '<span class="badge">Withdrawn</span>' : '<span class="muted">Active</span>') + '</td>' +
       '<td class="st-notes">' + (s.notes ? '<span class="pii st-notes-text">' + esc(truncate(s.notes, 90)) + '</span>' : '') + '</td>' +
       '<td class="st-actions">' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="details" data-id="' + id + '" data-fk="details:' + id + '" aria-label="Details for ' + ref + '" title="Details">' + icon('user') + '</button>' +
@@ -957,7 +981,7 @@
     var cols = 3 + tg.length;
     var head = '<tr><th scope="col">Team</th><th scope="col" class="num">Members</th>' + tg.map(function (a) {
       return '<th scope="col" class="ts-h ' + groupClass(course, a) + '">' + esc(a.name) + ' ' + ui.placeholderBadge(course, 'maxScores', { compact: true }) +
-        '<span class="ts-sub">max ' + esc(a.maxScore) + ' · ' + esc(a.weight) + '%</span></th>';
+        '<span class="ts-sub">max ' + esc(a.maxScore) + ' · ' + esc(a.weight) + '% ' + weightBadges(course, a) + '</span></th>';
     }).join('') + '<th scope="col">Overrides</th></tr>';
     var body = course.teams.map(function (t) {
       var members = model.sortedMembers(course, t.id);
@@ -1569,7 +1593,7 @@
       '<h3 class="sd-name pii">' + (name ? esc(name) : '(no name)') + '</h3>' +
       '<div class="sd-meta"><span class="badge">No ' + (typeof s.no === 'number' ? s.no : '–') + '</span>' +
       '<span class="badge badge-info">' + icon('users') + esc(t ? t.name : 'No team') + '</span>' +
-      (w ? '<span class="badge">Withdrawn</span>' : '<span class="badge badge-success">Active</span>') +
+      (w ? '<span class="badge">Withdrawn</span>' : '<span class="muted sd-status">Active</span>') +
       '<span class="badge">' + esc(model.courseLabel(course)) + '</span></div></div>' +
       '<div class="sd-actions no-print">' +
       '<button type="button" class="btn btn-sm" data-sd="edit" data-fk="sd-edit">' + icon('edit') + 'Edit</button>' +
@@ -1609,7 +1633,7 @@
       if (d.state === 'empty') flags.push('<span class="badge">Empty' + ((a.weight || 0) > 0 ? ' · counted as 0' : '') + '</span>');
       if (d.weeksLate > 0) flags.push('<span class="badge badge-info">' + d.weeksLate + ' wk late' + (d.waived ? ', waived' : (d.penalty ? ' · −' + esc(fmt(d.penalty)) : '')) + '</span>');
       return '<tr><th scope="row"><span class="sd-swatch ' + groupClass(course, a) + '" aria-hidden="true"></span>' + esc(a.name) + '</th>' +
-        '<td class="num">' + esc(a.maxScore) + '</td><td class="num">' + esc(a.weight) + '%</td>' +
+        '<td class="num">' + esc(a.maxScore) + '</td><td class="num sd-weight">' + weightBadges(course, a) + ' ' + esc(a.weight) + '%</td>' +
         '<td class="num sd-raw' + (d.state === 'invalid' ? ' is-invalid' : d.outOfRange ? ' is-range' : '') + '">' + (raw === '' ? '<span class="faint">–</span>' : esc(raw)) + '</td>' +
         '<td>' + source + '</td><td class="num">' + esc(fmt(d.weighted)) + '</td><td class="sd-flags">' + flags.join(' ') + '</td></tr>';
     }).join('');
@@ -1620,7 +1644,8 @@
       '<tbody>' + rowsHtml + '</tbody><tfoot>' +
       '<tr><th scope="row" colspan="5">Sum of weighted scores</th><td class="num">' + esc(fmt(r.weightedSum)) + '</td><td></td></tr>' +
       (r.curve ? '<tr><th scope="row" colspan="5">Curve ' + ui.placeholderBadge(course, 'curve', { compact: true }) + '</th><td class="num">' + esc(signed(r.curve)) + '</td><td></td></tr>' : '') +
-      '<tr class="sd-total-row"><th scope="row" colspan="5">Total' + (roundingNote ? ' <span class="muted small">(' + roundingNote + ')</span>' : '') + '</th>' +
+      '<tr class="sd-total-row"><th scope="row" colspan="5">Total' + (roundingNote ? ' <span class="muted small">(' + roundingNote + ')</span> ' +
+        ui.placeholderBadge(course, 'rounding', { compact: true }) : '') + '</th>' +
       '<td class="num"><strong>' + esc(fmt(r.total)) + '</strong></td><td>' + (r.letter ? '<span class="badge badge-accent">' + esc(r.letter) + '</span>' : '') + '</td></tr>' +
       '</tfoot></table></div></section>';
 

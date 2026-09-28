@@ -17,6 +17,7 @@
 .grid-sort select { min-height: 26px; padding: 3px 8px; font-size: 12.5px; }
 .grid-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .grid-toolbar [hidden] { display: none; }
+.grid-legend-btn { display: none; } /* phones only (see the end of this file) */
 
 .grid-legend {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px;
@@ -30,6 +31,11 @@
 }
 .lg-invalid { background: var(--cell-invalid-bg); border-color: color-mix(in srgb, var(--cell-invalid-text) 30%, transparent); }
 .lg-range { background: var(--cell-range-bg); border-color: var(--warn-border); }
+.lg-late { position: relative; }
+.lg-late::after {
+  content: ""; position: absolute; top: 0; right: 0;
+  border-style: solid; border-width: 0 6px 6px 0; border-color: transparent var(--warn) transparent transparent;
+}
 .lg-mk { display: inline-flex; align-items: center; }
 .lg-mk .icon { width: 13px; height: 13px; }
 
@@ -39,7 +45,9 @@
   position: relative;
   width: fit-content;
   max-width: 100%;
-  max-height: max(320px, calc(100vh - 250px));
+  /* --grid-top: the scroll box's page offset, set by grid.js, so the box (with its class-average
+   * footer and horizontal scrollbar) ends just above the bottom of the window. */
+  max-height: max(320px, calc(100vh - var(--grid-top, 310px) - 16px));
   min-height: 220px;
   overscroll-behavior: contain;
 }
@@ -109,6 +117,7 @@
   display: block; margin-top: 2px; font-size: 11px; font-weight: 500; color: var(--text-muted); line-height: 1.3;
 }
 .gt-grid thead .h-sub .hs { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gt-grid thead .h-sub .hs-w { white-space: normal; } /* "10% · team" wraps before "· team" in a narrow column */
 .gt-grid thead .badge { padding: 1px 3px; margin-left: 3px; vertical-align: -1px; }
 .gt-grid thead .badge svg { width: 10px; height: 10px; }
 .gt-grid thead th.hdr-active { box-shadow: inset 0 -2px 0 var(--focus); }
@@ -124,9 +133,9 @@
 /* sticky identity columns: No, Last Name, First Name, Team (offsets match W in grid.js) */
 .gt-grid .sc { position: sticky; z-index: 1; }
 .gt-grid .sc1, .gt-grid .sc-span { left: 0; }
-.gt-grid .sc2 { left: 56px; }
-.gt-grid .sc3 { left: 180px; }
-.gt-grid .sc4 { left: 328px; border-right: 1px solid var(--border-strong); }
+.gt-grid .sc2 { left: 52px; }
+.gt-grid .sc3 { left: 158px; }
+.gt-grid .sc4 { left: 294px; border-right: 1px solid var(--border-strong); }
 .gt-grid .sc-span { border-right: 1px solid var(--border-strong); }
 .gt-grid thead th.sc { z-index: 4; }
 .gt-grid tbody td.sc { background-color: var(--bg-elev); }
@@ -135,6 +144,9 @@
 .gt-grid .c-last, .gt-grid .c-first { font-weight: 550; }
 .gt-grid .c-team { color: var(--text-muted); }
 .wd-badge { font-size: 10px; padding: 2px 5px; margin-left: 2px; }
+.gt-grid .fn-wd { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.gt-grid .fn-wd .pii { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.gt-grid .fn-wd .wd-badge { flex: none; }
 
 /* raw score cells */
 .gt-grid td.is-empty, .gt-grid td.c-w.is-empty { color: var(--text-faint); }
@@ -289,7 +301,16 @@
 /* ------------------------------------------------------------------ narrow screens */
 
 @media (max-width: 720px) {
-  .grid-toolbar .search input { width: 170px; }
+  .grid-toolbar .search { flex: 1 1 150px; }
+  .grid-toolbar .search input { width: 100%; }
+  /* Icon-only toolbar buttons: the labels stay for screen readers (and in the title tooltips). */
+  .grid-toolbar .btn .bl {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .grid-toolbar .btn { gap: 2px; }
+  .grid-legend-btn { display: inline-flex; }
+  .grid-legend:not(.is-open) { display: none; }
   .grid-legend .lg-hint { display: none; }
   /* Only No and Last Name stay pinned, so the scores keep some room. */
   .gt-grid .sc3, .gt-grid .sc4 { position: static; }

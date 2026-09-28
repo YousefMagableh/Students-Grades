@@ -249,6 +249,37 @@ describe('util.parseScoreInput magnitude limit (review F6)', () => {
   });
 });
 
+describe('util.parseScoreInput percent of the max score (E2E-9)', () => {
+  test('"x%" is x percent of the given max score', () => {
+    assert.deepEqual(util.parseScoreInput('88%', 50), { kind: 'number', value: 44 });
+    assert.deepEqual(util.parseScoreInput(' 88 % ', 30), { kind: 'number', value: 26.4 }); // 88 * 30 / 100
+    assert.deepEqual(util.parseScoreInput('100%', 20), { kind: 'number', value: 20 });
+    assert.deepEqual(util.parseScoreInput('88%', 100), { kind: 'number', value: 88 });
+    assert.deepEqual(util.parseScoreInput('0%', 50), { kind: 'number', value: 0 });
+  });
+
+  test('without a % the max score changes nothing', () => {
+    assert.deepEqual(util.parseScoreInput('88', 50), { kind: 'number', value: 88 });
+    assert.deepEqual(util.parseScoreInput(88, 50), { kind: 'number', value: 88 });
+  });
+
+  test('without a usable max score the % is dropped (weights, curve, settings fields)', () => {
+    assert.deepEqual(util.parseScoreInput('25%'), { kind: 'number', value: 25 });
+    assert.deepEqual(util.parseScoreInput('25%', null), { kind: 'number', value: 25 });
+    assert.deepEqual(util.parseScoreInput('25%', 0), { kind: 'number', value: 25 });
+    assert.deepEqual(util.parseScoreInput('25%', -50), { kind: 'number', value: 25 });
+    assert.deepEqual(util.parseScoreInput('25%', NaN), { kind: 'number', value: 25 });
+  });
+
+  test('a converted value above the magnitude limit is invalid', () => {
+    assert.deepEqual(util.parseScoreInput('1e6%', 1000), { kind: 'invalid', text: '1e6%' });
+  });
+
+  test('invalid text stays invalid with a max score', () => {
+    assert.deepEqual(util.parseScoreInput('abc%', 50), { kind: 'invalid', text: 'abc%' });
+  });
+});
+
 describe('util.parseCount (whole, non-negative numbers; review F7)', () => {
   test('whole numbers parse', () => {
     assert.equal(util.parseCount('2'), 2);

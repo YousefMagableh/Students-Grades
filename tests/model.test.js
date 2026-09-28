@@ -846,6 +846,14 @@ describe('entryFromInput', () => {
   test('does not invent late info when the previous entry had none', () => {
     assert.deepEqual(model.entryFromInput('75', { value: 80 }), { value: 75 });
   });
+
+  test('with the item max score, "x%" is stored as x percent of it (E2E-9)', () => {
+    assert.deepEqual(model.entryFromInput('88%', null, 50), { value: 44 });
+    assert.deepEqual(model.entryFromInput('88%', null, 100), { value: 88 });
+    assert.deepEqual(model.entryFromInput('88', null, 50), { value: 88 });
+    assert.deepEqual(model.entryFromInput('80%', { value: 10, weeksLate: 1, override: true }, 30),
+      { value: 24, weeksLate: 1, override: true });
+  });
 });
 
 // ---------------------------------------------------------------- review round 1 regressions

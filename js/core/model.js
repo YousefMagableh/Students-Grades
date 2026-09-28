@@ -376,9 +376,10 @@
 
   /** Builds a ScoreEntry from user input (string or number). Keeps late info from `prev`, and its
    * override flag unless the input is empty: clearing an override cell hands the member back to
-   * the team score (K5). */
-  function entryFromInput(input, prev) {
-    var p = util.parseScoreInput(input);
+   * the team score (K5). Pass the assessment's `maxScore` so "88%" is read as 88 percent of it
+   * (44 on a 50-point item); without it the "%" is dropped (util.parseScoreInput). */
+  function entryFromInput(input, prev, maxScore) {
+    var p = util.parseScoreInput(input, maxScore);
     var e = {};
     if (p.kind === 'number') e.value = p.value;
     else if (p.kind === 'invalid') { e.value = null; e.text = p.text; }

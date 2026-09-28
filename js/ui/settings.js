@@ -65,6 +65,10 @@
   var pointerDown = false, deferred = false, pointerTimer = null;
   var globalsBound = false;
   var lastParams = null;
+  // courseId + '\n' + assessmentId -> { studentId: { teamId, key, prev } }: students who had no score when the
+  // item was made team-graded here and received their team's score (key = entryKey of that score,
+  // prev = their own entry before, null or late info only). Lets "Make individually graded" undo that fill.
+  var teamFill = Object.create(null);
 
   // ------------------------------------------------------------------ small helpers
 
@@ -151,11 +155,40 @@
     return { scored: scored, overrides: overrides, teamScores: teamScores };
   }
 
-  /** Letter ranges for a scale sorted high to low: "93–100", "90–92.99", …, "0–59.99". */
+  /** Decimal places of a number as num() shows it (0 to 6). */
+  function decimalsOf(x) {
+    var s = num(x);
+    var i = s.indexOf('.');
+    return i === -1 ? 0 : s.length - i - 1;
+  }
+
+  function fillKey(course, aid) { return course.id + '\n' + aid; }
+
+  /** Members of a team-graded item who still show only the team score they received when it was made
+   * team-graded here (same team, same score, no entry of their own since). Returns [{ studentId, prev }]. */
+  function teamFillCandidates(course, a) {
+    var rec = teamFill[fillKey(course, a.id)];
+    if (!rec || !a.teamGraded) return [];
+    var out = [];
+    course.students.forEach(function (s) {
+      var r = util.hasOwn(rec, s.id) ? rec[s.id] : null;
+      if (!r || s.teamId !== r.teamId || !model.findTeam(course, s.teamId)) return;
+      if (model.getEntry(course.scores, s.id, a.id)) return; // an override or entry of their own since
+      var e = model.effectiveEntry(course, s, a);
+      if (model.hasScore(e) && model.entryKey(e) === r.key) out.push({ studentId: s.id, prev: r.prev });
+    });
+    return out;
+  }
+
+  /** Letter ranges for a scale sorted high to low: "93–100", "90–92.99", …, "0–59.99".
+   * A range ends one step below the cutoff above, in the finest decimals of the two cutoffs
+   * (at least 0.01): with B+ at 89.995, B is "83–89.994" and B+ is "89.995–89.999". */
   function rangeTexts(scale) {
     return scale.map(function (r, i) {
       if (i === 0) return r.min >= 100 ? num(r.min) + ' and above' : num(r.min) + '–100';
-      var hi = util.fix(scale[i - 1].min - 0.01);
+      var above = scale[i - 1].min;
+      var d = Math.max(2, decimalsOf(r.min), decimalsOf(above));
+      var hi = util.roundTo(above - Math.pow(10, -d), d);
       return hi > r.min ? num(r.min) + '–' + num(hi) : num(r.min);
     });
   }
@@ -457,7 +490,7 @@
       '<div class="set-ph-note">' + esc(p.note) + '</div>' +
       '<div class="set-ph-current"><span class="muted">Current value:</span> ' + esc(phCurrent(course, p.key)) + '</div></div>' +
       '<div class="set-ph-actions">' + go +
-      '<button type="button" class="btn btn-sm btn-primary" data-act="ph-confirm" data-key="' + esc(p.key) + '" data-field="ph:' + esc(p.key) + ':confirm">' +
+      '<button type="button" class="btn btn-sm" data-act="ph-confirm" data-key="' + esc(p.key) + '" data-field="ph:' + esc(p.key) + ':confirm">' +
       icon('check') + 'Mark confirmed</button></div></li>';
   }
 
@@ -1092,33 +1125,97 @@
         '</ul>' +
         (course.teams.length ? '' : '<div class="callout callout-warn">This course has no teams yet, so every student keeps an individual score until you create teams.</div>') +
         '<p class="muted">' + plural(stats.scored, 'student') + ' currently have a score for ' + esc(a.name) + '. Every entered score is kept, and you can undo this (Ctrl+Z).</p>';
-    } else {
+    }
+    // Students who got their team's score only because the item was made team-graded here: offer to
+    // leave them without a score again, so switching back does not invent a grade.
+    var refill = toTeam ? [] : teamFillCandidates(course, a);
+    if (!toTeam) {
       body = '<p>Each student\'s current <strong>' + esc(a.name) + '</strong> score (their team score, or their override) becomes their own individual score. ' +
         'Team scores for ' + esc(a.name) + ' are removed.</p><ul class="set-dlg-list">' +
-        '<li>Totals and letters do not change.</li>' +
+        '<li>Totals and letters do not change' + (refill.length ? ' for students who keep a score' : '') + '.</li>' +
         (stats.overrides ? '<li>The ◆ marker goes away for ' + plural(stats.overrides, 'override') + '; those students keep their scores.</li>' : '') +
-        '<li>From now on, scores are entered per student.</li></ul><p class="muted">You can undo this (Ctrl+Z).</p>';
+        '<li>From now on, scores are entered per student.</li></ul>' +
+        (refill.length
+          ? '<div class="field set-dlg-choice"><label class="check"><input type="checkbox" data-role="refill-clear" checked>' +
+            '<span>Leave <strong>' + plural(refill.length, 'student') + '</strong> without a ' + esc(a.name) + ' score, as before</span></label>' +
+            '<div class="help">' + (refill.length === 1 ? 'This student' : 'These students') + ' had no ' + esc(a.name) + ' score when it was made team-graded ' +
+            'and only received their team\'s score then. Clear the check to give them that score as their own.</div></div>'
+          : '') +
+        '<p class="muted">You can undo this (Ctrl+Z).</p>';
     }
-    ui.dialog.confirm({
-      title: toTeam ? 'Make ' + a.name + ' team-graded?' : 'Make ' + a.name + ' individually graded?',
-      messageHtml: body,
-      confirmText: toTeam ? 'Make team-graded' : 'Make individually graded'
-    }).then(function (ok) {
-      if (!ok) { refocusIfLost('a:' + aid + ':team'); return; }
+    var title = toTeam ? 'Make ' + a.name + ' team-graded?' : 'Make ' + a.name + ' individually graded?';
+    var confirmText = toTeam ? 'Make team-graded' : 'Make individually graded';
+    var ask = refill.length
+      ? ui.dialog.open({
+        title: title,
+        bodyHtml: body,
+        buttons: [
+          { text: 'Cancel', value: null },
+          {
+            text: confirmText, primary: true,
+            value: function (dlg) { var box = dlg.querySelector('[data-role="refill-clear"]'); return { clear: !!(box && box.checked) }; }
+          }
+        ],
+        initialFocus: '.dlg-foot .btn-primary'
+      })
+      : ui.dialog.confirm({ title: title, messageHtml: body, confirmText: confirmText }).then(function (ok) { return ok ? { clear: false } : null; });
+    ask.then(function (choice) {
+      if (!choice) { refocusIfLost('a:' + aid + ':team'); return; }
       pendingFocus = 'a:' + aid + ':team';
       var out = null;
+      var noScore = toTeam ? scorelessEntries(GT.store.course(), aid) : null;
       try {
         GT.store.transact(toTeam ? 'Make ' + a.name + ' team-graded' : 'Make ' + a.name + ' individually graded', function (c) {
-          out = toTeam ? model.convertAssessmentToTeam(c, aid) : model.convertAssessmentToIndividual(c, aid);
+          if (toTeam) { out = model.convertAssessmentToTeam(c, aid); return; }
+          model.convertAssessmentToIndividual(c, aid);
+          if (choice.clear) {
+            refill.forEach(function (r) { model.setEntry(c.scores, r.studentId, aid, r.prev ? util.clone(r.prev) : null); });
+          }
         });
       } catch (err) { toastError(err); return; }
       if (toTeam) {
+        rememberTeamFill(GT.store.course(), aid, noScore);
         var nOv = out && out.overridesCreated ? out.overridesCreated : 0;
         ui.toast(a.name + ' is now team-graded.' + (nOv ? ' ' + plural(nOv, 'differing score was', 'differing scores were') + ' kept as per-member overrides (◆).' : ''), { type: 'success' });
+      } else if (choice.clear) {
+        ui.toast(a.name + ' is now graded individually. ' + plural(refill.length, 'student is', 'students are') +
+          ' without a score again, as before; everyone else kept their score.', { type: 'success', timeout: 6000 });
       } else {
         ui.toast(a.name + ' is now graded individually. Every student kept their score.', { type: 'success' });
       }
     });
+  }
+
+  /** Students without a score for an (individually graded) assessment: studentId -> their own entry (null, or late info only). */
+  function scorelessEntries(course, aid) {
+    var out = Object.create(null);
+    var a = course && model.findAssessment(course, aid);
+    if (!a) return out;
+    course.students.forEach(function (s) {
+      if (model.hasScore(model.effectiveEntry(course, s, a))) return;
+      var own = model.getEntry(course.scores, s.id, aid);
+      out[s.id] = own ? util.clone(own) : null;
+    });
+    return out;
+  }
+
+  /** After making an item team-graded: remembers which of the students in `noScore` now show their team's score. */
+  function rememberTeamFill(course, aid, noScore) {
+    var a = course && model.findAssessment(course, aid);
+    if (!a) return;
+    var rec = Object.create(null), n = 0;
+    if (a.teamGraded) {
+      course.students.forEach(function (s) {
+        if (!util.hasOwn(noScore, s.id) || !s.teamId || !model.findTeam(course, s.teamId)) return;
+        if (model.getEntry(course.scores, s.id, aid)) return;
+        var e = model.effectiveEntry(course, s, a);
+        if (!model.hasScore(e)) return;
+        rec[s.id] = { teamId: s.teamId, key: model.entryKey(e), prev: noScore[s.id] };
+        n++;
+      });
+    }
+    if (n) teamFill[fillKey(course, aid)] = rec;
+    else delete teamFill[fillKey(course, aid)];
   }
 
   function addAssessment() {
@@ -1442,19 +1539,26 @@
     var course = GT.store.course();
     if (!course) return;
     var def = model.defaultLetterScale(course.level);
+    var pass = model.defaultPassingLetter(course.level);
+    var passNow = course.settings.passingLetter;
     ui.dialog.confirm({
       title: 'Reset the letter scale?',
       messageHtml: '<p>Replace the current cutoffs with the default ' + esc(course.level) + ' scale:</p>' +
         '<p class="set-dlg-scale">' + esc(def.map(function (r) { return r.letter + ' ' + num(r.min); }).join(' · ')) + '</p>' +
+        '<p>The passing letter ' + (passNow === pass ? 'stays at the default, <strong>' + esc(pass) + '</strong>.'
+          : 'goes back to the default, <strong>' + esc(pass) + '</strong> (now ' + esc(passNow) + ').') + '</p>' +
         '<p class="muted">These defaults are placeholders too. You can undo this (Ctrl+Z).</p>',
       confirmText: 'Reset letter scale'
     }).then(function (ok) {
       if (!ok) return;
       GT.store.transact('Reset letter scale to the ' + course.level + ' default', function (c) {
         c.settings.letterScale = model.defaultLetterScale(c.level);
+        c.settings.passingLetter = model.defaultPassingLetter(c.level);
         normalizeScale(c);
       });
-      ui.toast('Letter scale reset to the ' + course.level + ' default.', { type: 'success' });
+      var passAfter = GT.store.course().settings.passingLetter;
+      ui.toast('Letter scale reset to the ' + course.level + ' default.' +
+        (passAfter !== passNow ? ' The passing letter is now ' + passAfter + '.' : ''), { type: 'success' });
     });
   }
 

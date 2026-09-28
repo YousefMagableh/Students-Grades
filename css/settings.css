@@ -197,6 +197,10 @@
 .set-dlg-list { margin: 0 0 10px; padding-left: 20px; }
 .set-dlg-list li + li { margin-top: 4px; }
 .set-dlg-scale { font-weight: 600; font-variant-numeric: tabular-nums; }
+.set-dlg-choice { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+.set-dlg-choice .check { align-items: flex-start; }
+.set-dlg-choice .check input { margin-top: 2px; }
+.set-dlg-choice .help { margin: 4px 0 0 20px; }
 
 .set-split-grid {
   display: grid; grid-template-columns: 124px minmax(0, 1fr) 110px 34px; gap: 8px 10px; align-items: center;

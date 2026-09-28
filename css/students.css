@@ -174,7 +174,8 @@
 .sd { display: flex; flex-direction: column; gap: 14px; padding-top: 4px; }
 .sd-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .sd-name { margin: 0 0 6px; font-size: 20px; }
-.sd-meta { display: flex; gap: 6px; flex-wrap: wrap; }
+.sd-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.sd-meta .sd-status { font-size: 12px; padding: 0 2px; }
 .sd-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .sd-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
 .sd-tile { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: var(--bg); min-width: 0; }
@@ -195,6 +196,7 @@
 .sd-raw.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); }
 .sd-raw.is-range { background: var(--cell-range-bg); }
 .sd-flags .badge { margin: 1px 0; }
+.sd-weight { white-space: nowrap; }
 .sd-notes { width: 100%; }
 .sd-att { margin-bottom: 8px; }
 .sd-att + .callout, .sd-section .callout + .callout { margin-top: 6px; }

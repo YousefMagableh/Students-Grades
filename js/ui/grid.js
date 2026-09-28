@@ -34,7 +34,9 @@
     { value: 'total:asc', label: 'Total low–high' }
   ];
   // Identity column widths (px). The sticky offsets in css/grid.css (.sc1 … .sc4) match these.
-  var W = { no: 56, last: 124, first: 148, team: 84, total: 78, letter: 68, rank: 58, pct: 82, diff: 66, att: 118 };
+  var W = { no: 52, last: 106, first: 136, team: 70, total: 74, letter: 60, rank: 54, pct: 90, diff: 62, att: 118 };
+  var HEAD_PAD = 17;   // header cell padding (2 × 8 px) plus slack
+  var BADGE_W = 21;    // compact placeholder badge in a header (with its margin)
 
   // Team-score marker: one masked span (css/grid.css) instead of an inline SVG per cell, to keep the
   // 59-row table cheap to lay out.
@@ -56,6 +58,7 @@
   var editing = null;        // { sid, key, kind, aid, mode, input, td, original, max }
   var drag = null;
   var tabStartKey = null;    // Excel: Tab, Tab, Enter returns to the column where tabbing started
+  var tabExit = false;       // Esc was pressed: the next Tab / Shift+Tab leaves the grid
   var newRowSid = null;      // freshly added student: Enter on a name moves right
   var pendingEdit = null;    // { sid, key } to edit after the next render
   var revealActive = false;  // scroll the active cell into view after the next render
@@ -161,6 +164,35 @@
 
   // ------------------------------------------------------------------ columns and rows
 
+  /** The placeholder key behind an assessment's weight, or null. */
+  function weightPlaceholderKey(a) {
+    if (a.id === 'a_paper') return 'termPaperWeight';
+    return a.category === 'project' ? 'projectSplit' : null;
+  }
+
+  // Header text widths, measured with the page font (canvas), so a header word is never split
+  // mid-word and the "max 100 · 10%" lines are not cut off. Falls back to an estimate.
+  var measure = { ctx: null, family: '', cache: Object.create(null) };
+  function textWidth(text, weight, size) {
+    var s = String(text);
+    var key = weight + '/' + size + '/' + s;
+    if (measure.cache[key] !== undefined) return measure.cache[key];
+    if (measure.ctx === null) {
+      measure.ctx = false;
+      try {
+        var cv = document.createElement('canvas');
+        measure.ctx = (cv.getContext && cv.getContext('2d')) || false;
+        measure.family = root.getComputedStyle(document.body).fontFamily || 'sans-serif';
+      } catch (e) { measure.ctx = false; }
+    }
+    var w = s.length * size * 0.64;
+    if (measure.ctx) {
+      measure.ctx.font = weight + ' ' + size + 'px ' + measure.family;
+      w = measure.ctx.measureText(s).width;
+    }
+    return (measure.cache[key] = Math.ceil(w));
+  }
+
   function buildColumns(course, prefs) {
     var cols = [
       { key: 'no', kind: 'no', label: 'No', edit: 'text', sticky: 1, width: W.no, num: true },
@@ -168,15 +200,25 @@
       { key: 'first', kind: 'first', label: 'First Name', edit: 'text', sticky: 3, width: W.first },
       { key: 'team', kind: 'team', label: 'Team', edit: 'team', sticky: 4, width: W.team }
     ];
-    // Header names wrap at spaces, so a column needs room for its longest word only.
-    var longestWord = function (text) {
-      return String(text).split(/\s+/).reduce(function (m, w) { return Math.max(m, w.length); }, 0);
+    // Header names (bold 12px) wrap at spaces, so a column needs room for its longest word; the
+    // small lines under the name (11px) do not wrap.
+    var nameW = function (text) { return textWidth(text, 700, 12); };
+    var subW = function (text) { return textWidth(text, 500, 11); };
+    var longestWordW = function (text) {
+      return String(text).split(/\s+/).reduce(function (m, w) { return Math.max(m, nameW(w)); }, 0);
     };
-    var rawWidth = function (a) { return clamp(Math.round(longestWord(a.name) * 7.4) + 20, 88, 140); };
-    // Weighted headers read "Project I 10%": room for a short name on one line, the weight may wrap.
+    var badgeW = function (key) { return key && !model.isConfirmed(course, key) ? BADGE_W : 0; };
+    var rawWidth = function (a) {
+      var maxLine = subW('max ' + num(a.maxScore, 4)) + badgeW('maxScores');
+      // "10% · team" may wrap before "· team" (css/grid.css .hs-w).
+      var weightLine = Math.max(subW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a)), a.teamGraded ? subW('· team') : 0);
+      return clamp(Math.max(longestWordW(a.name), maxLine, weightLine) + HEAD_PAD, 64, 150);
+    };
+    // Weighted headers read "Project I 10%": a short name stays on one line, the weight may wrap.
     var weightedWidth = function (a) {
-      var n = String(a.name).length <= 12 ? String(a.name).length : longestWord(a.name);
-      return clamp(Math.round(n * 7) + 20, 66, 124);
+      var name = String(a.name).length <= 12 ? nameW(a.name) : longestWordW(a.name);
+      var weight = nameW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a));
+      return clamp(Math.max(name, weight, subW('weighted')) + HEAD_PAD, 56, 150);
     };
     course.assessments.forEach(function (a, i) {
       cols.push({ key: 'raw:' + a.id, kind: 'raw', aid: a.id, a: a, label: a.name, edit: 'score',
@@ -274,6 +316,17 @@
     return !!rc && (rc.r1 !== rc.r2 || rc.c1 !== rc.c2);
   }
 
+  /** The cells a range covers (student ids and column keys), or null without a range. The range is
+   * stored as two corner cells, so it only means the same cells while the rows between the corners
+   * stay the same. */
+  function rangeSignature() {
+    if (!layout || !hasRange()) return null;
+    var rc = rectOf();
+    var ids = layout.students.slice(rc.r1, rc.r2 + 1).map(function (s) { return s.id; }).sort();
+    var keys = layout.cols.slice(rc.c1, rc.c2 + 1).map(function (c) { return c.key; });
+    return ids.join('\n') + '|' + keys.join('\n');
+  }
+
   function inRect(r, c) {
     var rc = rectOf();
     return !!rc && r >= rc.r1 && r <= rc.r2 && c >= rc.c1 && c <= rc.c2;
@@ -365,13 +418,36 @@
     if (!ae || ae === document.body || (dom && dom.table && dom.table.contains(ae))) focusActive();
   }
 
+  /** Publishes the grid's page offset as --grid-top, so css/grid.css can size the scroll box to end
+   * above the bottom of the window (the class-average footer and the horizontal scrollbar stay in
+   * view) whatever the banners, toolbar and legend above it take. Runs once per frame at most. */
+  var wrapTopQueued = false;
+  function syncWrapTop() {
+    if (!dom || !dom.wrap || !dom.wrap.isConnected) return;
+    var top = Math.round(dom.wrap.getBoundingClientRect().top + (root.pageYOffset || 0));
+    if (top !== dom.gridTop) {
+      dom.gridTop = top;
+      dom.wrap.style.setProperty('--grid-top', top + 'px');
+    }
+  }
+  function queueWrapTop() {
+    if (wrapTopQueued) return;
+    wrapTopQueued = true;
+    (root.requestAnimationFrame || setTimeout)(function () {
+      wrapTopQueued = false;
+      syncWrapTop();
+    });
+  }
+
+  /** Right edge of the identity columns pinned on the left. On phones (css/grid.css) the First Name
+   * and Team headers are sticky only vertically (left: auto), so they do not count. */
   function stickyRight() {
     var row = dom.table.tHead && dom.table.tHead.rows[0];
     if (!row) return 0;
     var right = 0;
     for (var i = 0; i < 4 && i < row.cells.length; i++) {
-      var th = row.cells[i];
-      if (root.getComputedStyle(th).position === 'sticky') right = th.getBoundingClientRect().right;
+      var th = row.cells[i], cs = root.getComputedStyle(th);
+      if (cs.position === 'sticky' && cs.left !== 'auto') right = th.getBoundingClientRect().right;
     }
     return right;
   }
@@ -433,6 +509,13 @@
 
   // ------------------------------------------------------------------ HTML builders
 
+  /** Placeholder badge for an assessment's weight: the Term Paper weight and the project split are
+   * unconfirmed defaults (placeholderBadge returns '' once the key is marked confirmed). */
+  function weightBadge(course, a) {
+    var key = weightPlaceholderKey(a);
+    return key ? ui.placeholderBadge(course, key, { compact: true }) : '';
+  }
+
   function headHtml(ctx) {
     var course = ctx.course, prefs = layout.prefs, dec = ctx.dec;
     var h = '<colgroup>';
@@ -468,13 +551,15 @@
         case 'team': inner = 'Team'; break;
         case 'raw':
           inner = '<span class="h-name">' + esc(a.name) + '</span><span class="h-sub"><span class="hs">max ' + num(a.maxScore, 4) +
-            ui.placeholderBadge(course, 'maxScores', { compact: true }) + '</span><span class="hs"><span class="sr-only"> · </span>' +
-            num(a.weight, 4) + '%' + (a.teamGraded ? ' · team' : '') + '</span></span>';
+            ui.placeholderBadge(course, 'maxScores', { compact: true }) + '</span><span class="hs hs-w"><span class="sr-only"> · </span>' +
+            '<span class="nowrap">' + num(a.weight, 4) + '%' + weightBadge(course, a) + '</span>' +
+            (a.teamGraded ? ' <span class="nowrap">· team</span>' : '') + '</span></span>';
           title = a.name + ': max ' + num(a.maxScore, 4) + ', weight ' + num(a.weight, 4) + '%' +
             (a.teamGraded ? ', team-graded (one score per team, ◆ = per-member override)' : '');
           break;
         case 'weighted':
-          inner = '<span class="h-name">' + esc(a.name) + ' <span class="nowrap">' + num(a.weight, 4) + '%</span></span><span class="h-sub">weighted</span>';
+          inner = '<span class="h-name">' + esc(a.name) + ' <span class="nowrap">' + num(a.weight, 4) + '%' + weightBadge(course, a) +
+            '</span></span><span class="h-sub">weighted</span>';
           title = 'Weighted points = raw ÷ ' + num(a.maxScore, 4) + ' × ' + num(a.weight, 4) + ' (calculated)';
           break;
         case 'letter': inner = 'Letter' + ui.placeholderBadge(course, 'letterScale', { compact: true }); title = 'Letter grade from the total'; break;
@@ -512,8 +597,9 @@
           break;
         case 'first':
           cls = 'c-first sc sc3';
-          body = (s.firstName ? '<span class="pii">' + esc(s.firstName) + '</span>' : '') +
-            (wd ? ' <span class="badge wd-badge">Withdrawn</span>' : '');
+          body = s.firstName ? '<span class="pii">' + esc(s.firstName) + '</span>' : '';
+          // Withdrawn: the name shrinks (ellipsis) so the badge always stays visible.
+          if (wd) body = '<span class="fn-wd">' + body + '<span class="badge wd-badge">Withdrawn</span></span>';
           break;
         case 'team':
           cls = 'c-team sc sc4';
@@ -696,26 +782,30 @@
       '<input type="search" class="grid-search" placeholder="Search name, No or team" title="Search (press / to jump here)" autocomplete="off" spellcheck="false"></label>' +
       '<label class="grid-sort"><span class="grid-sort-label">Sort</span><select class="grid-sort-select" aria-label="Sort rows">' +
       SORTS.map(function (o) { return '<option value="' + o.value + '">' + esc(o.label) + '</option>'; }).join('') + '</select></label>' +
-      '<button type="button" class="btn btn-sm" data-act="group" aria-pressed="false">' + ui.icon('layers') + '<span>Group by team</span></button>' +
-      '<button type="button" class="btn btn-sm" data-act="withdrawn" aria-pressed="true">' + ui.icon('user') + '<span>Show withdrawn</span></button>' +
-      '<button type="button" class="btn btn-sm" data-act="columns" aria-haspopup="menu" aria-expanded="false">' + ui.icon('grid') +
-      '<span>Columns</span>' + ui.icon('chevron-down') + '</button>' +
+      // On phones the button labels (.bl) are visually hidden and the legend folds behind "Legend".
+      '<button type="button" class="btn btn-sm" data-act="group" aria-pressed="false" title="Group rows by team">' + ui.icon('layers') + '<span class="bl">Group by team</span></button>' +
+      '<button type="button" class="btn btn-sm" data-act="withdrawn" aria-pressed="true">' + ui.icon('user') + '<span class="bl">Show withdrawn</span></button>' +
+      '<button type="button" class="btn btn-sm" data-act="columns" aria-haspopup="menu" aria-expanded="false" title="Show or hide columns">' + ui.icon('grid') +
+      '<span class="bl">Columns</span>' + ui.icon('chevron-down') + '</button>' +
+      '<button type="button" class="btn btn-sm grid-legend-btn" data-act="legend" aria-expanded="false" aria-controls="grid-legend" title="Show the legend">' +
+      ui.icon('info') + '<span class="bl">Legend</span></button>' +
       '<span class="spacer"></span>' +
       '<span class="grid-count muted small" aria-live="polite"></span>' +
-      '<button type="button" class="btn btn-sm" data-act="paste-roster">' + ui.icon('copy') + '<span>Paste roster</span></button>' +
-      '<button type="button" class="btn btn-sm btn-primary" data-act="add-student">' + ui.icon('plus') + '<span>Add student</span></button>' +
+      '<button type="button" class="btn btn-sm" data-act="paste-roster" title="Paste a roster copied from Excel">' + ui.icon('copy') + '<span class="bl">Paste roster</span></button>' +
+      '<button type="button" class="btn btn-sm btn-primary" data-act="add-student" title="Add a student">' + ui.icon('plus') + '<span class="bl">Add student</span></button>' +
       '</div>';
   }
 
   function legendHtml() {
-    return '<div class="grid-legend" aria-label="Legend">' +
+    return '<div class="grid-legend" id="grid-legend" aria-label="Legend">' +
       '<span><span class="lg-sw lg-empty">–</span>empty: counted as 0</span>' +
       '<span><span class="lg-sw lg-invalid"></span>red: not a number</span>' +
       '<span><span class="lg-sw lg-range"></span>yellow: outside 0 to max</span>' +
       '<span><span class="lg-mk mk-ovr">◆</span>per-member override</span>' +
       '<span><span class="lg-mk mk-team"></span>team score</span>' +
       '<span><span class="lg-mk inc">' + ICON_INCOMPLETE + '</span>incomplete total</span>' +
-      '<span class="lg-hint">Type to replace · Enter or F2 to edit · Ctrl+C / Ctrl+V with Excel · right-click or Shift+F10 for cell actions</span>' +
+      '<span><span class="lg-sw lg-late"></span>late work (penalty in the tooltip)</span>' +
+      '<span class="lg-hint">Type to replace · Enter or F2 to edit · Ctrl+C / Ctrl+V with Excel · right-click or Shift+F10 for cell actions · Esc, then Tab leaves the grid</span>' +
       '</div>';
   }
 
@@ -827,8 +917,13 @@
     var ae = document.activeElement;
     var hadFocus = (ae && dom.table.contains(ae)) || (nowMs() < focusUntil && (!ae || ae === document.body));
     focusUntil = 0;
+    var prevRange = rangeSignature();
     layout = buildLayout(course, results, getPrefs());
     normalizeSelection();
+    // A re-sort, filter or grouping change (or new totals under a total sort) can move other rows
+    // between the two corners: collapse the range to the active cell rather than let Delete, Copy or
+    // a paste reach cells the user never selected.
+    if (prevRange && rangeSignature() !== prevRange) sel.end = sel.active;
     var ctx = {
       course: course, results: results, cols: layout.cols, dec: decimalsOf(course), teamById: layout.teamById,
       nActive: results.activeIds.length, openStudent: typeof GT.ui.openStudent === 'function'
@@ -934,6 +1029,7 @@
     renderHead(course, ctx.results);
     if (mode === 'empty') { renderEmpty(course); return; }
     renderToolbar();
+    queueWrapTop();
     if (editing) { tableDirty = true; return; }
     if (!rebuilt && !dataDirty && !switchedCourse && !ctx.switched && layout) return;
     renderTable();
@@ -941,8 +1037,14 @@
 
   function destroy() {
     closeColumnsMenu(false);
+    // Leaving the view (e.g. Alt+2) removes the container before the editor's focusout can commit:
+    // save the typed value now, like a click elsewhere does.
+    if (editing) {
+      try { commitEdit(null, { soft: true }); } catch (e) { if (root.console) console.error(e); }
+    }
     editing = null;
     drag = null;
+    tabExit = false;
   }
 
   // ------------------------------------------------------------------ editing
@@ -1327,21 +1429,85 @@
   function clearCells() {
     var rc = rectOf();
     if (!rc) return;
-    var targets = [], skipped = 0;
+    var course = cur();
+    // No is cleared only when the selection stays inside the No column (a wider Delete is about scores).
+    var noOnly = rc.c1 === rc.c2 && layout.cols[rc.c1].kind === 'no';
+    var targets = [], skipped = 0, skippedNo = 0;
+    var teamClears = Object.create(null), teamClearList = [];
     for (var r = rc.r1; r <= rc.r2; r++) {
       for (var c = rc.c1; c <= rc.c2; c++) {
         var col = layout.cols[c], sid = layout.students[r].id;
-        if (col.kind === 'raw') targets.push({ sid: sid, aid: col.aid });
-        else if (col.kind === 'no') targets.push({ sid: sid, no: true });
-        else if (col.kind === 'last' || col.kind === 'first' || col.kind === 'team') skipped++;
+        if (col.kind === 'raw') {
+          var t = { sid: sid, aid: col.aid };
+          // A team-graded cell without an override clears the TEAM score (K5), for every member.
+          var s = model.findStudent(course, sid), a = col.a;
+          var team = a.teamGraded && s && s.teamId ? model.findTeam(course, s.teamId) : null;
+          var own = team ? model.getEntry(course.scores, sid, a.id) : null;
+          if (team && !(own && own.override === true)) {
+            t.teamClear = true;
+            var k = team.id + '\n' + a.id;
+            if (!teamClears[k]) {
+              teamClears[k] = { team: team, a: a, selected: Object.create(null), had: model.hasScore(model.getEntry(course.teamScores, team.id, a.id)) };
+              teamClearList.push(teamClears[k]);
+            }
+            teamClears[k].selected[sid] = true;
+          }
+          targets.push(t);
+        } else if (col.kind === 'no') {
+          if (noOnly) targets.push({ sid: sid, no: true }); else skippedNo++;
+        } else if (col.kind === 'last' || col.kind === 'first' || col.kind === 'team') skipped++;
       }
     }
     if (!targets.length) {
-      if (skipped) ui.toast('Names and teams are not cleared with Delete. Press F2 (or double-click) to edit the cell.', { type: 'info' });
+      if (skipped || skippedNo) ui.toast('Names and teams are not cleared with Delete. Press F2 (or double-click) to edit the cell.', { type: 'info' });
       else notifyReadOnly();
       return;
     }
-    var teams = Object.create(null);
+    var left = [];
+    if (skippedNo) left.push('No');
+    if (skipped) left.push('names', 'teams');
+    // A multi-cell Delete that would also empty the team score of members outside the selection asks first.
+    var outside = Object.create(null), outsideTeams = [], outsideAsmts = [];
+    if (targets.length > 1) {
+      teamClearList.forEach(function (tc) {
+        if (!tc.had) return;
+        var n = 0;
+        model.teamMembers(course, tc.team.id).forEach(function (m) {
+          if (tc.selected[m.id]) return;
+          var ownM = model.getEntry(course.scores, m.id, tc.a.id);
+          if (ownM && ownM.override === true) return; // keeps its own score
+          outside[m.id] = true;
+          n++;
+        });
+        if (!n) return;
+        if (outsideTeams.indexOf(tc.team.name) === -1) outsideTeams.push(tc.team.name);
+        if (outsideAsmts.indexOf(tc.a.name) === -1) outsideAsmts.push(tc.a.name);
+      });
+    }
+    var nOutside = Object.keys(outside).length;
+    if (!nOutside) { doClear(targets, left); return; }
+    var others = targets.filter(function (t) { return !t.teamClear; });
+    ui.dialog.open({
+      title: 'Clear team scores?',
+      bodyHtml: '<p>The selection includes team-graded cells. Deleting them clears the <strong>team score</strong> (' + esc(outsideAsmts.join(', ')) +
+        ') of ' + esc(outsideTeams.join(', ')) + ', which also empties it for <strong>' + esc(plural(nOutside, 'team member')) +
+        '</strong> outside the selection.</p><p class="muted small">Undo with Ctrl+Z. Every change is logged in History.</p>',
+      buttons: [
+        { text: 'Cancel', value: null },
+        { spacer: true }
+      ].concat(others.length ? [{ text: 'Clear the other cells only', value: 'others' }] : []).concat([
+        { text: 'Clear team scores too', value: 'all', primary: true }
+      ])
+    }).then(function (v) {
+      refocusGrid();
+      if (!v) return;
+      if (v === 'others') left.push('team scores');
+      doClear(v === 'others' ? others : targets, left);
+    });
+  }
+
+  function doClear(targets, left) {
+    var teams = Object.create(null), removed = [];
     focusUntil = nowMs() + 1500;
     transact(targets.length === 1 ? 'Clear cell' : 'Clear ' + targets.length + ' cells', function (c) {
       targets.forEach(function (t) {
@@ -1353,12 +1519,25 @@
         var had = model.getEntry(c.teamScores, (model.findStudent(c, t.sid) || {}).teamId, t.aid);
         var info = writeScore(c, t.sid, t.aid, '');
         if (info && info.kind === 'team' && model.hasScore(had)) teams[info.team.name] = info.members;
+        if (info && info.kind === 'override-removed') removed.push({ sid: t.sid, aid: t.aid, tid: info.team.id, team: info.team.name });
       });
     });
     var msgs = [];
     var tn = Object.keys(teams);
     if (tn.length) msgs.push('Team score cleared for ' + tn.map(function (n) { return n + ' (' + plural(teams[n], 'member') + ')'; }).join(', ') + '.');
-    if (skipped) msgs.push('Names and teams were left as they are.');
+    // Delete on a ◆ cell removes the override: the student then gets the team score, not an empty cell.
+    if (removed.length === 1) {
+      var rm = removed[0], after = cur();
+      var tv = entryText(model.getEntry(after.teamScores, rm.tid, rm.aid));
+      msgs.push('Override removed for ' + studentLabel(model.findStudent(after, rm.sid)) + ': now uses the ' + rm.team + ' score (' +
+        (tv || 'empty') + ').');
+    } else if (removed.length > 1) {
+      msgs.push(removed.length + ' overrides (◆) removed: those students now use their team\'s score.');
+    }
+    if (left && left.length) {
+      var list = left.length > 1 ? left.slice(0, -1).join(', ') + ' and ' + left[left.length - 1] : left[0];
+      msgs.push(list.charAt(0).toUpperCase() + list.slice(1) + ' were left as they are.');
+    }
     if (msgs.length) ui.toast(msgs.join(' ') + ' Undo with Ctrl+Z.', { type: 'info', timeout: 6000 });
   }
 
@@ -1487,8 +1666,6 @@
     var nRows = fill ? rc.r2 - rc.r1 + 1 : block.length;
     var nCols = fill ? rc.c2 - rc.c1 + 1 : width;
     var nR = layout.students.length, nC = layout.cols.length;
-    var droppedRows = Math.max(0, r0 + nRows - nR);
-    var droppedCols = Math.max(0, c0 + nCols - nC);
     var ops = [], skipped = [], skippedSeen = Object.create(null);
     for (var i = 0; i < nRows && r0 + i < nR; i++) {
       var sid = layout.students[r0 + i].id;
@@ -1503,7 +1680,72 @@
         ops.push({ sid: sid, kind: col.kind, aid: col.aid || null, text: String(text) });
       }
     }
-    var sum = { cells: 0, overrides: 0, moved: 0, badNo: 0, newTeams: 0, propagated: 0 };
+    var job = {
+      ops: ops, skipped: skipped, fill: fill, source: o.source || 'paste',
+      droppedRows: Math.max(0, r0 + nRows - nR), droppedCols: Math.max(0, c0 + nCols - nC),
+      // The pasted area, as cell refs taken now (a dialog may come first).
+      selA: refAt(r0, c0), selE: refAt(Math.min(r0 + nRows - 1, nR - 1), Math.min(c0 + nCols - 1, nC - 1))
+    };
+    var moves = teamMoveCheck(ops);
+    if (!moves.students) { runBlock(job, null); return; }
+    // Like the Team cell editor: team moves that would change team-graded scores ask first, because
+    // keeping them creates per-member overrides, which need the team's written agreement (K5).
+    ui.dialog.open({
+      title: (fill ? 'Fill' : 'Paste') + ' changes teams',
+      bodyHtml: '<p>' + esc(plural(moves.students, 'student')) + ' changing team ' + (moves.students === 1 ? 'has' : 'have') +
+        ' team-graded scores that differ from the new team\'s: <strong>' + esc(moves.asmts.join(', ')) + '</strong>.</p>' +
+        '<p>Keep their current scores (as per-member overrides ◆), or use the new team\'s scores?</p>' +
+        '<p class="muted small">An unequal split within a team needs the team\'s written agreement. A student left without a team keeps ' +
+        'the current scores as individual scores, or has none with "Use the new team\'s scores". Every change is logged in History.</p>',
+      buttons: [
+        { text: 'Cancel', value: null },
+        { spacer: true },
+        { text: 'Use the new team\'s scores', value: 'team' },
+        { text: 'Keep current scores (as overrides)', value: 'keep', primary: true }
+      ]
+    }).then(function (v) {
+      refocusGrid();
+      if (!v) { ui.toast((fill ? 'Fill' : 'Paste') + ' cancelled. Nothing was changed.', { type: 'info' }); return; }
+      runBlock(job, v === 'keep');
+    });
+  }
+
+  /** Team cells in a paste that move a student whose team-graded scores differ from the new team's
+   * (none for a new team or no team). Returns { students, asmts: [names] }. */
+  function teamMoveCheck(ops) {
+    var course = cur();
+    var out = { students: 0, asmts: [] };
+    var tg = course.assessments.filter(function (x) { return x.teamGraded; });
+    if (!tg.length) return out;
+    var byName = Object.create(null);
+    course.teams.forEach(function (t) { byName[t.name.trim().toLowerCase()] = t.id; });
+    ops.forEach(function (op) {
+      if (op.kind !== 'team') return;
+      var s = model.findStudent(course, op.sid);
+      if (!s) return;
+      var name = op.text.trim();
+      var target = name ? (byName[name.toLowerCase()] || NEW_TEAM) : null;
+      var current = s.teamId && model.findTeam(course, s.teamId) ? s.teamId : null;
+      if (target === current) return;
+      var hit = false;
+      tg.forEach(function (x) {
+        var eff = model.effectiveEntry(course, s, x);
+        if (!model.hasScore(eff)) return;
+        var next = target && target !== NEW_TEAM ? model.getEntry(course.teamScores, target, x.id) : null;
+        if (model.entryKey(eff) === model.entryKey(next)) return;
+        hit = true;
+        if (out.asmts.indexOf(x.name) === -1) out.asmts.push(x.name);
+      });
+      if (hit) out.students++;
+    });
+    return out;
+  }
+
+  /** keep: null (no team move changes scores), true (keep them as overrides) or false (use the new
+   * team's scores). */
+  function runBlock(job, keep) {
+    var ops = job.ops, fill = job.fill;
+    var sum = { cells: 0, overrides: 0, moved: 0, unteamed: 0, kept: 0, badNo: 0, newTeams: 0, propagated: 0 };
     if (ops.length) {
       var label = (fill ? 'Fill ' : 'Paste ') + plural(ops.length, 'cell');
       focusUntil = nowMs() + 1500;
@@ -1535,8 +1777,17 @@
               }
             }
             var before = st.teamId || null;
-            model.moveStudentToTeam(c, st.id, tid, { keepScores: true });
-            if ((st.teamId || null) !== before) sum.moved++;
+            model.moveStudentToTeam(c, st.id, tid, { keepScores: keep === true });
+            if ((st.teamId || null) !== before) {
+              sum.moved++;
+              if (!st.teamId) sum.unteamed++;
+              else if (keep === true) {
+                c.assessments.forEach(function (x) {
+                  var e = x.teamGraded ? model.getEntry(c.scores, st.id, x.id) : null;
+                  if (e && e.override === true) sum.kept++;
+                });
+              }
+            }
             sum.cells++;
           }
         });
@@ -1567,12 +1818,15 @@
             });
           }
         });
-      }, { source: o.source || 'paste' });
-      // Select the pasted area, like Excel.
-      sel.active = refAt(r0, c0);
-      sel.end = refAt(Math.min(r0 + nRows - 1, nR - 1), Math.min(c0 + nCols - 1, nC - 1));
-      paintSelection();
-      focusActive();
+      }, { source: job.source });
+      // Select the pasted area, like Excel. (If the re-render re-sorts the rows, renderTable
+      // collapses it to the active cell.)
+      if (posOf(job.selA) && posOf(job.selE)) {
+        sel.active = job.selA;
+        sel.end = job.selE;
+        paintSelection();
+        focusActive();
+      }
     }
     var msg = [];
     if (ops.length) msg.push((fill ? 'Filled ' : 'Pasted ') + plural(sum.cells, 'cell') + '.');
@@ -1583,13 +1837,22 @@
         ' saved as per-member override' + (sum.overrides === 1 ? '' : 's') + ' (◆).');
     }
     if (sum.propagated) msg.push('Team scores also apply to ' + plural(sum.propagated, 'other team member') + '.');
-    if (skipped.length) msg.push('Calculated columns were skipped (' + skipped.join(', ') + ').');
-    if (droppedRows) msg.push(plural(droppedRows, 'row') + ' past the end of the list ' + (droppedRows === 1 ? 'was' : 'were') + ' not pasted.');
-    if (droppedCols) msg.push(plural(droppedCols, 'column') + ' past the last column ' + (droppedCols === 1 ? 'was' : 'were') + ' not pasted.');
+    if (job.skipped.length) msg.push('Calculated columns were skipped (' + job.skipped.join(', ') + ').');
+    if (job.droppedRows) msg.push(plural(job.droppedRows, 'row') + ' past the end of the list ' + (job.droppedRows === 1 ? 'was' : 'were') + ' not pasted.');
+    if (job.droppedCols) msg.push(plural(job.droppedCols, 'column') + ' past the last column ' + (job.droppedCols === 1 ? 'was' : 'were') + ' not pasted.');
     if (sum.badNo) msg.push(plural(sum.badNo, 'value') + ' in No ' + (sum.badNo === 1 ? 'was not a whole number and was' : 'were not whole numbers and were') + ' skipped.');
-    if (sum.moved) msg.push(plural(sum.moved, 'student') + ' changed team' + (sum.newTeams ? ' (' + plural(sum.newTeams, 'new team') + ' created)' : '') + '.');
-    var warn = droppedRows || droppedCols || sum.badNo || !ops.length;
-    ui.toast(msg.join(' '), { type: warn ? 'warn' : 'success', timeout: warn || sum.overrides ? 9000 : 4000 });
+    if (sum.moved) {
+      msg.push(plural(sum.moved, 'student') + ' changed team' + (sum.newTeams ? ' (' + plural(sum.newTeams, 'new team') + ' created)' : '') +
+        (sum.unteamed ? '; ' + sum.unteamed + ' of them now ' + (sum.unteamed === 1 ? 'has' : 'have') + ' no team' : '') + '.');
+    }
+    if (sum.kept) {
+      msg.push(sum.kept + ' team-graded score' + (sum.kept === 1 ? ' was' : 's were') + ' kept as per-member override' +
+        (sum.kept === 1 ? '' : 's') + ' (◆) for students who changed team.');
+    } else if (keep === false && sum.moved) {
+      msg.push('Students who changed team now use their new team\'s scores.');
+    }
+    var warn = job.droppedRows || job.droppedCols || sum.badNo || !ops.length;
+    ui.toast(msg.join(' '), { type: warn ? 'warn' : 'success', timeout: warn || sum.overrides || sum.kept ? 9000 : 4000 });
   }
 
   // ------------------------------------------------------------------ cell menu
@@ -1775,6 +2038,14 @@
     else setPrefs({ sort: key, dir: key === 'total' ? 'desc' : 'asc' });
   }
 
+  function toggleLegend(b) {
+    if (!dom || !dom.legend) return;
+    var open = !dom.legend.classList.contains('is-open');
+    dom.legend.classList.toggle('is-open', open);
+    b.setAttribute('aria-expanded', open ? 'true' : 'false');
+    queueWrapTop();
+  }
+
   function focusSearch() {
     if (!dom || !dom.search) return;
     dom.search.focus();
@@ -1800,6 +2071,7 @@
     }
     var hit = cellFromEvent(e);
     if (!hit) return;
+    tabExit = false;
     if (e.target.closest('button')) return;
     if (e.button === 2) {
       if (!inRect(hit.r, hit.c)) {
@@ -1877,6 +2149,7 @@
     if (act === 'group') setPrefs({ group: !getPrefs().group });
     else if (act === 'withdrawn') setPrefs({ showWithdrawn: !getPrefs().showWithdrawn });
     else if (act === 'columns') openColumnsMenu(b);
+    else if (act === 'legend') toggleLegend(b);
     else if (act === 'add-student') addStudent();
     else if (act === 'paste-roster') { if (typeof GT.ui.openRosterPaste === 'function') GT.ui.openRosterPaste(); }
     else if (act === 'load-sample') { if (GT.app && GT.app.actions && GT.app.actions.loadSample) GT.app.actions.loadSample(); }
@@ -1947,6 +2220,9 @@
     var k = e.key, mod = e.ctrlKey || e.metaKey, shift = e.shiftKey;
     var a = posOf(sel.active);
     if (!a || e.isComposing) return;
+    if (k === 'Shift' || k === 'Control' || k === 'Alt' || k === 'Meta') return;
+    var exit = tabExit;
+    tabExit = false;
     var end = posOf(sel.end) || a;
     var nR = layout.students.length, nC = layout.cols.length;
     if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') {
@@ -1965,8 +2241,11 @@
       return;
     }
     if (k === 'Tab' && !mod && !e.altKey) {
+      // Esc, then Tab (or the first/last cell): let focus leave the grid. Only the active cell is in
+      // the tab order, so the browser moves on to the controls after (or before) the table.
+      if (exit) return;
       var t = tabTarget(a, shift);
-      if (!t) return; // first/last cell: let focus leave the grid
+      if (!t) return;
       e.preventDefault();
       if (tabStartKey === null) tabStartKey = layout.cols[a.c].key;
       moveTo(t.r, t.c, false);
@@ -2005,6 +2284,7 @@
     }
     if (k === 'Escape') {
       if (hasRange()) { e.preventDefault(); sel.end = sel.active; paintSelection(); }
+      tabExit = true;
       return;
     }
     if ((k === 'F10' && shift) || k === 'ContextMenu') {
@@ -2089,6 +2369,7 @@
     if (globalBound) return;
     globalBound = true;
     document.addEventListener('mouseup', function () { drag = null; });
+    root.addEventListener('resize', function () { if (isActiveView()) queueWrapTop(); });
     document.addEventListener('copy', onCopy);
     document.addEventListener('paste', onPaste);
     document.addEventListener('keydown', function (e) {

@@ -62,11 +62,14 @@
   var NUMBER_RE = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
 
   /** Parses a user-typed or pasted score. Accepts "88", " 88.5 ", "+7", "-3", ".5", "88%",
-   * the unicode minus sign, and a trailing "%" (dropped). Commas are NOT accepted
+   * the unicode minus sign, and a trailing "%". Commas are NOT accepted
    * (ambiguous between decimal and thousands separators), so "88,5" is invalid.
    * Magnitudes above MAX_INPUT_ABS (such as "1e308") are invalid, so totals stay finite.
+   * `maxScore` (optional, a score cell's max): "x%" means x percent of it, so "88%" with max 50
+   * gives 44 (multiply first: x * maxScore / 100). Without a positive maxScore (weights, curve,
+   * settings fields) the "%" is simply dropped: "88%" gives 88.
    * Returns { kind: 'empty' } | { kind: 'number', value } | { kind: 'invalid', text }. */
-  function parseScoreInput(input) {
+  function parseScoreInput(input, maxScore) {
     if (input === null || input === undefined) return { kind: 'empty' };
     if (typeof input === 'number') {
       return isSaneNumber(input) ? { kind: 'number', value: fix(input) } : { kind: 'invalid', text: String(input) };
@@ -75,9 +78,11 @@
     var s = raw.replace(/ /g, ' ').trim();
     if (s === '') return { kind: 'empty' };
     s = s.replace(/^−/, '-');
-    if (s.charAt(s.length - 1) === '%') s = s.slice(0, -1).trim();
+    var percent = s.charAt(s.length - 1) === '%';
+    if (percent) s = s.slice(0, -1).trim();
     if (NUMBER_RE.test(s)) {
       var v = Number(s);
+      if (percent && isSaneNumber(v) && isSaneNumber(maxScore) && maxScore > 0) v = v * maxScore / 100;
       if (isSaneNumber(v)) return { kind: 'number', value: fix(v) };
     }
     return { kind: 'invalid', text: raw.trim() };

@@ -1,0 +1,213 @@
+/* Grade Tracker - grade calculations (weighted points, totals, rounding, curve, late penalty,
+ * team propagation, letter grades, rank, percentile). See docs/DESIGN.md section 3.
+ * Pure; runs in the browser (GT.calc) and in Node. */
+(function (root) {
+  'use strict';
+  var isNode = typeof module === 'object' && module.exports;
+  var util = isNode ? require('./util.js') : root.GT.util;
+  var model = isNode ? require('./model.js') : root.GT.model;
+  var fix = util.fix;
+
+  /** Classifies a ScoreEntry: empty, a number, or invalid text. */
+  function parseEntry(entry) {
+    if (!entry) return { state: 'empty', value: null, text: null };
+    if (typeof entry.value === 'number' && isFinite(entry.value)) return { state: 'number', value: entry.value, text: null };
+    if (typeof entry.text === 'string' && entry.text !== '') return { state: 'invalid', value: null, text: entry.text };
+    return { state: 'empty', value: null, text: null };
+  }
+
+  /** Which stored entry applies to this student and assessment (K5). */
+  function resolveEntry(course, student, assessment) {
+    var own = model.getEntry(course.scores, student.id, assessment.id);
+    if (assessment.teamGraded && student.teamId && model.findTeam(course, student.teamId)) {
+      if (own && own.override === true) return { entry: own, source: 'override', teamId: student.teamId };
+      return { entry: model.getEntry(course.teamScores, student.teamId, assessment.id), source: 'team', teamId: student.teamId };
+    }
+    return { entry: own, source: 'individual', teamId: student.teamId || null };
+  }
+
+  /** Late penalty in points on this assessment's own scale (K4):
+   * weeksLate x pointsPerWeek, scaled by maxScore / 100. Zero when waived. */
+  function latePenalty(entry, assessment, settings) {
+    if (!entry || entry.waived) return 0;
+    var weeks = typeof entry.weeksLate === 'number' && entry.weeksLate > 0 ? entry.weeksLate : 0;
+    if (!weeks) return 0;
+    var perWeek = settings && typeof settings.latePointsPerWeek === 'number' ? settings.latePointsPerWeek : 10;
+    var max = typeof assessment.maxScore === 'number' ? assessment.maxScore : 100;
+    return fix(weeks * perWeek * max / 100);
+  }
+
+  function scoreDetail(course, student, assessment) {
+    var r = resolveEntry(course, student, assessment);
+    var p = parseEntry(r.entry);
+    var max = assessment.maxScore;
+    var weight = assessment.weight || 0;
+    var missing = p.state !== 'number';
+    var weeksLate = r.entry && r.entry.weeksLate > 0 ? r.entry.weeksLate : 0;
+    var waived = !!(r.entry && r.entry.waived);
+    var penalty = missing ? 0 : latePenalty(r.entry, assessment, course.settings);
+    var adjusted = missing ? null : (penalty > 0 ? fix(Math.max(0, p.value - penalty)) : p.value);
+    var weighted = (missing || !(max > 0)) ? 0 : fix(adjusted * weight / max);
+    return {
+      assessmentId: assessment.id,
+      state: p.state,
+      raw: p.value,
+      text: p.text,
+      source: r.source,
+      teamId: r.teamId,
+      override: r.source === 'override',
+      missing: missing,
+      outOfRange: p.state === 'number' && (p.value < 0 || p.value > max),
+      weeksLate: weeksLate,
+      waived: waived,
+      penalty: penalty,
+      adjusted: adjusted,
+      weighted: weighted
+    };
+  }
+
+  function roundTotal(x, mode) {
+    if (x === null || x === undefined) return x;
+    if (mode === 'hundredth') return util.roundTo(x, 2);
+    if (mode === 'integer') return util.roundTo(x, 0);
+    return fix(x);
+  }
+
+  function sortedScale(scale) {
+    return (scale || []).slice().sort(function (a, b) { return b.min - a.min; });
+  }
+
+  /** Letter for a total: the first cutoff (highest first) the total reaches; else the lowest letter. */
+  function letterFor(total, scale) {
+    var s = sortedScale(scale);
+    if (!s.length) return '';
+    if (total === null || total === undefined || !isFinite(total)) return '';
+    var t = fix(total);
+    for (var i = 0; i < s.length; i++) {
+      if (t >= fix(s[i].min)) return s[i].letter;
+    }
+    return s[s.length - 1].letter;
+  }
+
+  function studentResult(course, student) {
+    var items = {};
+    var weighted = [];
+    var missingCount = 0, invalidCount = 0, outOfRangeCount = 0, overrideCount = 0, lateCount = 0;
+    course.assessments.forEach(function (a) {
+      var d = scoreDetail(course, student, a);
+      items[a.id] = d;
+      weighted.push(d.weighted);
+      if (d.missing && (a.weight || 0) > 0) missingCount++;
+      if (d.state === 'invalid') invalidCount++;
+      if (d.outOfRange) outOfRangeCount++;
+      if (d.override) overrideCount++;
+      if (d.weeksLate > 0) lateCount++;
+    });
+    var curve = typeof course.settings.curve === 'number' && isFinite(course.settings.curve) ? course.settings.curve : 0;
+    var weightedSum = util.sum(weighted);
+    var totalUnrounded = fix(weightedSum + curve);
+    var total = roundTotal(totalUnrounded, course.settings.rounding);
+    return {
+      studentId: student.id,
+      active: student.status !== 'withdrawn',
+      items: items,
+      weightedSum: weightedSum,
+      curve: curve,
+      totalUnrounded: totalUnrounded,
+      total: total,
+      letter: letterFor(total, course.settings.letterScale),
+      incomplete: missingCount > 0,
+      missingCount: missingCount,
+      invalidCount: invalidCount,
+      outOfRangeCount: outOfRangeCount,
+      overrideCount: overrideCount,
+      lateCount: lateCount,
+      rank: null,
+      percentile: null,
+      diffFromAverage: null
+    };
+  }
+
+  function weightStatus(course) {
+    var s = util.sum(course.assessments.map(function (a) { return a.weight || 0; }));
+    return { sum: s, ok: Math.abs(s - 100) < 1e-9 };
+  }
+
+  /** Results for every student plus class-level figures (K7). */
+  function computeCourse(course) {
+    var byId = {};
+    var active = [];
+    course.students.forEach(function (s) {
+      var r = studentResult(course, s);
+      byId[s.id] = r;
+      if (r.active) active.push(r);
+    });
+    var n = active.length;
+    var average = n ? fix(util.sum(active.map(function (r) { return r.total; })) / n) : null;
+    var totals = active.map(function (r) { return fix(r.total); }).sort(function (a, b) { return b - a; });
+    active.forEach(function (r) {
+      var t = fix(r.total);
+      var higher = 0, lower = 0;
+      for (var i = 0; i < totals.length; i++) {
+        if (totals[i] > t) higher++;
+        else if (totals[i] < t) lower++;
+      }
+      r.rank = higher + 1;
+      r.percentile = n <= 1 ? 100 : fix(100 * lower / (n - 1));
+      r.diffFromAverage = fix(r.total - average);
+    });
+    return {
+      byId: byId,
+      activeIds: active.map(function (r) { return r.studentId; }),
+      average: average,
+      weights: weightStatus(course)
+    };
+  }
+
+  function compareByName(a, b) {
+    return util.compareText(a.lastName, b.lastName) ||
+      util.compareText(a.firstName, b.firstName) ||
+      ((a.no === null || a.no === undefined ? Infinity : a.no) - (b.no === null || b.no === undefined ? Infinity : b.no)) || 0;
+  }
+
+  /** Returns a sorted copy of the course's students. key: 'name' | 'total' | 'no'. Ties by name. */
+  function sortStudents(course, results, key, dir) {
+    var sign = dir === 'desc' ? -1 : 1;
+    var list = course.students.slice();
+    list.sort(function (a, b) {
+      var c = 0;
+      if (key === 'total') {
+        var ta = results && results.byId[a.id] ? results.byId[a.id].total : -Infinity;
+        var tb = results && results.byId[b.id] ? results.byId[b.id].total : -Infinity;
+        c = ta === tb ? 0 : (ta < tb ? -1 : 1);
+        if (c !== 0) return sign * c;
+        return compareByName(a, b);
+      }
+      if (key === 'no') {
+        var na = typeof a.no === 'number' ? a.no : Infinity;
+        var nb = typeof b.no === 'number' ? b.no : Infinity;
+        c = na === nb ? 0 : (na < nb ? -1 : 1);
+        if (c !== 0) return sign * c;
+        return compareByName(a, b);
+      }
+      return sign * compareByName(a, b);
+    });
+    return list;
+  }
+
+  var api = {
+    parseEntry: parseEntry,
+    resolveEntry: resolveEntry,
+    latePenalty: latePenalty,
+    scoreDetail: scoreDetail,
+    roundTotal: roundTotal,
+    letterFor: letterFor,
+    studentResult: studentResult,
+    weightStatus: weightStatus,
+    computeCourse: computeCourse,
+    compareByName: compareByName,
+    sortStudents: sortStudents
+  };
+
+  if (isNode) module.exports = api; else (root.GT = root.GT || {}).calc = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

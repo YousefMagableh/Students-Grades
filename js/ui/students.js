@@ -751,7 +751,7 @@
     var t = model.findTeam(course, tid), a = model.findAssessment(course, aid);
     if (!t || !a) return;
     var prev = model.getEntry(course.teamScores, tid, aid);
-    var next = model.entryFromInput(input.value, prev);
+    var next = model.entryFromInput(input.value, prev, a.maxScore);
     var same = model.isBlankEntry(prev) ? model.isBlankEntry(next)
       : (model.entryKey(prev) === model.entryKey(next) && entryText(prev) === entryText(next) && !model.isBlankEntry(next));
     if (same) return;

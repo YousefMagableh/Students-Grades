@@ -1124,7 +1124,7 @@
       var t = v.trim();
       bad = t !== '' && !(/^\d+$/.test(t) && parseInt(t, 10) >= 1);
     } else if (ed.kind === 'score') {
-      var p = util.parseScoreInput(v);
+      var p = util.parseScoreInput(v, ed.max);
       bad = p.kind === 'invalid';
       warn = p.kind === 'number' && (p.value < 0 || (ed.max !== null && p.value > ed.max));
     }
@@ -1204,20 +1204,20 @@
     var team = a.teamGraded && s.teamId ? model.findTeam(c, s.teamId) : null;
     if (!team) {
       var prev = model.getEntry(c.scores, sid, aid);
-      var e = model.entryFromInput(text, prev);
+      var e = model.entryFromInput(text, prev, a.maxScore);
       delete e.override;
       model.setEntry(c.scores, sid, aid, model.isBlankEntry(e) ? null : e);
       return { kind: 'individual' };
     }
     var own = model.getEntry(c.scores, sid, aid);
     if (own && own.override === true) {
-      var eo = model.entryFromInput(text, own);
+      var eo = model.entryFromInput(text, own, a.maxScore);
       if (eo.override) { model.setEntry(c.scores, sid, aid, eo); return { kind: 'override' }; }
       model.clearOverride(c, sid, aid);
       return { kind: 'override-removed', team: team, teamText: entryText(model.getEntry(c.teamScores, team.id, aid)) };
     }
     var prevT = model.getEntry(c.teamScores, team.id, aid);
-    model.setTeamScore(c, team.id, aid, model.entryFromInput(text, prevT));
+    model.setTeamScore(c, team.id, aid, model.entryFromInput(text, prevT, a.maxScore));
     return { kind: 'team', team: team, members: model.teamMembers(c, team.id).length };
   }
 
@@ -1366,7 +1366,7 @@
       if (v === null) { refocusGrid(); return; }
       refocusGrid();
       transact('Edit team score (' + a.name + ')', function (c) {
-        model.setTeamScore(c, teamId, aid, model.entryFromInput(v, model.getEntry(c.teamScores, teamId, aid)));
+        model.setTeamScore(c, teamId, aid, model.entryFromInput(v, model.getEntry(c.teamScores, teamId, aid), a.maxScore));
       });
     });
   }
@@ -1392,14 +1392,14 @@
       ],
       confirmText: 'Save override',
       validate: function (v) {
-        return util.parseScoreInput(v.value).kind === 'invalid' ? 'Enter a number, or leave it empty.' : null;
+        return util.parseScoreInput(v.value, a.maxScore).kind === 'invalid' ? 'Enter a number, or leave it empty.' : null;
       }
     }).then(function (v) {
       refocusGrid();
       if (!v) return;
       var before = (cur().history || []).length;
       transact('Override ' + a.name, function (c) {
-        model.setOverride(c, sid, aid, model.entryFromInput(v.value, model.getEntry(c.teamScores, team.id, aid)));
+        model.setOverride(c, sid, aid, model.entryFromInput(v.value, model.getEntry(c.teamScores, team.id, aid), a.maxScore));
       });
       var reason = String(v.reason || '').trim();
       if (reason && GT.store.annotateHistory) {
@@ -1807,7 +1807,7 @@
           if (asmt.teamGraded) {
             var rows = byAid[aid].map(function (op) {
               var st = model.findStudent(c, op.sid);
-              return { studentId: op.sid, entry: model.entryFromInput(op.text, st ? model.effectiveEntry(c, st, asmt) : null) };
+              return { studentId: op.sid, entry: model.entryFromInput(op.text, st ? model.effectiveEntry(c, st, asmt) : null, asmt.maxScore) };
             });
             var out = model.setTeamScoreFromMembers(c, aid, rows);
             sum.overrides += out.overridesCreated;
@@ -1815,7 +1815,7 @@
             sum.cells += rows.length;
           } else {
             byAid[aid].forEach(function (op) {
-              var e = model.entryFromInput(op.text, model.getEntry(c.scores, op.sid, aid));
+              var e = model.entryFromInput(op.text, model.getEntry(c.scores, op.sid, aid), asmt.maxScore);
               delete e.override;
               model.setEntry(c.scores, op.sid, aid, model.isBlankEntry(e) ? null : e);
               sum.cells++;

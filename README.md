@@ -5,7 +5,9 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 - **Private by design:** there is no server, no account, and no internet use. Grades stay in this browser on this computer.
 - **No install:** open `index.html` in Chrome, Edge, Firefox, or Safari.
 
-> This README is being completed stage by stage. The full guide to formulas, placeholders and statistics arrives with the final stage.
+> **Status (paused 2026-09-28):** grades, teams, final letters, attendance, and Excel/CSV export and import are done and tested.
+> Still to come: the Statistics tab, the late-work dialog, the printable Summary tab, and the full guide to formulas and placeholders.
+> See `docs/build/RESUME.md`.
 
 ## Open the app
 

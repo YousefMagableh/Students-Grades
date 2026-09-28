@@ -65,7 +65,7 @@ All data is plain JSON (serializable, structured-clonable). IDs are strings with
 ```js
 AppState = {
   app: 'grade-tracker',
-  schemaVersion: 1,
+  schemaVersion: 2,                  // 2 since stage 3 (see 2.3: migration from 1)
   courses: Course[],                 // display order
   activeCourseId: string|null,
   ui: { theme: 'system'|'light'|'dark', privacy: boolean, activeView: string },
@@ -115,14 +115,15 @@ Settings = {
   passingLetter: 'D-'|'C'             // lowest passing letter (pass rate, ST2); always a letter of the scale
 }
 
-Attendance = {                        // stage 3 fills in behavior; shape exists from stage 1
+Attendance = {                        // behavior: GT.attendance (section 7)
   mode: 'per-session'|'totals'|'off',
   sessions: [{ id: 'ses_…', date: 'YYYY-MM-DD', label: '' }],   // ascending by date
   records: { [studentId]: { [sessionId]: 'P'|'A'|'E' } },      // missing = not recorded
   totals:  { [studentId]: { absent: number, excused: number } },// totals-only mode
   totalsSessionsHeld: 0,               // denominator for totals-only rates
   unexcusedThreshold: 3,               // T4 placeholder; highlight when unexcused > threshold
-  excusedCountsTowardStreak: true,     // T5
+  totalAbsenceThreshold: null,         // DECISIONS 3: null = off (default) | whole number >= 0; highlight when total > it
+  excusedCountsTowardStreak: false,    // T5; default FALSE since DECISIONS 6 (allowed absences do not count)
   dropStreak: 3, failStreak: 4         // T5 (from syllabus)
 }
 ```
@@ -167,6 +168,11 @@ courses get generic notes.
 Editing a value never auto-confirms; the user clicks "Mark confirmed" (and can undo that).
 The `maxScores` note says every item defaults to max 100 except Class/Project Participation, which is out of
 5 like the previous TA's sheet (5 = full marks), picked from a drop-down list in steps of 0.5.
+The `unexcusedThreshold` note also covers the optional total-absence threshold (DECISIONS 3; no separate key):
+for the SE4351/SE6362 templates it quotes the syllabus ("total absences should not exceed a certain threshold",
+no number given), says the placeholder highlights above 3 unexcused (not allowed) absences, and that the
+total-absence threshold (excused + unexcused) needs confirming too and is off until set. Custom courses get the
+same note without the syllabus quote.
 
 ### 2.3 Helpers
 
@@ -202,6 +208,17 @@ A stored score above that limit becomes invalid text (shown and highlighted, cou
   scale** (calc reports `finalLetterValid: false` and the UI warns; it is never dropped), else null;
   `Course.finalized` is kept only as `{ at: non-empty string, note: string }` (a missing note becomes `''`,
   extra keys are dropped), else null; `Assessment.choices` only when `normalizeChoices` accepts it.
+  Attendance (stage 3): `excusedCountsTowardStreak` is true only when stored as `true` (missing or anything
+  else → false, DECISIONS 6); `totalAbsenceThreshold` through `model.normalizeTotalAbsenceThreshold(x)` → a
+  whole number >= 0 (at most 1e6), else null (off). Marks other than 'P'/'A'/'E' are dropped. Courses saved
+  saved before stage 3 stored `excusedCountsTowardStreak: true` (the old default, which no screen could
+  change), so it was never the TA's choice: **schema 2 migration** — `normalizeState` (so both loading from
+  the browser and `readBackup`) sets it to false in every course when the data's `schemaVersion` is below 2
+  or missing (`model.migrateToV2(course, isoNow?)` → true when it changed), and logs one history entry per
+  changed course (source `'system'`, kind `'settings'`, fieldKey `'attendance.excusedCountsTowardStreak'`,
+  `'yes'` → `'no'`, with a note saying how to turn it back on). Warnings only, never a grade. Data with
+  schema 2 keeps a stored true (the TA ticked the box). A wrapped backup whose inner state has no
+  `schemaVersion` uses the envelope's.
 - `model.wrapBackup(state, isoNow)` → `{ app:'grade-tracker', kind:'backup', schemaVersion, exportedAt, state }`
 - `model.readBackup(obj)` → `{ state, summary: { exportedAt, courses: [{code, title, students}] } }` or throws.
   Accepts the wrapped format (inner state may omit `app`) or a bare state that has `app: 'grade-tracker'`.
@@ -339,8 +356,9 @@ remove binary noise. Weighted points use multiply-first: `adjusted * weight / ma
 scores such as 30 (an exact 80 became 79.9999999999, a C+ instead of B-).
 
 Input parsing (`GT.util`): `parseScoreInput` accepts numbers with |x| <= `util.MAX_INPUT_ABS` (1e6); larger
-values are `'invalid'` so totals stay finite. `parseCount` (weeks late, absence counts) accepts whole
-numbers >= 0 only (no fractions, no `%`). `roundTo(x, d)` is Excel `ROUND` (half away from zero, negative
+values are `'invalid'` so totals stay finite. `parseCount` (weeks late, absence counts, thresholds) accepts
+whole numbers from 0 to 1e6 only: text must be plain digits (optionally `"2.0"`, spaces around trimmed), so
+fractions, `%`, signs, `1,000` and scientific notation (`"1e3"`) are refused. `roundTo(x, d)` is Excel `ROUND` (half away from zero, negative
 `d` allowed, safe for any finite magnitude).
 
 - `calc.parseEntry(entry)` → `{ state: 'empty'|'number'|'invalid', value: number|null, text: string|null }`.
@@ -433,7 +451,15 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   entries (value/text, weeksLate, waived, override flag), and **effective** team-graded values of each
   student that changed without an individual entry change (kind `'propagation'`, note
   `"From <team> team score"`). Attendance changes (stage 3) are logged per student when a transaction
-  changes ≤ 5 marks, otherwise as one `'attendance'` summary entry.
+  changes ≤ 5 marks, otherwise as one `'attendance'` summary entry ("Mark everyone present" on a class
+  gives ONE entry, e.g. "57 marks changed"; totals-mode counts are counted separately, e.g. "114 absence totals
+  changed" for "Fill totals from per-session marks", or "4 marks and 4 absence totals changed"). Attendance settings are kind `'settings'`, fieldKey
+  `'attendance.<field>'`: mode, unexcusedThreshold, **totalAbsenceThreshold** (field "Total-absence threshold",
+  values `'off'` for null/missing, else the number), excusedCountsTowardStreak (`'yes'`/`'no'`), dropStreak,
+  failStreak, totalsSessionsHeld. Sessions added/changed/removed are `'settings'` entries (more than 10 in one
+  transaction: one "Sessions" summary). Marks deleted with a session are not itemized; the session entry
+  says how many: note "Session removed with its 59 marks" (the summary adds "; N marks deleted with the
+  removed sessions").
   Group order: course details and settings, assessments, placeholders, teams, students, team scores,
   individual entries, propagation, final letters, attendance.
 - Final letters (STAGE2B): for students present before and after, a changed `finalLetter` gives kind
@@ -503,7 +529,9 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   Sticky elements inside a view's own scroll box (table headers) need nothing. Page-level z-index: header 40,
   menus 100, toasts 200; dialogs use the top layer. Keep view z-indexes below 30.
 - Cross-view links: `GT.app.navigate('settings', { section })`, `navigate('settings', { placeholder })`,
-  `navigate('history', { studentId })`, `navigate('grades', { studentId, assessmentId })`.
+  `navigate('history', { studentId })`, `navigate('grades', { studentId, assessmentId })`,
+  `navigate('attendance', { studentId })` (selects the student's row; totals mode: their Absent input),
+  `navigate('attendance', { section: 'settings' | 'warnings' })` (scrolls to that card).
 - Shared widgets: `GT.ui.dialog.confirm/prompt/open`, `GT.ui.toast(message, { type })`,
   `GT.ui.download(filename, blobOrText, mime)`, `GT.ui.loadExcel()`, `GT.ui.icon(name)` (inline SVG).
 
@@ -536,9 +564,11 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
     raw scores, Total, the absence columns, participation, Suggested, Final letter, Rank; sorted by Total,
     high to low; larger text; participation and Final letter marked "fill in the meeting".
   - Absence columns "Excused (allowed)", "Unexcused (not allowed)", "Total absences" (toggles
-    `gridPrefs.cols.attExcused / attUnexcused / attTotal`) appear when attendance is not off and
-    `GT.attendance.summary(course, studentId)` exists. Stage 3 must return `{ excused, unexcused,
-    totalAbsences, recorded, warning, longestStreak, overThreshold, overTotalThreshold }`.
+    `gridPrefs.cols.attExcused / attUnexcused / attTotal`) appear when attendance is not off (per-session
+    and totals modes) and read `GT.attendance.summary(course, studentId)` (section 7), cached per render.
+    The Unexcused cell carries a warning icon and a tooltip for a 'fail'/'drop' streak or `overThreshold`;
+    the Total cell for `overTotalThreshold`. The cells are read-only ("Absences come from the Attendance
+    tab").
 - **Cross-view**: `GT.ui.openFinalize()` opens the grid's Finalize dialog from any view (it switches to
   Grades first). Settings has a "Grading status" card (`navigate('settings', { section: 'status' })`) with
   Finalize / Unlock, the final-letter counts and "Copy suggested letters into empty final letters".
@@ -549,3 +579,163 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
 - **Students**: the table has a read-only Final letter column; `GT.ui.openStudent(id)` shows the suggested
   letter, an editable Final letter select (`#sd-final`) and a select for each individually entered item with
   a list (disabled when finalized). Team scores are read-only when finalized.
+
+## 7. Attendance (`GT.attendance`) — T1–T6, X7, DECISIONS 3 and 6
+
+`js/core/attendance.js`, pure and UMD like `calc.js` (depends on `util` and `model`; load it after `model.js`).
+Tests: `tests/attendance.test.js`. Marks: **P** Present, **A** Absent = *not allowed, unexcused*,
+**E** Excused = *allowed, instructor-approved* (DECISIONS 3). In the UI use the words "Excused (allowed,
+instructor-approved)" and "Absent (not allowed, unexcused)".
+
+### 7.1 Definitions (also for the README)
+
+- A session is **held** when at least one student of the course (active or withdrawn) has a mark for it.
+  Sessions nobody has marked yet (future sessions, a day the roll was not taken) are ignored completely: they
+  are not counted and they do not break streaks. Marks stored for ids that are not students of the course,
+  and values other than P/A/E, are ignored.
+- A student's **recorded sessions** are the held sessions where that student has a mark (P, A or E).
+  A held session where this student has **no** mark is "unknown": not counted, and it **breaks** a streak
+  (conservative: no warning is based on a guess).
+- `present` = P marks, `absent` = A marks, `excused` = E marks (held sessions only).
+- `totalAbsences = absent + excused` (T3). `unexcused = absent` (T3).
+- `absenceRate = 100 × totalAbsences / recorded`, `unexcusedRate = 100 × absent / recorded` (through
+  `util.fix`); both `null` when `recorded = 0`.
+- **Streak**: a maximal run of consecutive held sessions, in date order, where the student's mark counts as
+  an absence. 'A' always counts. 'E' counts only when `excusedCountsTowardStreak` is true. The default is
+  **false** (DECISIONS 6: at the user's request, allowed absences do not count against the student; the
+  original request defaulted to "all absences count"), and then an 'E' **breaks** the run. 'P' and unknown
+  also break it; unmarked (not held) sessions are skipped.
+- `longestStreak` = the longest run (0 when none). `streaks` lists only runs of length ≥ 2, oldest first.
+  `currentStreak` = the run ending at the student's latest recorded session (0 when that mark does not
+  count as an absence; held sessions after it where the student is unmarked do not reset it).
+- `warning`: `'fail'` when `longestStreak ≥ failStreak` (default 4; text "4 consecutive absences: syllabus
+  says F"), else `'drop'` when `longestStreak ≥ dropStreak` (default 3; "3 consecutive absences: syllabus says
+  one letter grade drop"), else `null`. The number in the text is the actual `longestStreak`. **Warnings
+  only: nothing ever changes a grade** (T5); attendance never feeds participation (T6).
+- `overThreshold = unexcused > unexcusedThreshold` (strictly greater, T4).
+- `overTotalThreshold = totalAbsences > totalAbsenceThreshold` when that optional setting is a number
+  (DECISIONS 3; `null` = off, the default); shown like the unexcused threshold and listed in the warnings as
+  kind `'total-threshold'`. Its placeholder text lives in the `unexcusedThreshold` note (section 2.2).
+
+Totals-only mode: `absent` and `excused` come from `attendance.totals[sid]` (missing → 0), `recorded =
+held = totalsSessionsHeld`, `present = max(0, recorded − totalAbsences)` (derived), rates use that
+denominator (null when 0). Streaks are not available: `longestStreak = currentStreak = null`, `streaks = []`,
+`streaksAvailable = false`, `warning = null` (the UI shows "n/a in totals mode"). The thresholds work the
+same. `moreAbsencesThanSessions` is true when `totalAbsences > recorded` (so the UI can flag the typo).
+
+Off mode: `summary()` returns `null`. Switching modes never deletes records, totals or sessions.
+
+### 7.2 Reading
+
+- `summary(course, studentId)` → `null` when the mode is `'off'` (or the course has no attendance / an
+  unknown mode); else `{ mode, held, recorded, unmarked, present, absent, excused, totalAbsences, unexcused,
+  absenceRate, unexcusedRate, longestStreak, currentStreak, streaks: [{ startDate, endDate, length, sessionIds,
+  dates }], streaksAvailable, excusedCountsTowardStreak, warning: null|'drop'|'fail', overThreshold,
+  overTotalThreshold, moreAbsencesThanSessions }`. `held` = held sessions (per-session) or totalsSessionsHeld;
+  `unmarked` = held sessions without a mark for this student (0 in totals mode).
+- `heldSessions(course)` → the held session objects, in date order (stable for equal dates).
+- `sessionCounts(course, sessionId)` → `{ present, absent, excused, unmarked, marked, presentRate }` over
+  **active** students only (`marked = P + A + E`; `presentRate = 100 × present / marked`, null when 0).
+- `markCount(course, sessionId)` → marks for that session by every student of the course, withdrawn
+  included: exactly what `clearSession` / `removeSession` delete, for "N marks will be lost".
+- `courseSummary(course)` → `{ mode, held, total: sessions.length, byStudent: { sid: summary }, warnings }`.
+  `byStudent` covers every student (withdrawn included). `warnings` covers **active** students only, one
+  item per student and kind: `{ studentId, kind: 'fail'|'drop'|'threshold'|'total-threshold', detail,
+  count, limit, streak }`, sorted fail, drop, threshold, total-threshold, then by name (last, first, No).
+  `detail` is the readable text (e.g. "6 unexcused absences: above the unexcused-absence threshold (3)",
+  "7 absences in total (excused + unexcused): above the total-absence threshold (6)"); `count` is the
+  streak length or absence count; `limit` the setting it passed; `streak` the longest run (oldest of equal
+  runs; its `dates` give "Oct 1, Oct 6, Oct 8") for fail/drop, else null. Off: `held 0`, `byStudent {}`,
+  `warnings []`.
+- `totalsFromRecords(course)` → `{ held, totals: { sid: { absent, excused } } }` counted from the marks of
+  held sessions (e.g. to prefill the totals-only table).
+- `markLabel(m)` → 'Present' | 'Absent' | 'Excused' | ''. `parseMark(input)` → `{ kind: 'mark', mark }`
+  (accepts p/a/e in any case and the words present/absent/excused), `{ kind: 'empty' }` or
+  `{ kind: 'invalid', text }`. `cycleMark(m)`: blank → P → A → E → blank (Space in the grid).
+- `nearestSessionIndex(course, isoDate)` → index in `attendance.sessions` of the earliest session on or
+  after `isoDate`, else the latest session; −1 when there are no sessions or the date is invalid ("Jump to
+  today" passes the computer's local date).
+- `mergeSessions(existing, generated, taken?)` → a NEW list sorted by date (stable). Every existing session
+  is kept (id, date, label, so its marks stay); a generated session is added only when no session has its
+  date (each date once); an added session whose id is taken (e.g. an existing session moved to another date
+  keeps `ses_20260908`) gets `ses_20260908_2`. `taken` (optional; the UI passes the course): the course, or a
+  Set / array of ids also in use — with the course, ids used by marks whose session is gone (a restored file
+  whose session had a bad date) are skipped too, so those old marks never reappear on a new session. Never
+  drops a session; inputs are not changed.
+- `sessionIdsInUse(course)` → Set of the session ids in `attendance.sessions` and in `attendance.records`
+  (`addSession` and `mergeSessions(…, course)` never reuse them).
+- `MARKS` = ['P', 'A', 'E'], `MODES` = ['per-session', 'totals', 'off'].
+
+### 7.3 Changing (call inside `GT.store.transact`; each helper changes the course in place)
+
+- `setMark(course, studentId, sessionId, mark|null)` → true when the stored mark changed. `mark` goes through
+  `parseMark` (null/'' clears; an emptied student row is removed); anything else **throws** a readable Error.
+  Unknown student or session → false, nothing written.
+- `setMarks(course, [{ studentId, sessionId, mark }])` → number changed; invalid items are skipped (a range
+  of cells, roll call: ONE transaction, ONE undo step).
+- `markAllPresent(course, sessionId, { activeOnly = true })` → number set: 'P' for every student with **no**
+  mark for that session (existing marks are never changed; withdrawn skipped unless `activeOnly: false`).
+  In one transaction this is ONE history entry.
+- `clearSession(course, sessionId)` → marks removed (the session stays and is no longer held).
+- `addSession(course, { date, label })` → the new session, inserted in date order, id `ses_YYYYMMDD` (or
+  `_2`, `_3` … when that id is used by a session or by stored marks). A second session on a date needs a
+  label; sessions on one date need distinct labels (case-insensitive) with at most one unlabeled. Bad dates
+  and clashes throw readable Errors.
+- `updateSession(course, id, { date?, label? })` → the session (id and marks kept, list re-sorted), or null
+  for an unknown id; same date rules.
+- `removeSession(course, id)` → marks removed (= `markCount` before); unknown id → 0, nothing changes.
+- `setTotals(course, studentId, { absent?, excused? })` → true when changed. Whole numbers >= 0 (numbers,
+  or text through `util.parseCount`); anything else throws and nothing changes; a missing field keeps its
+  value; unknown student → false; 0 and 0 for a student without a row adds no row.
+- `setSessionsHeld(course, n)` (totals-mode denominator, whole number >= 0) and `setMode(course, mode)`
+  (throws for an unknown mode; data of the other modes is kept) → true when changed.
+
+### 7.4 The Attendance tab and the other views (`js/ui/attendance.js`, `css/attendance.css`)
+
+- `GT.views.attendance = { id, title, render, destroy, lastRenderMs(), openSessions({ generate? }),
+  openRollCall(sessionId|null) }`. Per-viewer preferences: `ui.attendancePrefs = { showWithdrawn, summary }`.
+  Every core call is guarded: without `GT.attendance` the tab shows a warning instead of failing.
+- Header: course code, mode selector (Per session / Totals only / Off, `setMode` in one transaction; data of
+  the other modes is kept). Off: an empty state with "Turn on attendance (per session)" and "Use totals only".
+- Per-session grid: sticky No / Last / First (names `pii`), one column per session ("Thu" over "Sep 3", label
+  below; sessions nobody marked are lighter). Keys: arrows, `p`/`a`/`e` set and move down, Space cycles
+  (`cycleMark`), Delete clears, Shift+arrows or a drag select a range and one key sets it in ONE transaction
+  (`setMarks`; withdrawn rows are skipped in a multi-row range). A second click cycles; right-click opens
+  Present / Absent / Excused / Clear. Session header menu: "Mark everyone without a mark as Present"
+  (`markAllPresent`, one transaction, one history entry), take roll, edit date/label, clear, delete (the
+  confirmation states `markCount`). Pinned summary columns on the right: Excused (allowed), Unexcused (not
+  allowed), Total absences, Absence rate, Unexcused rate, Longest streak, Syllabus warning (chips "4 in a row:
+  F per syllabus", "3 in a row: 1 letter drop"; "(warning only)" is in screen-reader text, the tooltip, the
+  header and the Warnings card). Threshold highlights: `.over` with the tooltip "Above the unexcused-absence
+  threshold (N)" (Total: the total-absence threshold). Footer: per-session counts over active students.
+  The body is one innerHTML string (`lastRenderMs()` measures it).
+- Session manager (dialog): list with mark counts, add (a second session on a date needs a label), edit,
+  delete, and "Generate…" prefilled with Fall 2026 Tue/Thu (2026-09-03 to 2026-12-08, skipping 11-24 and
+  11-26), merged through `mergeSessions(existing, generated, course)`.
+- Roll call (dialog): one active student per row with P / A / E buttons; the keys P / A / E mark and advance
+  (one transaction per mark); "Mark remaining present" is one `markAllPresent` transaction.
+- Totals-only table: Absent (not allowed, unexcused) and Excused (allowed, instructor-approved) inputs checked
+  with `util.parseCount` (a refused value shows an inline error, is not saved, and survives re-renders);
+  "Sessions held so far" is the denominator; streaks read "n/a in totals mode".
+- Settings card: unexcused threshold (placeholder badge, "Mark confirmed"), optional total threshold (empty =
+  off), "Excused absences count toward a streak" (off by default; the help says the user changed it), the
+  consecutive-absence rule "(from the syllabus)" validated F > drop ≥ 2, and the text "Warnings never change
+  grades" / "Attendance does not feed Class/Project Participation".
+- Warnings card: `courseSummary().warnings` grouped per active student, with the streak dates, "Show in the
+  grid" and "Details".
+- Student detail (`GT.ui.openStudent`, js/ui/students.js): an Attendance section (hidden when off) with
+  Excused / Unexcused / Total / both rates / Longest streak, the basis ("Out of N recorded sessions", held
+  sessions without a mark), the fail/drop warning with its dates, the threshold warnings, the list of absences
+  by date (excused vs unexcused, "part of N in a row"), the dates without a mark, and "Open in Attendance".
+- Settings → Needs confirmation: the `unexcusedThreshold` item's current value also states the total-absence
+  threshold; "Open Attendance" goes to the attendance settings card.
+
+### 7.5 Sample data
+
+The SE 4351 sample (`GT.sample.loadInto`) marks all 26 sessions for every student: mostly present, random
+absences that never form a run of 3, exactly one run of 3 and one run of 4 **unexcused** ('A') absences
+(framed by presences, active students), one student with 5 scattered unexcused absences, and one active
+student with 4 **excused** absences never next to each other and no unexcused ones (note "Sample note:
+absences excused by the instructor (medical)"), so the Excused column is not all zeros. The warnings are the
+same with either `excusedCountsTowardStreak` setting: one 'drop', one 'fail'. Each case uses its own random
+stream, so every other value of the sample stays as it was. SE 6362 (off) gets random marks only.

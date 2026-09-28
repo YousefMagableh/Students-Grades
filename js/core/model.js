@@ -7,7 +7,9 @@
   var hasOwn = util.hasOwn;
   var isSafeKey = util.isSafeKey;
 
-  var SCHEMA_VERSION = 1;
+  // 2 (stage 3): attendance.excusedCountsTowardStreak defaults to false; older data is migrated
+  // (see migrateToV2).
+  var SCHEMA_VERSION = 2;
   var APP_ID = 'grade-tracker';
 
   // ---------------------------------------------------------------- letter scales (K6)
@@ -177,7 +179,16 @@
     },
     unexcusedThreshold: {
       label: 'Unexcused-absence threshold',
-      note: function () { return 'The syllabus mentions "a certain threshold" but does not state it. Placeholder: highlight above 3 unexcused absences.'; }
+      // Also covers the optional total-absence threshold (attendance.totalAbsenceThreshold, DECISIONS 3):
+      // the syllabus limit is on total absences, so both numbers need confirmation (no separate key).
+      note: function (c) {
+        var tail = ' Placeholder: highlight above 3 unexcused (not allowed) absences. The optional total-absence ' +
+          'threshold (excused + unexcused) needs confirming too; it is off until you set it.';
+        if (c.template === 'SE4351' || c.template === 'SE6362') {
+          return 'The syllabus says total absences should not exceed "a certain threshold" but does not give the number.' + tail;
+        }
+        return 'No attendance threshold on file for this course.' + tail;
+      }
     },
     passingLetter: {
       label: 'Passing grade (pass rate)',
@@ -240,8 +251,9 @@
       records: {},
       totals: {},
       totalsSessionsHeld: 0,
-      unexcusedThreshold: 3,
-      excusedCountsTowardStreak: true,
+      unexcusedThreshold: 3,              // T4 placeholder: highlight above this many unexcused absences
+      totalAbsenceThreshold: null,        // DECISIONS 3: optional limit on excused + unexcused; null = off
+      excusedCountsTowardStreak: false,   // DECISIONS 6: allowed (excused) absences do not count by default
       dropStreak: 3,
       failStreak: 4
     };
@@ -1027,6 +1039,12 @@
     return isSafeKey(id) && !seen[id] ? id : undefined;
   }
 
+  /** attendance.totalAbsenceThreshold (DECISIONS 3): a whole number >= 0, or null (off, the default)
+   * for anything else (missing, negative, fractional, text). */
+  function normalizeTotalAbsenceThreshold(x) {
+    return util.isSaneNumber(x) && x >= 0 && Math.floor(x) === x ? x : null;
+  }
+
   function normalizeCourse(raw) {
     if (!util.isPlainObject(raw)) throw new Error('Course data is not an object.');
     var template = typeof raw.template === 'string' && hasOwn(TEMPLATES, raw.template) ? raw.template : 'custom';
@@ -1126,7 +1144,10 @@
     }
     att.totalsSessionsHeld = Math.max(0, num(ra.totalsSessionsHeld, 0));
     att.unexcusedThreshold = Math.max(0, num(ra.unexcusedThreshold, 3));
-    att.excusedCountsTowardStreak = ra.excusedCountsTowardStreak !== false;
+    att.totalAbsenceThreshold = normalizeTotalAbsenceThreshold(ra.totalAbsenceThreshold);
+    // DECISIONS 6: false unless explicitly turned on (a missing field is false). A true saved before
+    // schema 2 is the old default, and normalizeState resets it (migrateToV2).
+    att.excusedCountsTowardStreak = ra.excusedCountsTowardStreak === true;
     att.dropStreak = Math.max(1, num(ra.dropStreak, 3));
     att.failStreak = Math.max(1, num(ra.failStreak, 4));
     c.attendance = att;
@@ -1160,6 +1181,28 @@
     return c;
   }
 
+  /** Schema 1 -> 2 (stage 3, DECISIONS 6). Schema 1 stored attendance.excusedCountsTowardStreak: true
+   * on every course (the old default), and no screen could change it, so a stored true was never the
+   * TA's choice. It becomes false, the new default: only unexcused absences make a streak. The change
+   * is logged once in the course history (source 'system'). It affects warnings only, never a grade.
+   * Returns true when the course changed. */
+  function migrateToV2(course, isoNow) {
+    var att = course && util.isPlainObject(course.attendance) ? course.attendance : null;
+    if (!att || att.excusedCountsTowardStreak !== true) return false;
+    att.excusedCountsTowardStreak = false;
+    if (!Array.isArray(course.history)) course.history = [];
+    course.history.push({
+      id: util.uid('h'), ts: isoNow || util.nowIso(), source: 'system', kind: 'settings',
+      studentId: null, studentName: null, teamId: null, teamName: null,
+      field: 'Excused absences count toward a streak', fieldKey: 'attendance.excusedCountsTowardStreak',
+      oldValue: 'yes', newValue: 'no',
+      note: 'App update: excused (allowed, instructor-approved) absences no longer count toward a ' +
+        'consecutive-absence streak by default. The old "yes" was the earlier default, not a choice you made. ' +
+        'To count them again, tick "Excused absences count toward a streak" in the Attendance tab.'
+    });
+    return true;
+  }
+
   function normalizeState(raw) {
     if (!util.isPlainObject(raw)) throw new Error('Not a Grade Tracker data file (expected a JSON object).');
     if (raw.app !== APP_ID) {
@@ -1179,6 +1222,9 @@
       seen[n.id] = true;
       return n;
     });
+    // A missing or unreadable version is treated as the oldest one.
+    var fromVersion = typeof raw.schemaVersion === 'number' && isFinite(raw.schemaVersion) ? raw.schemaVersion : 0;
+    if (fromVersion < 2) courses.forEach(function (c) { migrateToV2(c); });
     var ui = util.isPlainObject(raw.ui) ? raw.ui : {};
     var meta = util.isPlainObject(raw.meta) ? raw.meta : {};
     var out = {
@@ -1233,6 +1279,10 @@
     if (obj.kind === 'backup' && obj.app !== APP_ID) throw new Error('This file is not a Grade Tracker backup.');
     // A wrapped backup carries the app marker on the envelope; a bare state must carry its own.
     if (rawState !== obj && rawState.app === undefined) rawState = Object.assign({ app: APP_ID }, rawState);
+    // ... and an inner state without its own version takes the envelope's (it decides migrations).
+    if (rawState !== obj && typeof rawState.schemaVersion !== 'number' && typeof obj.schemaVersion === 'number') {
+      rawState = Object.assign({}, rawState, { schemaVersion: obj.schemaVersion });
+    }
     var state = normalizeState(rawState);
     return {
       state: state,
@@ -1320,8 +1370,10 @@
     splitAssessment: splitAssessment,
     renumberByName: renumberByName,
     deleteStudent: deleteStudent,
+    normalizeTotalAbsenceThreshold: normalizeTotalAbsenceThreshold,
     normalizeCourse: normalizeCourse,
     normalizeState: normalizeState,
+    migrateToV2: migrateToV2,
     wrapBackup: wrapBackup,
     readBackup: readBackup,
     duplicateCourse: duplicateCourse,

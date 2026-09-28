@@ -619,10 +619,12 @@
       if (!typing && !mod && !e.altKey && e.key === '?') { e.preventDefault(); showShortcuts(); }
     });
 
+    // Leaving the page (reload, close, navigate, switch tab): an IndexedDB save started now may not commit
+    // before the page unloads, so flushOnLeave() also writes unsaved changes synchronously (store.js).
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'hidden') store.flush();
+      if (document.visibilityState === 'hidden') store.flushOnLeave();
     });
-    root.addEventListener('pagehide', function () { store.flush(); });
+    root.addEventListener('pagehide', function () { store.flushOnLeave(); });
     root.addEventListener('beforeunload', function (e) {
       var s = store.saveStatus();
       if (s.backend === 'memory' && hasAnyData()) {
@@ -698,6 +700,11 @@
           GT.storage.save = (function (orig) {
             return function (st) { return loadProblem ? Promise.resolve() : orig(st); };
           })(GT.storage.save);
+          if (GT.storage.saveSync) {
+            GT.storage.saveSync = (function (orig) {
+              return function (st) { return loadProblem ? false : orig(st); };
+            })(GT.storage.saveSync);
+          }
         }
         store.subscribe(function () { requestRender(); });
         bindShell();

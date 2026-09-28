@@ -122,7 +122,7 @@ test('names are obviously fake: "Student NN" + NATO first names, No in name orde
     const byName = calc.sortStudents(course, null, 'name', 'asc').map((s) => s.no);
     assert.deepEqual(byName, course.students.map((_, i) => i + 1));
     const noted = course.students.filter((s) => s.notes !== '');
-    assert.ok(noted.length >= 1 && noted.length <= 3, 'a couple of notes');
+    assert.ok(noted.length >= 1 && noted.length <= 4, 'a few notes');
     for (const s of noted) assert.match(s.notes, /^Sample note: /);
   }
 });
@@ -328,6 +328,25 @@ test('attendance SE4351: special streak cases, no other streak of 3+', () => {
   assert.ok(share('P') > 0.85 && share('P') < 0.97, `present ${share('P')}`);
   assert.ok(share('A') > 0.02 && share('E') > 0.005);
   assert.equal(course.attendance.mode, 'per-session');
+});
+
+test('attendance SE4351: one active student with 4 excused (allowed) absences, never two in a row, no unexcused', () => {
+  const { course } = loaded('SE4351');
+  const rows = course.students.map((s) => ({ s, marks: marksOf(course, s) }));
+  const planted = rows.filter((r) => /excused by the instructor/.test(r.s.notes));
+  assert.equal(planted.length, 1);
+  const { s, marks } = planted[0];
+  assert.equal(s.status, 'active');
+  assert.equal(marks.filter((m) => m === 'E').length, 4);
+  assert.equal(marks.filter((m) => m === 'A').length, 0);
+  assert.ok(!marks.join('').includes('EE'), marks.join(''));
+  assert.deepEqual(course.attendance.totals[s.id], { absent: 0, excused: 4 });
+  // Its own role: not one of the streak, scattered, withdrawn or override students.
+  assert.equal(longestStreak(marks), 1);
+  assert.ok(!course.scores[s.id] || !Object.values(course.scores[s.id]).some((e) => e.override));
+  // The small dataset and a course without sessions have no such student.
+  assert.ok(!loaded('SE6362').course.students.some((x) => /excused/.test(x.notes)));
+  assert.ok(!loaded('custom').course.students.some((x) => /excused/.test(x.notes)));
 });
 
 test('attendance SE6362: filled although the mode is off, no streak of 3+', () => {

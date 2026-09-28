@@ -795,8 +795,14 @@
         var p = model.findAssessment(course, 'a_paper');
         return p ? p.name + ' ' + num(p.weight) + '%' : 'No term paper item';
       }
-      case 'unexcusedThreshold':
-        return 'Highlight students with more than ' + num(course.attendance ? course.attendance.unexcusedThreshold : 3) + ' unexcused absences';
+      case 'unexcusedThreshold': {
+        // The placeholder also covers the optional total-absence threshold (DECISIONS 3).
+        var att = course.attendance || {};
+        var tt = typeof att.totalAbsenceThreshold === 'number' ? att.totalAbsenceThreshold : null;
+        return 'Highlight students with more than ' + num(typeof att.unexcusedThreshold === 'number' ? att.unexcusedThreshold : 3) + ' unexcused absences' +
+          ' · Total-absence threshold: ' + (tt === null ? 'off' : 'more than ' + num(tt) + ' absences in total') +
+          (att.mode === 'off' || !att.mode ? ' · Attendance is off for this course' : '');
+      }
       case 'passingLetter':
         return s.passingLetter + ' or better counts as passing';
       default:
@@ -811,7 +817,7 @@
       go = '<button type="button" class="btn btn-sm btn-ghost" data-act="ph-goto" data-key="' + esc(p.key) + '" data-field="ph:' + esc(p.key) + ':goto">' +
         'Show setting' + icon('chevron-right') + '</button>';
     } else if (p.key === 'unexcusedThreshold' && GT.views.attendance) {
-      go = '<button type="button" class="btn btn-sm btn-ghost" data-act="open-view" data-view="attendance" data-field="ph:' + esc(p.key) + ':goto">' +
+      go = '<button type="button" class="btn btn-sm btn-ghost" data-act="open-view" data-view="attendance" data-section="settings" data-field="ph:' + esc(p.key) + ':goto">' +
         'Open Attendance' + icon('chevron-right') + '</button>';
     }
     return '<li class="set-ph-item" data-ph="' + esc(p.key) + '">' +
@@ -2124,7 +2130,12 @@
       case 'ph-confirm': setConfirmed(key, true); break;
       case 'ph-unconfirm': setConfirmed(key, false); break;
       case 'ph-goto': gotoPlaceholder(key); break;
-      case 'open-view': if (GT.app && GT.app.navigate) GT.app.navigate(b.getAttribute('data-view')); break;
+      case 'open-view':
+        if (GT.app && GT.app.navigate) {
+          var sec = b.getAttribute('data-section');
+          GT.app.navigate(b.getAttribute('data-view'), sec ? { section: sec } : undefined);
+        }
+        break;
       case 'dup-course': if (a.duplicateCourse) a.duplicateCourse(); break;
       case 'del-course': if (a.deleteCourse) a.deleteCourse(); break;
       case 'add-asmt': addAssessment(); break;

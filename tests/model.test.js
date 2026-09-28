@@ -61,7 +61,8 @@ describe('default state (C1, C2, C4)', () => {
   test('has SE 4351 and SE 6362, no students, SE 4351 active', () => {
     const st = model.createDefaultState();
     assert.equal(st.app, 'grade-tracker');
-    assert.equal(st.schemaVersion, 1);
+    assert.equal(st.schemaVersion, 2);
+    assert.equal(model.SCHEMA_VERSION, 2);
     assert.equal(st.courses.length, 2);
     const [a, b] = st.courses;
     assert.equal(a.code, 'SE 4351');
@@ -205,10 +206,17 @@ describe('attendance defaults (T1, T2, T4, T5)', () => {
     assert.deepEqual(att.sessions.map((s) => s.date), FALL_2026_SESSIONS);
   });
 
-  test('attendance settings defaults: threshold 3, excused counts toward streak, streaks 3 and 4, no records', () => {
+  test('attendance settings defaults: threshold 3, total threshold off, excused do NOT count toward a streak (DECISIONS 6), streaks 3 and 4, no records', () => {
+    for (const tpl of ['SE4351', 'SE6362', 'custom']) {
+      const a = course(tpl).attendance;
+      assert.equal(a.excusedCountsTowardStreak, false, tpl);
+      assert.equal(a.totalAbsenceThreshold, null, tpl);
+    }
+    assert.equal(model.defaultAttendance('off', []).excusedCountsTowardStreak, false);
+    assert.equal(model.defaultAttendance('off', []).totalAbsenceThreshold, null);
     const att = course('SE4351').attendance;
     assert.equal(att.unexcusedThreshold, 3);
-    assert.equal(att.excusedCountsTowardStreak, true);
+    assert.equal(att.excusedCountsTowardStreak, false);
     assert.equal(att.dropStreak, 3);
     assert.equal(att.failStreak, 4);
     assert.deepEqual(att.records, {});
@@ -346,7 +354,7 @@ describe('normalizeState', () => {
         students: [{ lastName: 'Student 01', firstName: 'Alpha' }] }]
     });
     assert.equal(st.app, 'grade-tracker');
-    assert.equal(st.schemaVersion, 1);
+    assert.equal(st.schemaVersion, 2);
     assert.equal(st.courses.length, 1);
     const c = st.courses[0];
     assert.ok(typeof c.id === 'string' && c.id.length > 0);
@@ -366,7 +374,8 @@ describe('normalizeState', () => {
     assert.ok(Array.isArray(c.attendance.sessions));
     assert.deepEqual(c.attendance.records, {});
     assert.equal(c.attendance.unexcusedThreshold, 3);
-    assert.equal(c.attendance.excusedCountsTowardStreak, true);
+    assert.equal(c.attendance.excusedCountsTowardStreak, false, 'a missing field is false (DECISIONS 6)');
+    assert.equal(c.attendance.totalAbsenceThreshold, null, 'a missing field is off');
     assert.deepEqual(sorted(Object.keys(c.placeholders)), sorted(BASE_KEYS));
     Object.keys(c.placeholders).forEach((k) => assert.equal(c.placeholders[k].confirmed, false));
     const s = c.students[0];
@@ -377,6 +386,28 @@ describe('normalizeState', () => {
     assert.equal(st.ui.theme, 'system');
     assert.equal(st.ui.privacy, false);
     assert.equal(st.meta.lastBackupAt, null);
+  });
+
+  test('attendance: excusedCountsTowardStreak only true when stored as true; totalAbsenceThreshold a whole number >= 0 or null', () => {
+    const read = (attendance) => model.normalizeCourse({ template: 'SE4351', attendance }).attendance;
+    assert.equal(read({}).excusedCountsTowardStreak, false);
+    assert.equal(read({ excusedCountsTowardStreak: true }).excusedCountsTowardStreak, true);
+    for (const v of [false, 'yes', 1, null]) assert.equal(read({ excusedCountsTowardStreak: v }).excusedCountsTowardStreak, false, String(v));
+    assert.equal(read({}).totalAbsenceThreshold, null);
+    assert.equal(read({ totalAbsenceThreshold: 6 }).totalAbsenceThreshold, 6);
+    assert.equal(read({ totalAbsenceThreshold: 0 }).totalAbsenceThreshold, 0);
+    for (const v of [-1, 2.5, '6', NaN, Infinity, 1e7, true, {}, null]) {
+      assert.equal(read({ totalAbsenceThreshold: v }).totalAbsenceThreshold, null, String(v));
+    }
+    assert.equal(model.normalizeTotalAbsenceThreshold(4), 4);
+    assert.equal(model.normalizeTotalAbsenceThreshold(undefined), null);
+    // A fresh course survives a round trip unchanged.
+    const c = course('SE4351');
+    c.attendance.totalAbsenceThreshold = 5;
+    c.attendance.excusedCountsTowardStreak = true;
+    assert.deepEqual(model.normalizeCourse(JSON.parse(JSON.stringify(c))).attendance, c.attendance);
+    const d = course('SE4351');
+    assert.deepEqual(model.normalizeCourse(JSON.parse(JSON.stringify(d))).attendance, d.attendance);
   });
 
   test('graduate course with no letter scale gets the graduate default', () => {
@@ -436,7 +467,7 @@ describe('backup files (R4)', () => {
     const w = model.wrapBackup(st, '2026-09-28T12:00:00.000Z');
     assert.equal(w.app, 'grade-tracker');
     assert.equal(w.kind, 'backup');
-    assert.equal(w.schemaVersion, 1);
+    assert.equal(w.schemaVersion, 2);
     assert.equal(w.exportedAt, '2026-09-28T12:00:00.000Z');
     assert.equal(w.state, st);
   });
@@ -470,6 +501,106 @@ describe('backup files (R4)', () => {
     assert.throws(() => model.readBackup({ hello: 'world' }), Error);
     assert.throws(() => model.readBackup({ app: 'other-app', courses: [] }), Error);
     assert.throws(() => model.readBackup({ app: 'other-app', kind: 'backup', schemaVersion: 1, state: roundTrip(st) }), Error);
+  });
+});
+
+describe('schema 2 migration: excused absences stop counting toward a streak (DECISIONS 6, review S3-SPEC-2 / R3-C3)', () => {
+  // What stages 1-2 saved: schema 1, and excusedCountsTowardStreak: true on every course (the old
+  // default, which no screen could change).
+  function schema1State() {
+    const st = roundTrip(model.createDefaultState());
+    st.schemaVersion = 1;
+    st.courses.forEach((c) => { c.attendance.excusedCountsTowardStreak = true; });
+    addStudent(st.courses[0], 'Student 01', 'Alpha');
+    return st;
+  }
+  const without = (c) => {
+    const x = roundTrip(c);
+    delete x.history;
+    delete x.attendance.excusedCountsTowardStreak;
+    return x;
+  };
+
+  test('a schema-1 state (IndexedDB) loads with false in every course, one system history entry each, nothing else changed', () => {
+    const raw = schema1State();
+    const st = model.normalizeState(roundTrip(raw));
+    assert.equal(st.schemaVersion, 2);
+    st.courses.forEach((c, i) => {
+      assert.equal(c.attendance.excusedCountsTowardStreak, false, c.code);
+      assert.equal(c.history.length, 1, c.code);
+      const h = c.history[0];
+      assert.deepEqual([h.source, h.kind, h.field, h.fieldKey, h.oldValue, h.newValue, h.studentId],
+        ['system', 'settings', 'Excused absences count toward a streak', 'attendance.excusedCountsTowardStreak', 'yes', 'no', null]);
+      assert.match(h.note, /no longer count toward a consecutive-absence streak/);
+      assert.match(h.note, /not a choice you made/);
+      assert.ok(typeof h.id === 'string' && typeof h.ts === 'string');
+      assert.deepEqual(without(c), without(model.normalizeCourse(roundTrip(raw.courses[i]))), 'only the setting changed');
+    });
+    // Loading the migrated state again changes nothing (schema 2 now): no second entry.
+    const again = model.normalizeState(roundTrip(st));
+    assert.deepEqual(again, st);
+  });
+
+  test('a state without a schemaVersion counts as schema 1', () => {
+    const raw = schema1State();
+    delete raw.schemaVersion;
+    const st = model.normalizeState(raw);
+    assert.deepEqual(st.courses.map((c) => c.attendance.excusedCountsTowardStreak), [false, false]);
+  });
+
+  test('schema 2: a stored true is the TA\'s own choice and is kept, with no history entry', () => {
+    const raw = schema1State();
+    raw.schemaVersion = 2;
+    const st = model.normalizeState(raw);
+    assert.deepEqual(st.courses.map((c) => c.attendance.excusedCountsTowardStreak), [true, true]);
+    assert.deepEqual(st.courses.map((c) => c.history.length), [0, 0]);
+  });
+
+  test('schema 1 with false or no setting: nothing to migrate, no history entry', () => {
+    const raw = schema1State();
+    raw.courses[0].attendance.excusedCountsTowardStreak = false;
+    delete raw.courses[1].attendance.excusedCountsTowardStreak;
+    const st = model.normalizeState(raw);
+    assert.deepEqual(st.courses.map((c) => c.attendance.excusedCountsTowardStreak), [false, false]);
+    assert.deepEqual(st.courses.map((c) => c.history.length), [0, 0]);
+  });
+
+  test('restoring a schema-1 backup file migrates too; a schema-2 backup keeps the setting', () => {
+    const old = { app: 'grade-tracker', kind: 'backup', schemaVersion: 1, exportedAt: '2026-09-20T12:00:00.000Z', state: schema1State() };
+    const r = model.readBackup(roundTrip(old));
+    assert.deepEqual(r.state.courses.map((c) => c.attendance.excusedCountsTowardStreak), [false, false]);
+    assert.equal(r.state.schemaVersion, 2);
+    // The inner state carries the version; when it lacks one, the envelope's decides.
+    const inner = schema1State();
+    delete inner.schemaVersion;
+    const v2 = model.readBackup({ app: 'grade-tracker', kind: 'backup', schemaVersion: 2, state: roundTrip(inner) });
+    assert.deepEqual(v2.state.courses.map((c) => c.attendance.excusedCountsTowardStreak), [true, true]);
+    const v1 = model.readBackup({ app: 'grade-tracker', kind: 'backup', schemaVersion: 1, state: roundTrip(inner) });
+    assert.deepEqual(v1.state.courses.map((c) => c.attendance.excusedCountsTowardStreak), [false, false]);
+    // A backup written now (schema 2) with the box ticked restores ticked.
+    const now = roundTrip(model.createDefaultState());
+    now.courses[0].attendance.excusedCountsTowardStreak = true;
+    const back = model.readBackup(roundTrip(model.wrapBackup(now)));
+    assert.equal(back.state.courses[0].attendance.excusedCountsTowardStreak, true);
+    assert.deepEqual(back.state.courses[0].history, []);
+  });
+
+  test('a newer schema is still refused', () => {
+    const raw = schema1State();
+    raw.schemaVersion = 3;
+    assert.throws(() => model.normalizeState(raw), /newer version of Grade Tracker \(schema 3\)/);
+  });
+
+  test('migrateToV2 returns whether it changed the course', () => {
+    const c = course('SE4351');
+    assert.equal(model.migrateToV2(c), false);
+    assert.deepEqual(c.history, []);
+    c.attendance.excusedCountsTowardStreak = true;
+    assert.equal(model.migrateToV2(c, '2026-09-28T12:00:00.000Z'), true);
+    assert.equal(c.attendance.excusedCountsTowardStreak, false);
+    assert.equal(c.history[0].ts, '2026-09-28T12:00:00.000Z');
+    assert.equal(model.migrateToV2(null), false);
+    assert.equal(model.migrateToV2({}), false);
   });
 });
 
@@ -1360,6 +1491,20 @@ describe('placeholder notes and scoping (review F5, second review)', () => {
 
   test('projectSplit applies to every course', () => {
     ['SE4351', 'SE6362', 'custom'].forEach((tpl) => assert.ok(model.placeholderKeys(course(tpl)).includes('projectSplit'), tpl));
+  });
+
+  test('unexcusedThreshold note also covers the optional total-absence threshold (DECISIONS 3, no new key)', () => {
+    ['SE4351', 'SE6362', 'custom'].forEach((tpl) => {
+      const c = course(tpl);
+      const note = model.placeholderInfo(c, 'unexcusedThreshold').note;
+      assert.match(note, /above 3 unexcused \(not allowed\) absences/, tpl);
+      assert.match(note, /total-absence threshold \(excused \+ unexcused\)/, tpl);
+      assert.match(note, /off until you set it/, tpl);
+      assert.ok(!model.placeholderKeys(c).includes('totalAbsenceThreshold'), tpl);
+    });
+    assert.match(model.placeholderInfo(course('SE4351'), 'unexcusedThreshold').note, /syllabus says total absences should not exceed "a certain threshold"/);
+    assert.ok(!/syllabus/i.test(model.placeholderInfo(course('custom'), 'unexcusedThreshold').note), 'custom courses do not quote a syllabus');
+    assert.ok(!('totalAbsenceThreshold' in model.PLACEHOLDERS));
   });
 });
 

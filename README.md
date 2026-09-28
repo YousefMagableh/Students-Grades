@@ -50,6 +50,64 @@ Rows never jump while you edit: a sort is applied once, like in Excel. When the 
 the order, **Order changed: re-sort** appears in the toolbar. Each score column's ⋯ menu can fill the empty
 cells, set every active student to one value, or clear the column, each in one step you can undo.
 
+## Attendance
+
+Open the **Attendance** tab. Each course has its own mode, chosen at the top of the tab:
+
+- **Per session** (SE 4351): mark each student **P** Present, **A** Absent (*not allowed, unexcused*) or
+  **E** Excused (*allowed, instructor-approved*) for each class meeting.
+- **Totals only**: type each student's number of unexcused and excused absences, and how many sessions were
+  held so far. Only whole numbers (0 or more) are accepted.
+- **Off** (SE 6362 by default): nothing is tracked. **Turn on attendance** switches it on at any time.
+  Changing the mode never deletes anything: switching back shows the earlier marks again.
+
+Taking roll in class:
+
+- **Take roll…** shows one student per row with big P / A / E buttons. Press `P`, `A` or `E` on the keyboard
+  and the next student is selected. **Mark remaining present** gives everyone still without a mark a P.
+- In the grid, click a session's date for **Mark everyone without a mark as Present** (usually after marking
+  the absent students), clear the session, edit its date or label, or delete it.
+- In a cell: type `P`, `A` or `E` (the cursor moves down), Space cycles, Delete clears. Shift+arrows select
+  several cells, and one key sets all of them. Everything can be undone with Ctrl+Z.
+- **Sessions…** adds, edits and deletes class dates. **Generate…** fills a semester (for example every
+  Tuesday and Thursday, skipping holidays) and never removes a session or its marks.
+
+How the numbers are counted:
+
+- A session counts as **held** once at least one student has a mark in it. Sessions nobody has marked yet
+  (future dates, or a day the roll was not taken) are ignored.
+- A student's **recorded sessions** are the held sessions where that student has a mark. A held session
+  where the student has no mark is not counted (the student detail lists those dates).
+- **Total absences** = unexcused + excused. **Absence rate** = total absences ÷ recorded sessions, and
+  **unexcused rate** = unexcused absences ÷ recorded sessions.
+- **Consecutive absences** (from the syllabus): 3 in a row means one letter grade drop, 4 in a row means F.
+  Only **unexcused** absences make a run: an excused (allowed) absence breaks it. This is the default because
+  you asked for it (allowed absences should not count against the student); the original request counted
+  every absence. To count excused absences too, tick **Excused absences count toward a streak** in the
+  Attendance settings. A present mark, or a held session without a mark, also breaks a run.
+- **Unexcused-absence threshold**: students with **more than** this many unexcused absences are highlighted.
+  The syllabus mentions a threshold without the number, so the value (3 for now) is marked *needs
+  confirmation*.
+- **Total-absence threshold** (optional, off by default): highlights students with more than this many
+  absences in total (excused + unexcused). It also needs confirming.
+- In totals-only mode the dates are unknown, so the consecutive-absence warnings are *n/a*.
+
+The warnings are **warnings only**: nothing ever changes a grade automatically, because the policy has
+exceptions (for example medical or family reasons). Attendance also never fills in Class/Project
+Participation; the instructor sets it in the Grades tab.
+
+Where the absences show up:
+
+- **Grades tab**: three columns next to every student, *Excused (allowed)*, *Unexcused (not allowed)* and
+  *Total absences*, also in the **Meeting view**. A warning icon on the Unexcused cell marks a streak or the
+  threshold; hover it for the reason. The **Columns** menu hides or shows each one. They are hidden while
+  attendance is off.
+- **Student details** (the person icon beside a student's No in the Grades tab, right-click → *Open student
+  details*, or *Details* in Students & Teams): the counts and rates, the warnings with their dates, and
+  every absence by date, excused or unexcused.
+- **Attendance tab**: the summary columns at the right of the grid, and a **Warnings** list with a button that
+  jumps to the student's row.
+
 ## Development
 
 - `npm test` runs the unit tests (Node 22, no dependencies).

@@ -42,8 +42,12 @@
   // Identity column widths (px). The sticky offsets in css/grid.css (.sc1 … .sc4) match these; the
   // Meeting view (larger text, no Team column) uses WM and its own offsets (.gt-grid.meeting .sc2/.sc3).
   var W = { no: 52, last: 106, first: 136, team: 70, total: 74, rank: 54, pct: 90, diff: 62 };
-  var WM = { no: 56, last: 128, first: 132, total: 84, rank: 60 };
+  var WM = { no: 56, last: 128, first: 132, total: 70, rank: 48, final: 90 };
   var HEAD_PAD = 17;   // header cell padding (2 × 8 px) plus slack
+  // Meeting view: header cells have 6 px side padding (css/grid.css .gt-grid.meeting thead th) and a
+  // placeholder badge may wrap under its text, so the decision columns (Participation, Suggested, Final
+  // letter, Rank) stay on screen at 1280 px with the three absence columns shown.
+  var HEAD_PAD_MEET = 13;
   var BADGE_W = 21;    // compact placeholder badge in a header (with its margin)
   var LOCKED_MSG = 'Scores are finalized. Unlock them to edit.';
   var NOTE_MAX = 200;        // characters of the Finalize note (the banner shows at most NOTE_SHOWN)
@@ -175,6 +179,26 @@
 
   function attSummary(course, sid) {
     try { return GT.attendance.summary(course, sid) || null; } catch (e) { return null; }
+  }
+
+  /** Attendance summary by student id for one pass over many rows (a render, a copied range).
+   * GT.attendance.courseSummary() finds the held sessions once for everyone; summary() per row would rescan
+   * every student's marks for each row (quadratic: about 45 ms at 300 students). Computed on first use;
+   * a student missing from it falls back to summary(). */
+  function attLookup(course) {
+    var byStudent = null;
+    var cache = Object.create(null);
+    return function (sid) {
+      if (byStudent === null) {
+        byStudent = false;
+        if (typeof GT.attendance.courseSummary === 'function') {
+          try { byStudent = GT.attendance.courseSummary(course).byStudent || false; } catch (e) { byStudent = false; }
+        }
+      }
+      if (byStudent && Object.prototype.hasOwnProperty.call(byStudent, sid)) return byStudent[sid] || null;
+      if (!(sid in cache)) cache[sid] = attSummary(course, sid);
+      return cache[sid];
+    };
   }
 
   function whole(x) { return typeof x === 'number' && isFinite(x) ? x : 0; }
@@ -458,6 +482,7 @@
     var meet = prefs.meeting;
     var locked = isFinalized(course);
     var w = meet ? WM : W;
+    var pad = meet ? HEAD_PAD_MEET : HEAD_PAD;
     var cols = [
       { key: 'no', kind: 'no', label: 'No', edit: 'text', sticky: 1, width: w.no, num: true },
       { key: 'last', kind: 'last', label: 'Last Name', edit: 'text', sticky: 2, width: w.last },
@@ -473,11 +498,14 @@
     };
     var badgeW = function (key) { return key && !model.isConfirmed(course, key) ? BADGE_W : 0; };
     var rawWidth = function (a, list) {
-      var maxLine = subW('max ' + num(a.maxScore, 4) + (list.length ? ' · list' : '')) + badgeW('maxScores');
+      // Meeting view: the maxScores badge may wrap under "max 100" (css/grid.css), and "fill in the
+      // meeting" wraps at its spaces.
+      var maxLine = subW('max ' + num(a.maxScore, 4) + (list.length ? ' · list' : '')) + (meet ? 0 : badgeW('maxScores'));
       // "10% · team" may wrap before "· team" (css/grid.css .hs-w).
       var weightLine = Math.max(subW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a)), a.teamGraded ? subW('· team') : 0);
-      var min = meet ? 72 : 64;
-      return clamp(Math.max(longestWordW(a.name), maxLine, weightLine, meet && a.category === 'participation' ? subW('fill in the meeting') : 0) + HEAD_PAD, min, 164);
+      // Meeting view: a short name stays on one line ("Project" / "I" would read badly).
+      var name = meet && String(a.name).length <= 12 ? nameW(a.name) : longestWordW(a.name);
+      return clamp(Math.max(name, maxLine, weightLine) + pad, 64, 164);
     };
     // Weighted headers read "Project I 10%": a short name stays on one line, the weight may wrap.
     var weightedWidth = function (a) {
@@ -499,14 +527,18 @@
       Object.keys(extra || {}).forEach(function (k) { c[k] = extra[k]; });
       return c;
     };
-    var suggested = simple('letter', 'letter', 'Suggested', Math.max(64, nameW('Suggested') + badgeW('letterScale') + HEAD_PAD), { ro: true });
-    var finalCol = simple('final', 'final', 'Final letter', meet ? 96 : 86, { edit: 'letter', dd: true, toFill: meet });
+    // Meeting view: the letterScale badge may wrap under "Suggested".
+    var suggested = simple('letter', 'letter', 'Suggested', meet
+      ? Math.max(64, nameW('Suggested'), subW('from cutoffs')) + pad
+      : Math.max(64, nameW('Suggested') + badgeW('letterScale') + HEAD_PAD), { ro: true });
+    var finalCol = simple('final', 'final', 'Final letter', meet ? WM.final : 86, { edit: 'letter', dd: true, toFill: meet });
     var total = simple('total', 'total', 'Total', w.total, { ro: true, num: true });
     var rank = simple('rank', 'rank', 'Rank', w.rank, { ro: true, num: true });
     var att = [];
     if (attendanceAvailable(course)) {
-      // Header lines: "Excused" / "(allowed)", "Unexcused" / "(not allowed)" (kept on one line), "Total" / "absences".
-      var attW = function (a1, a2) { return clamp(Math.max(nameW(a1), nameW(a2)) + HEAD_PAD, 58, 130); };
+      // Header: the name, then a small line under it: "Excused" / "(allowed)", "Unexcused" / "(not allowed)",
+      // "Total" / "absences" (the small line is kept on one line).
+      var attW = function (a1, a2) { return clamp(Math.max(nameW(a1), subW(a2)) + pad, 58, 130); };
       if (prefs.cols.attExcused) att.push(simple('att:exc', 'attExc', 'Excused (allowed)', attW('Excused', '(allowed)'), { ro: true, num: true }));
       if (prefs.cols.attUnexcused) att.push(simple('att:unx', 'attUnx', 'Unexcused (not allowed)', attW('Unexcused', '(not allowed)'), { ro: true, num: true }));
       if (prefs.cols.attTotal) att.push(simple('att:tot', 'attTot', 'Total absences', attW('Total', 'absences'), { ro: true, num: true }));
@@ -951,12 +983,18 @@
         case 'rank': inner = 'Rank'; title = 'Rank among active students'; break;
         case 'pct': inner = 'Percentile'; title = 'Percentile among active students'; break;
         case 'diff': inner = '±Avg'; title = 'Difference from the class average (active students)'; break;
-        case 'attExc': inner = 'Excused <span class="nowrap">(allowed)</span>'; title = 'Excused absences: allowed (approved by the instructor)'; break;
+        case 'attExc':
+          inner = '<span class="h-name">Excused</span> <span class="h-sub nowrap">(allowed)</span>';
+          title = 'Excused absences: allowed (approved by the instructor)';
+          break;
         case 'attUnx':
-          inner = 'Unexcused <span class="nowrap">(not allowed)</span>';
+          inner = '<span class="h-name">Unexcused</span> <span class="h-sub nowrap">(not allowed)</span>';
           title = 'Unexcused absences: not allowed. They drive the threshold highlight and the consecutive-absence warnings (warnings only)';
           break;
-        case 'attTot': inner = 'Total absences'; title = 'Excused + unexcused absences (for information)'; break;
+        case 'attTot':
+          inner = '<span class="h-name">Total</span> <span class="h-sub nowrap">absences</span>';
+          title = 'Excused + unexcused absences (for information)';
+          break;
       }
       h += '<th role="columnheader" scope="col" data-c="' + i + '" class="' + cls + '"' + aria +
         (title ? ' title="' + esc(title) + '"' : '') + '>' + inner + '</th>';
@@ -968,6 +1006,13 @@
   function attCell(ctx, s, kind) {
     var sm = ctx.att ? ctx.att(s.id) : null;
     if (!sm) return { cls: '', body: '<span class="faint">—</span>', title: 'No attendance recorded' };
+    // Warnings cover active students only (STAGE3 §1, like the Attendance warnings list and its grid rows):
+    // a withdrawn student keeps the numbers but gets no warning icon, class or warning tooltip.
+    var wd = s.status === 'withdrawn';
+    var warning = wd ? null : sm.warning;
+    var over = !wd && !!sm.overThreshold;
+    var overT = !wd && !!sm.overTotalThreshold;
+    var WD_NOTE = 'Withdrawn: no attendance warning (warnings cover active students only)';
     var rec = whole(sm.recorded);
     var cls = '', body, title;
     if (kind === 'attExc') {
@@ -976,25 +1021,29 @@
     } else if (kind === 'attUnx') {
       body = String(whole(sm.unexcused));
       var tips = [whole(sm.unexcused) + ' unexcused (not allowed) absences in ' + plural(rec, 'recorded session')];
-      if (sm.warning === 'fail') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says F (warning only, the grade is not changed)');
-      else if (sm.warning === 'drop') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says one letter grade drop (warning only)');
-      if (sm.overThreshold) {
+      if (warning === 'fail') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says F (warning only, the grade is not changed)');
+      else if (warning === 'drop') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says one letter grade drop (warning only)');
+      if (over) {
         var th = ctx.course.attendance && typeof ctx.course.attendance.unexcusedThreshold === 'number' ? ' (' + ctx.course.attendance.unexcusedThreshold + ')' : '';
         tips.push('Above the unexcused-absence threshold' + th);
       }
-      if (sm.warning || sm.overThreshold) {
-        cls = ' is-att-warn' + (sm.warning === 'fail' ? ' is-att-fail' : '');
+      if (warning || over) {
+        cls = ' is-att-warn' + (warning === 'fail' ? ' is-att-fail' : '');
         body = '<span class="mk-att" aria-hidden="true">' + ui.icon('alert') + '</span><span class="sr-only">warning: </span>' + body;
+      } else if (wd && (sm.warning || sm.overThreshold)) {
+        tips.push(WD_NOTE);
       }
       title = tips.join('. ');
     } else {
       body = String(whole(sm.totalAbsences));
       title = whole(sm.totalAbsences) + ' absences in total (excused + unexcused) in ' + plural(rec, 'recorded session');
-      if (sm.overTotalThreshold) {
+      if (overT) {
         cls = ' is-att-warn';
         var tt = ctx.course.attendance && typeof ctx.course.attendance.totalAbsenceThreshold === 'number' ? ' (' + ctx.course.attendance.totalAbsenceThreshold + ')' : '';
         title += '. Above the total-absence threshold' + tt;
         body = '<span class="mk-att" aria-hidden="true">' + ui.icon('alert') + '</span><span class="sr-only">warning: </span>' + body;
+      } else if (wd && sm.overTotalThreshold) {
+        title += '. ' + WD_NOTE;
       }
     }
     return { cls: cls, body: body, title: title };
@@ -1505,11 +1554,7 @@
       return nos.join(', ') + (ids.length > 4 ? ' and ' + (ids.length - 4) + ' more' : '');
     };
     if (layout.cols.some(function (c) { return c.kind === 'attExc' || c.kind === 'attUnx' || c.kind === 'attTot'; })) {
-      var attCache = Object.create(null);
-      ctx.att = function (sid) {
-        if (!(sid in attCache)) attCache[sid] = attSummary(course, sid);
-        return attCache[sid];
-      };
+      ctx.att = attLookup(course);
     }
     // Band boundaries: sorted by Total, high to low, a rule sits above the first row of each new final
     // letter (active students only), so the bands read like the old sheet.
@@ -2531,7 +2576,8 @@
     ui.toast(label + ' is calculated and cannot be edited. Edit the raw scores instead.', { type: 'info', timeout: 3000 });
   }
 
-  function copyText(course, results, s, col) {
+  /** att: an attLookup(course) shared by the cells of one copy (optional). */
+  function copyText(course, results, s, col, att) {
     var rs = results.byId[s.id];
     var dec = decimalsOf(course);
     var wd = s.status === 'withdrawn';
@@ -2551,7 +2597,7 @@
       case 'attExc':
       case 'attUnx':
       case 'attTot': {
-        var sm = attendanceAvailable(course) ? attSummary(course, s.id) : null;
+        var sm = !attendanceAvailable(course) ? null : att ? att(s.id) : attSummary(course, s.id);
         if (!sm) return '';
         return String(whole(col.kind === 'attExc' ? sm.excused : col.kind === 'attUnx' ? sm.unexcused : sm.totalAbsences));
       }
@@ -2568,10 +2614,11 @@
     var rc = rectOf();
     if (!rc) return '';
     var course = cur(), results = res(), lines = [];
+    var att = attLookup(course); // computed only if an absence column is copied
     for (var r = rc.r1; r <= rc.r2; r++) {
       var s = model.findStudent(course, layout.students[r].id);
       var cells = [];
-      for (var c = rc.c1; c <= rc.c2; c++) cells.push(tsvField(s ? copyText(course, results, s, layout.cols[c]) : ''));
+      for (var c = rc.c1; c <= rc.c2; c++) cells.push(tsvField(s ? copyText(course, results, s, layout.cols[c], att) : ''));
       lines.push(cells.join('\t'));
     }
     return lines.join('\r\n');

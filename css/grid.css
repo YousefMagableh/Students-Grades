@@ -289,6 +289,10 @@
 .gt-grid.meeting th, .gt-grid.meeting td { height: 36px; }
 .gt-grid.meeting .sc2 { left: 56px; }   /* WM in grid.js */
 .gt-grid.meeting .sc3 { left: 184px; }
+/* Narrower headers (HEAD_PAD_MEET in grid.js), and a placeholder badge may wrap under "max 100", so the
+   decision columns (Participation, Suggested, Final letter, Rank) fit at 1280 px with the absence columns. */
+.gt-grid.meeting thead th { padding-left: 6px; padding-right: 6px; }
+.gt-grid.meeting thead .h-sub .hs { white-space: normal; }
 .gt-grid.meeting td.c-total { font-size: 15.5px; }
 .gt-grid.meeting td.to-fill { background-color: var(--to-fill); }
 .gt-grid.meeting td.to-fill.is-empty { outline: 1px dashed var(--to-fill-line); outline-offset: -5px; }

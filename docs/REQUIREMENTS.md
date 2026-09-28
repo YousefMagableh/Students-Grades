@@ -89,7 +89,7 @@ The mode is set per course: per-session, totals-only, or off.
   - Absence rate and unexcused rate are percentages of recorded sessions.
 - T4. Students above a configurable unexcused-absence threshold (**placeholder**) are highlighted.
 - T5. Consecutive-absence rule from the syllabus: 3 in a row means a one-letter drop, and 4 in a row means F. These are warnings only; grades never change automatically.
-  - Setting: whether excused absences count toward a streak. Default: yes.
+  - Setting: whether excused absences count toward a streak. Default: no: only unexcused absences make a streak (changed at the user's request, DECISIONS 6 / X7; the original request said yes).
 - T6. Attendance never feeds participation automatically.
 
 ## Statistics

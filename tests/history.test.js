@@ -543,13 +543,15 @@ describe('attendance', () => {
     const out = change(c, (co) => {
       co.attendance.mode = 'totals';
       co.attendance.unexcusedThreshold = 4;
-      co.attendance.excusedCountsTowardStreak = false;
+      co.attendance.totalAbsenceThreshold = 6;
+      co.attendance.excusedCountsTowardStreak = true;
       co.attendance.totals[alpha.id] = { absent: 2, excused: 1 };
     });
     assert.deepEqual(briefs(out), [
       ['settings', '', 'Attendance mode', 'Per session', 'Totals only'],
       ['settings', '', 'Unexcused-absence threshold', '3', '4'],
-      ['settings', '', 'Excused absences count toward a streak', 'yes', 'no'],
+      ['settings', '', 'Total-absence threshold', 'off', '6'],
+      ['settings', '', 'Excused absences count toward a streak', 'no', 'yes'],
       ['attendance', 'Student 01, Alpha', 'Absences (totals)', '', '2'],
       ['attendance', 'Student 01, Alpha', 'Excused (totals)', '', '1']
     ]);

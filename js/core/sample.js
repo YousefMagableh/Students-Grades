@@ -26,7 +26,8 @@
   var NOTES = {
     withdrawn: 'Sample note: withdrew mid-semester',
     override: 'Sample note: team agreed in writing to an unequal Project I split',
-    lateJoiner: 'Sample note: joined late'
+    lateJoiner: 'Sample note: joined late',
+    excused: 'Sample note: absences excused by the instructor (medical)'
   };
 
   function datasetKey(course) {
@@ -112,7 +113,7 @@
       incomplete: take(spec.incomplete),
       override: take(1)[0],
       lateJoiner: take(1)[0],
-      streak3: null, streak4: null, scattered: null
+      streak3: null, streak4: null, scattered: null, excused: null
     };
     if (spec.attendanceCases) {
       roles.streak3 = take(1)[0];
@@ -122,10 +123,21 @@
     return roles;
   }
 
+  /** The student with several excused absences (large dataset only), picked with its own random
+   * stream among the students without another role, so every other role and value stays as it was. */
+  function pickExcused(rng, roles, n) {
+    var taken = {};
+    roles.withdrawn.concat(roles.incomplete, [roles.override, roles.lateJoiner, roles.streak3, roles.streak4, roles.scattered])
+      .forEach(function (i) { if (i !== null && i !== undefined) taken[i] = true; });
+    var free = range(n).filter(function (i) { return !taken[i]; });
+    return free.length ? free[rng.int(0, free.length - 1)] : null;
+  }
+
   function studentNotes(i, roles, hasOverride) {
     if (i === roles.withdrawn[0]) return NOTES.withdrawn;
     if (hasOverride && i === roles.override) return NOTES.override;
     if (i === roles.lateJoiner) return NOTES.lateJoiner;
+    if (i === roles.excused) return NOTES.excused;
     return '';
   }
 
@@ -246,6 +258,8 @@
   // ---------------------------------------------------------------- attendance
 
   var P_PRESENT = 0.93, P_ABSENT = 0.05; // the remaining 2% are excused
+  /** Excused (allowed) absences of the "excused" sample student: never two in a row, no unexcused. */
+  var EXCUSED_COUNT = 4;
 
   /** Mostly present. Random absences never form a run of 3 or more; long runs are placed on purpose. */
   function randomMarks(rng, count) {
@@ -268,14 +282,15 @@
     marks[start + len] = 'P';
   }
 
-  /** All present except `count` unexcused absences, one per segment and never two in a row. */
-  function scatteredMarks(rng, total, count) {
+  /** All present except `count` absences marked `mark` (default 'A', unexcused), one per segment and
+   * never two in a row. */
+  function scatteredMarks(rng, total, count, mark) {
     var marks = [];
     for (var i = 0; i < total; i++) marks.push('P');
     for (var k = 0; k < count; k++) {
       var lo = Math.floor(k * total / count);
       var hi = Math.floor((k + 1) * total / count) - 2; // keeps a gap before the next segment
-      if (hi >= lo) marks[rng.int(lo, hi)] = 'A';
+      if (hi >= lo) marks[rng.int(lo, hi)] = mark || 'A';
     }
     return marks;
   }
@@ -290,11 +305,13 @@
     if (sessions.length) {
       var rng = ctx.stream('attendance');
       var cases = ctx.stream('attendance-cases');
+      var excusedRng = ctx.stream('attendance-excused'); // own stream: the other rows stay unchanged
       course.students.forEach(function (s, i) {
         var marks = randomMarks(rng, sessions.length); // always drawn to keep the stream aligned
         if (i === roles.streak3) placeRun(marks, cases, 3);
         else if (i === roles.streak4) placeRun(marks, cases, 4);
         else if (i === roles.scattered) marks = scatteredMarks(cases, sessions.length, 5);
+        else if (i === roles.excused) marks = scatteredMarks(excusedRng, sessions.length, EXCUSED_COUNT, 'E');
         var row = {}, absent = 0, excused = 0;
         sessions.forEach(function (ses, k) {
           row[ses.id] = marks[k];
@@ -325,6 +342,9 @@
     var teams = spec.teamSizes.map(function (_, t) { return model.createTeam('Team ' + (t + 1)); });
     var teamOf = assignTeams(stream('teams').shuffle(range(n)), spec.teamSizes, teams);
     var roles = pickRoles(stream('roles'), spec, n);
+    // Only a course with sessions gets attendance marks, so only then is there an excused student.
+    var hasSessions = !!(course.attendance && Array.isArray(course.attendance.sessions) && course.attendance.sessions.length);
+    if (spec.attendanceCases && hasSessions) roles.excused = pickExcused(stream('roles-excused'), roles, n);
     var p1 = model.findAssessment(course, 'a_p1');
     var hasOverride = !!(p1 && p1.teamGraded);
 

@@ -263,8 +263,25 @@
   var saveTimer = null;
   var saving = null;
   var dirtyWhileSaving = false;
+  var changeSeq = 0;     // counts changes that need saving
+  var savedSeq = 0;      // changeSeq included in the last successful save
+  var emergencySeq = 0;  // changeSeq included in the last emergency copy (flushOnLeave)
+  var lastStamp = '';
+
+  /** meta.lastSavedAt for a save: now, but always later than the previous one, so storage.load() can tell
+   * which of two copies is newer even when both were taken in the same millisecond. */
+  function saveStamp() {
+    var ts = util.nowIso();
+    if (lastStamp && ts <= lastStamp) {
+      var t = Date.parse(lastStamp);
+      ts = isFinite(t) ? new Date(t + 1).toISOString() : ts;
+    }
+    lastStamp = ts;
+    return ts;
+  }
 
   function scheduleSave() {
+    changeSeq++;
     status.phase = 'pending';
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(function () { saveTimer = null; doSave(); }, SAVE_DELAY);
@@ -274,9 +291,11 @@
     if (!state) return Promise.resolve();
     if (saving) { dirtyWhileSaving = true; return saving; }
     status.phase = 'saving';
-    var ts = util.nowIso();
+    var seq = changeSeq;
+    var ts = saveStamp();
     state.meta.lastSavedAt = ts;
     saving = GT.storage.save(state).then(function () {
+      if (seq > savedSeq) savedSeq = seq;
       // A change made while this save ran (timer pending or flushed) is not saved yet.
       status.phase = saveTimer || dirtyWhileSaving ? 'pending' : 'saved';
       status.at = ts;
@@ -300,6 +319,24 @@
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     if (hadTimer || status.phase === 'pending' || status.phase === 'error' || dirtyWhileSaving) return doSave();
     return saving || Promise.resolve();
+  }
+
+  /** For a page that is being hidden, closed, reloaded or left: flush() alone starts an asynchronous
+   * IndexedDB save that does not commit when the page unloads first, so a change made in the last moments
+   * (less than the autosave delay, or while a save ran) would be lost. Unsaved changes are therefore first
+   * written synchronously as an emergency copy (GT.storage.saveSync), which storage.load() prefers while it
+   * is newer, and then saved normally. Returns true when an emergency copy was written. */
+  function flushOnLeave() {
+    var wrote = false;
+    if (state && changeSeq > savedSeq && changeSeq > emergencySeq &&
+        GT.storage && typeof GT.storage.saveSync === 'function') {
+      var seq = changeSeq;
+      state.meta.lastSavedAt = saveStamp(); // newer than any save that may still be running
+      try { wrote = GT.storage.saveSync(state) === true; } catch (e) { wrote = false; }
+      if (wrote) emergencySeq = seq;
+    }
+    flush();
+    return wrote;
   }
 
   /** Saves now even if nothing changed (e.g. the first save of a new, empty profile). */
@@ -336,6 +373,7 @@
     moveCourse: moveCourse,
     replaceState: replaceState,
     flush: flush,
+    flushOnLeave: flushOnLeave,
     saveNow: saveNow,
     saveStatus: saveStatus,
     version: function () { return version; }

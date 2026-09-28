@@ -792,6 +792,8 @@
   var ATTENDANCE_FIELDS = [
     ['mode', 'Attendance mode', modeLabel],
     ['unexcusedThreshold', 'Unexcused-absence threshold', prim],
+    // DECISIONS 3: optional limit on excused + unexcused absences; null (or missing) = off.
+    ['totalAbsenceThreshold', 'Total-absence threshold', function (v) { return v === undefined || v === null ? 'off' : prim(v); }],
     ['excusedCountsTowardStreak', 'Excused absences count toward a streak', function (v) { return v === undefined || v === null ? '' : yesNo(v); }],
     ['dropStreak', 'Consecutive absences for a one-letter drop', prim],
     ['failStreak', 'Consecutive absences for an F', prim],
@@ -831,8 +833,26 @@
         sesChanges.push({ date: s.date, id: s.id, o: describeSession(b), n: describeSession(s), note: 'Session changed', type: 'changed' });
       }
     });
+    // Marks deleted with a removed session are not logged one by one (see below), so the session
+    // entry says how many there were: "Session removed with its 59 marks".
+    var recB = objOf(attB.records), recA = objOf(attA.records);
+    function marksLost(sesId) {
+      var n = 0;
+      Object.keys(recB).forEach(function (sid) {
+        if (!markOf(own(objOf(own(recB, sid)), sesId))) return;
+        if (!markOf(own(objOf(own(recA, sid)), sesId))) n++;
+      });
+      return n;
+    }
+    var marksRemoved = 0;
     sesB.forEach(function (b) {
-      if (!mapA.has(b.id)) sesChanges.push({ date: b.date, id: b.id, o: describeSession(b), n: '', note: 'Session removed', type: 'removed' });
+      if (mapA.has(b.id)) return;
+      var lost = marksLost(b.id);
+      marksRemoved += lost;
+      sesChanges.push({
+        date: b.date, id: b.id, o: describeSession(b), n: '', type: 'removed',
+        note: lost ? 'Session removed with its ' + plural(lost, 'mark') : 'Session removed'
+      });
     });
     if (sesChanges.length > SESSION_LIMIT) {
       var counts = { added: 0, changed: 0, removed: 0 };
@@ -841,7 +861,8 @@
       add(ctx, 'settings', {
         field: 'Sessions', fieldKey: 'attendance.sessions', oldValue: plural(sesB.length, 'session'), newValue: plural(sesA.length, 'session'),
         note: sesChanges.length + ' sessions changed (' + counts.added + ' added, ' + counts.removed + ' removed, ' + counts.changed + ' edited): ' +
-          sesDates.slice(0, SUMMARY_DATES).join(', ') + (sesDates.length > SUMMARY_DATES ? ', …' : '')
+          sesDates.slice(0, SUMMARY_DATES).join(', ') + (sesDates.length > SUMMARY_DATES ? ', …' : '') +
+          (marksRemoved ? '; ' + plural(marksRemoved, 'mark') + ' deleted with the removed sessions' : '')
       });
     } else {
       sesChanges.forEach(function (c) {
@@ -852,7 +873,6 @@
     // Marks (per student per session) and totals. Deleted students are covered by their deletion
     // entry, and marks of removed sessions by the session entry.
     var changes = [];
-    var recB = objOf(attB.records), recA = objOf(attA.records);
     var sids = [];
     var seen = new Set();
     Object.keys(recB).concat(Object.keys(recA)).forEach(function (sid) {
@@ -904,19 +924,23 @@
       return;
     }
 
-    var dateSet = new Set(), who = new Set(), totalCount = 0;
+    // newValue counts what changed: "57 marks changed", "114 absence totals changed" (totals mode:
+    // an Absent or Excused count per student), or both ("3 marks and 4 absence totals changed").
+    var dateSet = new Set(), who = new Set(), totalCount = 0, markCount = 0;
     changes.forEach(function (c) {
       who.add(c.student.id);
-      if (c.type === 'mark') dateSet.add(c.session.date);
-      else totalCount++;
+      if (c.type === 'mark') { dateSet.add(c.session.date); markCount++; } else totalCount++;
     });
     var dates = Array.from(dateSet).sort();
     var parts = [];
     if (dates.length) parts.push('Sessions: ' + dates.slice(0, SUMMARY_DATES).join(', ') + (dates.length > SUMMARY_DATES ? ', …' : ''));
-    if (totalCount) parts.push('absence totals changed');
+    if (totalCount) parts.push('Absent and Excused counts (totals mode)');
     parts.push(plural(who.size, 'student'));
+    var what = [];
+    if (markCount) what.push(plural(markCount, 'mark'));
+    if (totalCount) what.push(plural(totalCount, 'absence total'));
     add(ctx, 'attendance', {
-      field: 'Attendance', fieldKey: 'attendance', oldValue: '', newValue: changes.length + ' marks changed', note: parts.join('; ')
+      field: 'Attendance', fieldKey: 'attendance', oldValue: '', newValue: what.join(' and ') + ' changed', note: parts.join('; ')
     });
   }
 

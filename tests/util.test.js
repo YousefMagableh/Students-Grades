@@ -297,6 +297,17 @@ describe('util.parseCount (whole, non-negative numbers; review F7)', () => {
     assert.equal(util.parseCount(''), null);
     assert.equal(util.parseCount(null), null);
   });
+
+  test('strict digits only: scientific notation, signs, separators and hex are rejected (review E2E3-13, DECISIONS 8)', () => {
+    for (const bad of ['1e3', '1E3', '.5e1', '2e0', '+2', '1,000', '1 000', 'Infinity', '0x10', '٣', '3 absences', '1000001', 1e7, -1, NaN, Infinity, true, {}, []]) {
+      assert.equal(util.parseCount(bad), null, JSON.stringify(bad));
+    }
+    assert.equal(util.parseCount('007'), 7);
+    assert.equal(util.parseCount('2.0'), 2, 'a whole number written with ".0" is fine');
+    assert.equal(util.parseCount('\u00a05\u00a0'), 5, 'non-breaking spaces around are trimmed');
+    assert.equal(util.parseCount('1000000'), 1000000);
+    assert.ok(Object.is(util.parseCount(-0), 0), '-0 becomes 0');
+  });
 });
 
 describe('util.hasOwn and util.isSafeKey (review F2, F4)', () => {

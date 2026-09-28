@@ -206,6 +206,102 @@ function pasteText(text) {
   }, text);
 }
 
+// Stage 3 helpers: the Attendance tab.
+
+/** Opens the Attendance tab (per-session mode) and waits for the marking grid with every student row. */
+async function gotoAttendanceGrid() {
+  await gotoView('attendance');
+  await page.waitForFunction((n) => document.querySelectorAll('.att-grid tbody tr[data-sid]').length === n, SAMPLE_STUDENTS);
+}
+
+/** Attendance grid cell of a student for the session at index j of course.attendance.sessions. */
+function attCell(sid, j) {
+  return page.locator(`.att-grid tbody tr[data-sid="${sid}"] > td:nth-child(${4 + j})`);
+}
+
+/** The stored mark ('P' | 'A' | 'E' | '') of a student for the session at index j. */
+function markOf(sid, j) {
+  return page.evaluate(([s, k]) => {
+    const c = GT.store.course(), ses = c.attendance.sessions[k];
+    const row = c.attendance.records[s] || {};
+    return row[ses.id] || '';
+  }, [sid, j]);
+}
+
+/** Selects sessions j0..j1 of one student in the attendance grid (click, then Shift+click). */
+async function selectAttRange(sid, j0, j1) {
+  await attCell(sid, j0).click();
+  if (j1 !== j0) await attCell(sid, j1).click({ modifiers: ['Shift'] });
+}
+
+/** An active student with no attendance warning and no threshold highlight (the first in name order). */
+function quietStudent(skip = []) {
+  return page.evaluate((sk) => {
+    const c = GT.store.course();
+    const s = GT.calc.sortStudents(c, GT.store.results(), 'name', 'asc').find((x) => {
+      const sm = GT.attendance.summary(c, x.id);
+      return x.status === 'active' && !sk.includes(x.id) && !sm.warning && !sm.overThreshold && sm.longestStreak < 2;
+    });
+    return s.id;
+  }, skip);
+}
+
+/** Totals, letters and ranks of every student: attendance must never change them (T5, T6). */
+function gradeSnapshot() {
+  return page.evaluate(() => {
+    const r = GT.store.results();
+    return JSON.stringify(Object.keys(r.byId).sort().map((id) => [id, r.byId[id].total, r.byId[id].letter, r.byId[id].rank, r.byId[id].percentile]));
+  });
+}
+
+/** Summary cells of the attendance grid that differ from GT.attendance.summary (empty when all match). */
+function attSummaryMismatches() {
+  return page.evaluate(() => {
+    const c = GT.store.course(), bad = [];
+    const pct = (x) => (typeof x === 'number' ? GT.util.formatPercent(x, 1) : '—');
+    document.querySelectorAll('.att-grid tbody tr[data-sid]').forEach((tr) => {
+      const sid = tr.getAttribute('data-sid');
+      const sm = GT.attendance.summary(c, sid);
+      const txt = (cls) => tr.querySelector('.' + cls).textContent.trim();
+      const want = { 'sr-exc': String(sm.excused), 'sr-unx': String(sm.unexcused), 'sr-tot': String(sm.totalAbsences),
+        'sr-arate': pct(sm.absenceRate), 'sr-urate': pct(sm.unexcusedRate), 'sr-streak': String(sm.longestStreak) };
+      Object.keys(want).forEach((k) => { if (txt(k) !== want[k]) bad.push(sid + ' ' + k + ': ' + txt(k) + ' != ' + want[k]); });
+      if (tr.querySelector('.sr-unx').classList.contains('over') !== sm.overThreshold) bad.push(sid + ' threshold highlight');
+      if (tr.querySelector('.sr-tot').classList.contains('over') !== sm.overTotalThreshold) bad.push(sid + ' total highlight');
+    });
+    return bad;
+  });
+}
+
+/** Absence cells of the Grades grid that differ from GT.attendance.summary; also returns the row count.
+ * A withdrawn student shows the numbers but never a warning icon (warnings cover active students only). */
+function gridAbsenceMismatches() {
+  return page.evaluate(() => {
+    const c = GT.store.course(), bad = [];
+    const col = (k) => { const th = document.querySelector('.gt-grid thead th.h-' + k); return th ? th.getAttribute('data-c') : null; };
+    const cs = { attExc: col('attExc'), attUnx: col('attUnx'), attTot: col('attTot') };
+    if (!cs.attExc || !cs.attUnx || !cs.attTot) return { rows: 0, bad: ['absence columns missing'] };
+    const rows = [...document.querySelectorAll('.gt-grid tbody tr.gr')];
+    rows.forEach((tr) => {
+      const sid = tr.getAttribute('data-sid');
+      const sm = GT.attendance.summary(c, sid);
+      const text = (k) => {
+        const td = tr.querySelector('td[data-c="' + cs[k] + '"]').cloneNode(true);
+        td.querySelectorAll('.sr-only').forEach((x) => x.remove());
+        return td.textContent.trim();
+      };
+      const got = [text('attExc'), text('attUnx'), text('attTot')].join(' ');
+      const want = [sm.excused, sm.unexcused, sm.totalAbsences].join(' ');
+      if (got !== want) bad.push(sid + ': ' + got + ' != ' + want);
+      const unx = tr.querySelector('td[data-c="' + cs.attUnx + '"]');
+      const wd = GT.model.findStudent(c, sid).status === 'withdrawn';
+      const flagged = !wd && !!(sm.warning || sm.overThreshold);
+      if (!!unx.querySelector('.mk-att') !== flagged) bad.push(sid + ': warning icon ' + !flagged);
+    });
+    return { rows: rows.length, bad };
+  });
+}
+
 /** The raw value stored under a key of the app's IndexedDB object store (undefined if none). */
 function idbStored(key) {
   return page.evaluate((k) => new Promise((resolve, reject) => {
@@ -968,6 +1064,35 @@ async function run() {
     }
   });
 
+  await check('Meeting view at 1280 px: the absence columns, Participation, Final letter and Rank all fit without scrolling', async () => {
+    // The instructor fills Participation and Final letter in the meeting, looking at the absences (DECISIONS 5, 6).
+    await resetSample();
+    assert.equal(page.viewportSize().width, 1280);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => document.querySelector('.gt-grid.meeting thead th.h-attUnx'));
+    const m = await page.evaluate(() => {
+      const t = document.querySelector('.gt-grid.meeting'), wrap = t.closest('.grid-wrap');
+      const wr = wrap.getBoundingClientRect();
+      const right = wr.left + wrap.clientLeft + wrap.clientWidth;
+      const edge = (sel) => { const th = t.querySelector('thead th' + sel); return th ? Math.round(th.getBoundingClientRect().right) : null; };
+      // Header text is never clipped, and the absence header names stay on one line.
+      const clipped = [...t.querySelectorAll('thead th')].filter((th) => th.scrollWidth > th.clientWidth + 1).map((th) => th.className);
+      const wrapped = [...t.querySelectorAll('thead th.h-attExc .h-name, thead th.h-attUnx .h-name, thead th.h-attTot .h-name, thead th.h-final .h-name')]
+        .filter((n) => n.getClientRects().length !== 1 || n.getBoundingClientRect().height > parseFloat(getComputedStyle(n).lineHeight) * 1.5)
+        .map((n) => n.textContent);
+      return { right: Math.round(right), overflow: wrap.scrollWidth - wrap.clientWidth, final: edge('.h-final'), rank: edge('.h-rank'),
+        part: edge('.to-fill.h-raw'), unx: edge('.h-attUnx'), clipped, wrapped };
+    });
+    assert.ok(m.final !== null && m.rank !== null && m.part !== null && m.unx !== null, JSON.stringify(m));
+    assert.ok(m.final <= m.right, 'Final letter is cut off: ' + JSON.stringify(m));
+    assert.ok(m.rank <= m.right, 'Rank is cut off: ' + JSON.stringify(m));
+    assert.ok(m.overflow <= 0, 'the meeting grid scrolls sideways: ' + JSON.stringify(m));
+    assert.deepEqual(m.clipped, []);
+    assert.deepEqual(m.wrapped, []);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => !document.querySelector('.gt-grid.meeting'));
+  });
+
   await check('Unlock scores asks first, is logged in History, and score cells are editable again', async () => {
     await resetSample();
     // Finalize from Settings → Grading status: it opens the Grades tab's Finalize dialog.
@@ -1098,11 +1223,504 @@ async function run() {
     assert.equal(last.newValue, 'confirmed');
   });
 
-  await check('privacy mode blurs every student name (.pii) in the grid and Students views', async () => {
+  // ---------------------------------------------------------------- stage 3: attendance
+
+  await check('Attendance: SE 4351 has 26 sessions and a 59 x 26 marking grid that renders in under 30 ms', async () => {
+    await resetSample();
+    const c = await page.evaluate(() => ({
+      sessions: GT.store.course().attendance.sessions.length,
+      template: GT.model.createCourse('SE4351').attendance.sessions.length,
+      mode: GT.store.course().attendance.mode,
+      streakDefault: GT.store.course().attendance.excusedCountsTowardStreak
+    }));
+    assert.deepEqual(c, { sessions: 26, template: 26, mode: 'per-session', streakDefault: false });
+    await gotoAttendanceGrid();
+    assert.equal(await page.locator('.att-grid thead th.ses').count(), 26);
+    assert.equal(await page.locator('.att-mode[data-mode="per-session"]').getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.locator('[data-f="excstreak"]').isChecked(), false, 'excused absences do not count toward a streak by default');
+    // Performance: the body of 59 x 26 cells (one innerHTML string). Best of three re-renders.
+    const ms = [];
+    for (let i = 0; i < 3; i++) {
+      await page.click('[data-act="withdrawn"]'); // hide withdrawn (57 rows), then show them again (59 rows)
+      await page.waitForFunction((n) => document.querySelectorAll('.att-grid tbody tr[data-sid]').length === n, SAMPLE_STUDENTS - 2);
+      await page.click('[data-act="withdrawn"]');
+      await page.waitForFunction((n) => document.querySelectorAll('.att-grid tbody tr[data-sid]').length === n, SAMPLE_STUDENTS);
+      ms.push(await page.evaluate(() => GT.views.attendance.lastRenderMs()));
+    }
+    assert.ok(Math.min(...ms) < 30, 'grid body render took ' + ms.join(', ') + ' ms');
+    // The summary columns and the footer counts are the core's numbers.
+    assert.deepEqual(await attSummaryMismatches(), []);
+    const foot = await page.evaluate(() => {
+      const c = GT.store.course(), ses = c.attendance.sessions[0];
+      const n = GT.attendance.sessionCounts(c, ses.id);
+      const cell = (k) => document.querySelector('.att-grid tfoot tr.f' + k).cells[1].textContent.trim();
+      return { got: [cell(1), cell(2), cell(3), cell(4)].join(), want: [n.present, n.absent, n.excused, n.unmarked].join() };
+    });
+    assert.equal(foot.got, foot.want);
+  });
+
+  await check('Attendance: SE 6362 starts off (no absence columns in Grades); turning it on works', async () => {
+    await resetSample();
+    const other = await page.evaluate(() => {
+      const c = GT.store.state.courses[1];
+      GT.store.transact('Load sample data', (cc) => GT.sample.loadInto(cc), { courseId: c.id, source: 'sample', historyMode: 'bulk' });
+      return { id: c.id, code: c.code, mode: c.attendance.mode };
+    });
+    assert.equal(other.code, 'SE 6362');
+    assert.equal(other.mode, 'off');
+    await page.selectOption('#course-select', other.id);
+    await page.waitForFunction(() => document.querySelectorAll('.gt-grid tbody tr.gr').length > 0);
+    assert.equal(await page.locator('.gt-grid thead th.h-attExc, .gt-grid thead th.h-attUnx, .gt-grid thead th.h-attTot').count(), 0,
+      'no absence columns while attendance is off');
+    await gotoView('attendance');
+    await page.locator('.att-off-state').waitFor();
+    assert.match(await page.locator('.att-off-state').textContent(), /not tracked for SE 6362/);
+    const h0 = await historyCount();
+    await page.click('.att-off-state [data-act="turn-on"][data-mode="per-session"]');
+    await page.waitForFunction(() => GT.store.course().attendance.mode === 'per-session');
+    await page.waitForFunction(() => document.querySelectorAll('.att-grid thead th.ses').length === 26);
+    const added = await historySince(h0);
+    assert.equal(added.length, 1);
+    assert.equal(added[0].kind, 'settings');
+    assert.equal(added[0].newValue, 'Per session');
+    await gotoView('grades');
+    await page.waitForFunction(() => document.querySelector('.gt-grid thead th.h-attUnx'));
+    const g = await gridAbsenceMismatches();
+    assert.ok(g.rows > 0);
+    assert.deepEqual(g.bad, []);
+    await page.selectOption('#course-select', await page.evaluate(() => GT.store.state.courses[0].id));
+  });
+
+  await check('Grades grid: Excused, Unexcused and Total absences next to every SE 4351 student equal the core summary', async () => {
+    await resetSample();
+    let g = await gridAbsenceMismatches();
+    assert.equal(g.rows, SAMPLE_STUDENTS);
+    assert.deepEqual(g.bad, []);
+    // A re-render and a copy of the three columns for every row compute attendance once for the course,
+    // not once per row (summary() rescans every student's marks: quadratic at 300 students).
+    const excC = await gridCol('attExc'), totC = await gridCol('attTot');
+    const ids = await rowIds();
+    await gridCell(ids[0], excC).click();
+    await gridCell(ids[ids.length - 1], totC).click({ modifiers: ['Shift'] });
+    const spy = await page.evaluate(async ([sid, n]) => {
+      const A = GT.attendance, orig = { summary: A.summary, courseSummary: A.courseSummary };
+      const calls = { summary: 0, courseSummary: 0 };
+      A.summary = function () { calls.summary++; return orig.summary.apply(this, arguments); };
+      A.courseSummary = function () { calls.courseSummary++; return orig.courseSummary.apply(this, arguments); };
+      try {
+        const r0 = GT.views.grades.lastRenderMs();
+        GT.store.transact('Edit Test 1', (c) => GT.model.setEntry(c.scores, sid, 'a_t1', { value: 11 }));
+        await new Promise((res) => requestAnimationFrame(() => setTimeout(res, 50)));
+        const render = { ...calls, rendered: GT.views.grades.lastRenderMs() !== r0 || calls.courseSummary > 0 };
+        calls.summary = 0; calls.courseSummary = 0;
+        const dt = new DataTransfer();
+        document.activeElement.dispatchEvent(new ClipboardEvent('copy', { clipboardData: dt, bubbles: true, cancelable: true }));
+        const copy = { ...calls, lines: dt.getData('text/plain').split('\r\n').length };
+        return { render, copy };
+      } finally {
+        A.summary = orig.summary;
+        A.courseSummary = orig.courseSummary;
+      }
+    }, [ids[1], ids.length]);
+    assert.equal(spy.render.rendered, true, 'the grid did not re-render');
+    assert.equal(spy.render.summary, 0, 'per-row summary() calls in a render');
+    assert.equal(spy.render.courseSummary, 1);
+    assert.deepEqual(spy.copy, { summary: 0, courseSummary: 1, lines: SAMPLE_STUDENTS });
+    g = await gridAbsenceMismatches();
+    assert.deepEqual(g.bad, []);
+    await page.keyboard.press('Escape');
+    // The fail and drop students: warning icon and tooltip on the Unexcused cell.
+    const tips = await page.evaluate(() => {
+      const c = GT.store.course(), cs = GT.attendance.courseSummary(c);
+      const unxC = document.querySelector('.gt-grid thead th.h-attUnx').getAttribute('data-c');
+      const tip = (kind) => {
+        const w = cs.warnings.find((x) => x.kind === kind);
+        return document.querySelector('.gt-grid tbody tr[data-sid="' + w.studentId + '"] td[data-c="' + unxC + '"]').title;
+      };
+      return { fail: tip('fail'), drop: tip('drop'), threshold: tip('threshold') };
+    });
+    assert.match(tips.fail, /4 consecutive absences: the syllabus says F/);
+    assert.match(tips.drop, /3 consecutive absences: the syllabus says one letter grade drop/);
+    assert.match(tips.threshold, /Above the unexcused-absence threshold \(3\)/);
+    // The Columns menu hides and shows each absence column.
+    await page.click('.grid-toolbar [data-act="columns"]');
+    const item = page.locator('.grid-cols-menu [data-key="attUnexcused"]');
+    assert.equal(await item.getAttribute('aria-checked'), 'true');
+    await item.click();
+    await page.waitForFunction(() => !document.querySelector('.gt-grid thead th.h-attUnx') && document.querySelector('.gt-grid thead th.h-attExc'));
+    await page.locator('.grid-cols-menu [data-key="attUnexcused"]').click();
+    await page.waitForFunction(() => document.querySelector('.gt-grid thead th.h-attUnx'));
+    await page.keyboard.press('Escape');
+    if (await page.locator('.grid-cols-menu').count()) await page.click('.grid-toolbar [data-act="columns"]');
+    await page.waitForFunction(() => !document.querySelector('.grid-cols-menu'));
+    // Totals-only mode: the columns read the typed totals; attendance off: the columns are hidden.
+    await page.evaluate(() => GT.store.transact('Totals', (c) => {
+      GT.attendance.setMode(c, 'totals');
+      GT.attendance.setSessionsHeld(c, 20);
+      GT.attendance.setTotals(c, c.students[0].id, { absent: 7, excused: 2 });
+    }));
+    await page.waitForFunction(() => {
+      const c = GT.store.course(), sid = c.students[0].id;
+      const unxC = document.querySelector('.gt-grid thead th.h-attUnx');
+      const td = unxC && document.querySelector('.gt-grid tbody tr[data-sid="' + sid + '"] td[data-c="' + unxC.getAttribute('data-c') + '"]');
+      return td && /7/.test(td.textContent);
+    });
+    g = await gridAbsenceMismatches();
+    assert.deepEqual(g.bad, []);
+    await page.evaluate(() => GT.store.transact('Off', (c) => GT.attendance.setMode(c, 'off')));
+    await page.waitForFunction(() => !document.querySelector('.gt-grid thead th.h-attExc, .gt-grid thead th.h-attUnx, .gt-grid thead th.h-attTot'));
+  });
+
+  await check('Attendance: a 3-run gives the drop warning, a 4-run the fail warning; grades never change', async () => {
+    await resetSample();
+    const before = await gradeSnapshot();
+    await gotoAttendanceGrid();
+    const sid = await quietStudent();
+    // Sessions 1-6 present (one range, one transaction), then 2-4 absent: a run of exactly 3.
+    await selectAttRange(sid, 1, 6);
+    await page.keyboard.press('p');
+    await page.waitForFunction((s) => document.querySelector(`.att-grid tr[data-sid="${s}"]`).cells[3 + 6].textContent === 'P', sid);
+    const h0 = await historyCount();
+    await selectAttRange(sid, 2, 4);
+    await page.keyboard.press('a');
+    await page.waitForFunction((s) => GT.attendance.summary(GT.store.course(), s).warning === 'drop', sid);
+    assert.equal((await historySince(h0)).length, 3, 'three marks: one history entry each (<= 5 per transaction)');
+    assert.deepEqual([await markOf(sid, 1), await markOf(sid, 2), await markOf(sid, 3), await markOf(sid, 4), await markOf(sid, 5)], ['P', 'A', 'A', 'A', 'P']);
+    const chip = page.locator(`.att-grid tbody tr[data-sid="${sid}"] .sr-warn .att-chip`);
+    await page.waitForFunction((s) => /3 in a row: 1 letter drop/.test(document.querySelector(`.att-grid tbody tr[data-sid="${s}"] .sr-warn`).textContent), sid);
+    assert.match(await chip.getAttribute('class'), /\bwarn\b/);
+    // The Warnings card lists the student with the dates of the run.
+    const dates = await page.evaluate((s) => GT.store.course().attendance.sessions.slice(2, 5)
+      .map((x) => GT.util.MONTH_SHORT[Number(x.date.slice(5, 7)) - 1] + ' ' + Number(x.date.slice(8, 10))).join(', '), sid);
+    const card = page.locator(`.att-warn-list .aw-item[data-sid="${sid}"]`);
+    await card.waitFor();
+    assert.match(await card.textContent(), /3 in a row: 1 letter drop \(warning only\)/);
+    assert.ok((await card.textContent()).includes(dates), 'streak dates ' + dates);
+    // One more absence (keyboard: select session 5, type a): a run of 4, fail.
+    await attCell(sid, 5).click();
+    await page.keyboard.press('a');
+    await page.waitForFunction((s) => GT.attendance.summary(GT.store.course(), s).warning === 'fail', sid);
+    await page.waitForFunction((s) => /4 in a row: F per syllabus/.test(document.querySelector(`.att-grid tbody tr[data-sid="${s}"] .sr-warn`).textContent), sid);
+    assert.match(await chip.getAttribute('class'), /\bdanger\b/);
+    assert.equal(await page.locator(`.att-grid tbody tr[data-sid="${sid}"]`).evaluate((tr) => tr.classList.contains('w-fail')), true);
+    // Rates, counts and highlights in the summary columns equal the core summary.
+    assert.deepEqual(await attSummaryMismatches(), []);
+    // Warnings only (T5): totals, letters and ranks are exactly as before.
+    assert.equal(await gradeSnapshot(), before);
+    // The Grades grid shows the fail warning on the Unexcused cell; the letter is untouched.
+    await gotoView('grades');
+    const tip = await page.evaluate((s) => {
+      const unxC = document.querySelector('.gt-grid thead th.h-attUnx').getAttribute('data-c');
+      const td = document.querySelector('.gt-grid tbody tr[data-sid="' + s + '"] td[data-c="' + unxC + '"]');
+      return { title: td.title, icon: !!td.querySelector('.mk-att') };
+    }, sid);
+    assert.ok(tip.icon);
+    assert.match(tip.title, /4 consecutive absences: the syllabus says F \(warning only/);
+    assert.equal(await gradeSnapshot(), before);
+  });
+
+  await check('Attendance: excused (allowed) absences do not make a streak by default; the setting makes them count', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    const sid = await quietStudent();
+    await selectAttRange(sid, 1, 6);
+    await page.keyboard.press('p');
+    await page.waitForFunction((s) => document.querySelector(`.att-grid tr[data-sid="${s}"]`).cells[3 + 6].textContent === 'P', sid);
+    const { exc0, unx0 } = await page.evaluate((s) => {
+      const sm = GT.attendance.summary(GT.store.course(), s);
+      return { exc0: sm.excused, unx0: sm.unexcused };
+    }, sid);
+    // Four excused absences in a row (right-click menu on a selected range).
+    await selectAttRange(sid, 2, 5);
+    await attCell(sid, 3).click({ button: 'right' });
+    await page.locator('.menu [role="menuitem"]', { hasText: 'Excused (allowed)' }).click();
+    await page.waitForFunction(([s, n]) => GT.attendance.summary(GT.store.course(), s).excused === n + 4, [sid, exc0]);
+    let sm = await page.evaluate((s) => GT.attendance.summary(GT.store.course(), s), sid);
+    assert.equal(sm.warning, null, 'excused absences alone never warn by default');
+    assert.equal(sm.longestStreak < 2, true);
+    assert.equal(await page.locator(`.att-grid tbody tr[data-sid="${sid}"] .sr-warn .att-chip`).count(), 0);
+    assert.equal(await page.locator(`.att-warn-list .aw-item[data-sid="${sid}"]`).count(), 0);
+    // Tick "Excused absences count toward a streak": the same four now give the fail warning.
+    const h0 = await historyCount();
+    await page.locator('[data-f="excstreak"]').check();
+    await page.waitForFunction(() => GT.store.course().attendance.excusedCountsTowardStreak === true);
+    sm = await page.evaluate((s) => GT.attendance.summary(GT.store.course(), s), sid);
+    assert.equal(sm.warning, 'fail');
+    assert.equal(sm.unexcused, unx0, 'the unexcused count does not change');
+    await page.waitForFunction((s) => /4 in a row: F per syllabus/.test(document.querySelector(`.att-grid tbody tr[data-sid="${s}"] .sr-warn`).textContent), sid);
+    const logged = await historySince(h0);
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0].kind, 'settings');
+    assert.equal(logged[0].field, 'Excused absences count toward a streak');
+    // Untick: back to no warning.
+    await page.locator('[data-f="excstreak"]').uncheck();
+    await page.waitForFunction((s) => GT.attendance.summary(GT.store.course(), s).warning === null, sid);
+    await page.waitForFunction((s) => !document.querySelector(`.att-grid tbody tr[data-sid="${s}"] .sr-warn .att-chip`), sid);
+  });
+
+  await check('Attendance: "Mark everyone without a mark as Present" is one transaction and one history entry', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    const ses = await page.evaluate(() => GT.store.course().attendance.sessions[5]);
+    // Clear the session first (header menu, with a confirmation that says how many marks go).
+    await page.click(`.att-grid thead button.ses-btn[data-ses="${ses.id}"]`);
+    await page.locator('.menu [role="menuitem"]', { hasText: 'Clear this session' }).click();
+    await page.locator('dialog[open]').waitFor();
+    assert.match(await page.locator('dialog[open]').textContent(), /59 marks/);
+    await page.locator('dialog[open] .btn-primary').click();
+    await page.waitForFunction((id) => GT.attendance.markCount(GT.store.course(), id) === 0, ses.id);
+    const h0 = await historyCount();
+    await page.click(`.att-grid thead button.ses-btn[data-ses="${ses.id}"]`);
+    await page.locator('.menu [role="menuitem"]', { hasText: 'Mark everyone without a mark as Present' }).click();
+    await page.waitForFunction((id) => GT.attendance.markCount(GT.store.course(), id) === 57, ses.id);
+    const added = await historySince(h0);
+    assert.equal(added.length, 1, 'one history entry');
+    assert.equal(added[0].kind, 'attendance');
+    assert.equal(added[0].newValue, '57 marks changed');
+    const counts = await page.evaluate((id) => GT.attendance.sessionCounts(GT.store.course(), id), ses.id);
+    assert.equal(counts.present, 57);
+    assert.equal(counts.unmarked, 0);
+    await page.waitForFunction(() => document.querySelector('.att-grid tfoot tr.f1').cells[1 + 5].textContent.trim() === '57');
+    // One undo step restores the cleared session.
+    await page.click('#btn-undo');
+    await page.waitForFunction((id) => GT.attendance.markCount(GT.store.course(), id) === 0, ses.id);
+  });
+
+  await check('Attendance: Roll call marks the current student and advances; "Mark remaining present" fills the rest', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    const ses = await page.evaluate(() => {
+      const c = GT.store.course(), s = c.attendance.sessions[3];
+      GT.store.transact('Clear', (cc) => GT.attendance.clearSession(cc, s.id));
+      return s;
+    });
+    await page.click('[data-act="roll"]');
+    await page.locator('dialog[open] .rc-list').waitFor();
+    await page.selectOption('#rc-ses', ses.id);
+    // Keys go to the current row (not to the session drop-down, where a letter would pick an option).
+    await page.locator('dialog[open] .rc-row.is-current .rc-b').first().focus();
+    const order = await page.$$eval('dialog[open] .rc-row', (rows) => rows.map((r) => r.getAttribute('data-sid')));
+    assert.equal(order.length, 57, 'active students only');
+    await page.waitForFunction((sid) => document.querySelector('dialog[open] .rc-row.is-current').getAttribute('data-sid') === sid, order[0]);
+    const current = () => page.$eval('dialog[open] .rc-row.is-current', (r) => r.getAttribute('data-sid'));
+    const stored = (sid) => page.evaluate(([s, id]) => (GT.store.course().attendance.records[s] || {})[id] || '', [sid, ses.id]);
+    await page.keyboard.press('a');
+    await page.waitForFunction((sid) => document.querySelector('dialog[open] .rc-row.is-current').getAttribute('data-sid') === sid, order[1]);
+    assert.equal(await stored(order[0]), 'A');
+    await page.keyboard.press('e');
+    await page.waitForFunction((sid) => document.querySelector('dialog[open] .rc-row.is-current').getAttribute('data-sid') === sid, order[2]);
+    assert.equal(await stored(order[1]), 'E');
+    await page.keyboard.press('p');
+    assert.equal(await current(), order[3]);
+    assert.equal(await stored(order[2]), 'P');
+    assert.match(await page.locator('dialog[open] .rc-progress').textContent(), /3 of 57/);
+    assert.equal(await page.locator(`dialog[open] .rc-row[data-sid="${order[0]}"] .rc-b[data-m="A"]`).getAttribute('aria-pressed'), 'true');
+    // Up, then Delete clears the mark of that student.
+    await page.keyboard.press('ArrowUp');
+    assert.equal(await current(), order[2]);
+    await page.keyboard.press('Delete');
+    await page.waitForFunction(([s, id]) => !(GT.store.course().attendance.records[s] || {})[id], [order[2], ses.id]);
+    const h0 = await historyCount();
+    await page.click('dialog[open] [data-rc="rest"]');
+    await page.waitForFunction((id) => GT.attendance.sessionCounts(GT.store.course(), id).unmarked === 0, ses.id);
+    const added = await historySince(h0);
+    assert.equal(added.length, 1);
+    assert.equal(added[0].newValue, '55 marks changed');
+    assert.deepEqual([await stored(order[0]), await stored(order[1]), await stored(order[2])], ['A', 'E', 'P']);
+    assert.match(await page.locator('dialog[open] .rc-progress').textContent(), /57 of 57/);
+    await page.locator('dialog[open] .dlg-foot .btn-primary').click();
+    await page.waitForFunction(() => !document.querySelector('dialog[open]'));
+    // The grid shows the marks.
+    await page.waitForFunction(([s, j]) => document.querySelector(`.att-grid tr[data-sid="${s}"]`).cells[3 + j].textContent === 'A', [order[0], 3]);
+  });
+
+  await check('Attendance: totals-only inputs accept whole numbers only; switching modes keeps the per-session marks', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    const records = await page.evaluate(() => JSON.stringify(GT.store.course().attendance.records));
+    await page.click('.att-mode[data-mode="totals"]');
+    await page.locator('table.att-totals tbody tr[data-sid]').first().waitFor();
+    assert.equal(await page.evaluate(() => GT.store.course().attendance.mode), 'totals');
+    // Sessions held so far: the rate denominator.
+    await page.fill('[data-f="held"]', '20');
+    await page.press('[data-f="held"]', 'Enter');
+    await page.waitForFunction(() => GT.store.course().attendance.totalsSessionsHeld === 20);
+    const rows = await page.$$eval('table.att-totals tbody tr[data-sid]', (trs) => trs.map((tr) => tr.getAttribute('data-sid')));
+    const sid = rows[0];
+    const input = `[data-f="t:absent:${sid}"]`, err = `[data-err="t:absent:${sid}"]`;
+    const before = await page.evaluate((s) => JSON.stringify(GT.store.course().attendance.totals[s] || null), sid);
+    const h0 = await historyCount();
+    for (const bad of ['2.5', '-1', 'abc', '3%']) {
+      await page.fill(input, bad);
+      await page.press(input, 'Enter');
+      await page.waitForFunction((e) => document.querySelector(e).textContent.trim() !== '', err);
+      assert.equal(await page.locator(input).evaluate((el) => el.classList.contains('is-invalid')), true, bad + ' is marked invalid');
+      assert.equal(await page.evaluate((s) => JSON.stringify(GT.store.course().attendance.totals[s] || null), sid), before, bad + ' was not saved');
+    }
+    assert.equal(await historyCount(), h0, 'nothing refused is logged');
+    assert.match(await page.locator(err).textContent(), /whole number/);
+    // A whole number is saved; Enter moves to the next student.
+    await page.fill(input, '3');
+    await page.press(input, 'Enter');
+    await page.waitForFunction((s) => GT.store.course().attendance.totals[s].absent === 3, sid);
+    await page.waitForFunction((next) => document.activeElement && document.activeElement.getAttribute('data-f') === 't:absent:' + next, rows[1]);
+    assert.equal((await page.locator(err).textContent()).trim(), '');
+    // The row's numbers are the core's (rates over 20 sessions); streaks are n/a.
+    // (The table re-renders on the next frame after the save.)
+    await page.waitForFunction((s) => {
+      const tr = document.querySelector(`table.att-totals tr[data-sid="${s}"]`);
+      const sm = GT.attendance.summary(GT.store.course(), s);
+      const want = [String(sm.totalAbsences), GT.util.formatPercent(sm.absenceRate, 1), GT.util.formatPercent(sm.unexcusedRate, 1), 'n/a in totals mode'];
+      return !!tr && [...tr.cells].slice(4).map((td) => td.textContent.trim()).join('|') === want.join('|');
+    }, sid);
+    // Back to per session: every mark is still there.
+    await page.click('.att-mode[data-mode="per-session"]');
+    await page.waitForFunction((n) => document.querySelectorAll('.att-grid tbody tr[data-sid]').length === n, SAMPLE_STUDENTS);
+    assert.equal(await page.evaluate(() => JSON.stringify(GT.store.course().attendance.records)), records);
+    assert.deepEqual(await attSummaryMismatches(), []);
+  });
+
+  await check('Student details: attendance numbers, streak dates and every absence by date (excused vs unexcused)', async () => {
+    await resetSample();
+    const fail = await page.evaluate(() => {
+      const c = GT.store.course(), w = GT.attendance.courseSummary(c).warnings.find((x) => x.kind === 'fail');
+      const sm = GT.attendance.summary(c, w.studentId);
+      const md = (d) => GT.util.MONTH_SHORT[Number(d.slice(5, 7)) - 1] + ' ' + Number(d.slice(8, 10));
+      return { sid: w.studentId, sm, dates: w.streak.dates.map(md) };
+    });
+    await page.evaluate((s) => { GT.ui.openStudent(s); }, fail.sid);
+    await page.locator('dialog[open] .sd-att-section').waitFor();
+    const tiles = await page.$$eval('dialog[open] .sd-att-value', (v) => v.map((x) => x.textContent.trim()));
+    const pct = (x) => page.evaluate((v) => GT.util.formatPercent(v, 1), x);
+    assert.deepEqual(tiles, [String(fail.sm.excused), String(fail.sm.unexcused), String(fail.sm.totalAbsences),
+      await pct(fail.sm.absenceRate), await pct(fail.sm.unexcusedRate), String(fail.sm.longestStreak)]);
+    const warn = await page.locator('dialog[open] .sd-att-warn[data-att-warn="fail"]').textContent();
+    assert.match(warn, /4 absences in a row/);
+    assert.ok(warn.includes(fail.dates.join(', ')), 'streak dates ' + fail.dates.join(', '));
+    assert.match(warn, /Warning only/);
+    // Absences by date: one row per A or E mark, with the stored mark.
+    const list = await page.$$eval('dialog[open] .sd-att-list tbody tr', (trs) => trs.map((tr) => [tr.getAttribute('data-att-date'), tr.getAttribute('data-att-mark')]));
+    const want = await page.evaluate((s) => {
+      const c = GT.store.course(), row = c.attendance.records[s] || {};
+      return GT.attendance.heldSessions(c).filter((x) => row[x.id] === 'A' || row[x.id] === 'E').map((x) => [x.date, row[x.id]]);
+    }, fail.sid);
+    assert.deepEqual(list, want);
+    assert.equal(list.length, fail.sm.totalAbsences);
+    // The excused student: 4 excused (allowed) rows, no warning.
+    await page.evaluate(() => document.querySelectorAll('dialog').forEach((d) => { d.close(); d.remove(); }));
+    const exc = await page.evaluate(() => GT.store.course().students.find((s) => /excused by the instructor/.test(s.notes || '')).id);
+    await page.evaluate((s) => { GT.ui.openStudent(s); }, exc);
+    await page.locator('dialog[open] .sd-att-section').waitFor();
+    assert.equal(await page.locator('dialog[open] .sd-att-list tbody tr[data-att-mark="E"]').count(), 4);
+    assert.equal(await page.locator('dialog[open] .sd-att-list tbody tr[data-att-mark="A"]').count(), 0);
+    assert.equal(await page.locator('dialog[open] .sd-att-warn').count(), 0);
+    assert.match(await page.locator('dialog[open] .sd-att-list').textContent(), /Excused \(allowed, instructor-approved\)/);
+    // "Open in Attendance" closes the dialog and selects the student's row.
+    await page.click('dialog[open] [data-sd="attendance"]');
+    await page.waitForFunction(() => GT.store.state.ui.activeView === 'attendance' && !document.querySelector('dialog[open]'));
+    await page.waitForFunction((s) => document.querySelector(`.att-grid tbody tr.row-active[data-sid="${s}"]`), exc);
+  });
+
+  await check('Withdrawn students keep their absence numbers but get no attendance warning in Grades, Student details or Attendance', async () => {
+    // Warnings cover active students only (STAGE3 §1): the three views must agree.
+    await resetSample();
+    const ids = await page.evaluate(() => {
+      const c = GT.store.course();
+      const w = c.students.find((s) => s.status === 'withdrawn');
+      const a = GT.calc.sortStudents(c, GT.store.results(), 'name', 'asc').find((x) => {
+        const sm = GT.attendance.summary(c, x.id);
+        return x.status === 'active' && !sm.warning && !sm.overThreshold && sm.longestStreak < 2;
+      });
+      // Both: absent (not allowed) in the first 5 sessions, a run of 5 (fail) and above the threshold (3).
+      GT.store.transact('Absent x5', (cc) => [w.id, a.id].forEach((sid) =>
+        cc.attendance.sessions.slice(0, 5).forEach((x) => GT.attendance.setMark(cc, sid, x.id, 'A'))));
+      const sw = GT.attendance.summary(GT.store.course(), w.id);
+      return { w: w.id, a: a.id, warning: sw.warning, over: sw.overThreshold, unexcused: sw.unexcused };
+    });
+    assert.equal(ids.warning, 'fail');
+    assert.equal(ids.over, true);
+    // Grades grid: the numbers, but no icon, warning class or warning tooltip for the withdrawn row.
+    await page.waitForFunction((s) => document.querySelector(`.gt-grid tbody tr[data-sid="${s}"] td.is-att-fail`), ids.a);
+    const unxC = await gridCol('attUnx');
+    assert.equal(await gridCell(ids.w, unxC).count(), 1, 'the withdrawn row is shown in Grades');
+    const wCell = await gridCell(ids.w, unxC).evaluate((td) => ({ cls: td.className, icon: !!td.querySelector('.mk-att'), title: td.title }));
+    assert.equal(wCell.icon, false);
+    assert.doesNotMatch(wCell.cls, /is-att-warn|is-att-fail/);
+    assert.doesNotMatch(wCell.title, /syllabus says F|Above the/);
+    assert.match(wCell.title, /Withdrawn: no attendance warning/);
+    assert.equal(await cellText(ids.w, unxC), String(ids.unexcused));
+    assert.equal(await page.locator(`.gt-grid tbody tr[data-sid="${ids.w}"] td.is-att-warn`).count(), 0);
+    assert.deepEqual((await gridAbsenceMismatches()).bad, []);
+    // Student details: no F/drop or threshold callout and no highlight; the numbers and dates stay.
+    await page.evaluate((s) => { GT.ui.openStudent(s); }, ids.w);
+    await page.locator('dialog[open] .sd-att-section').waitFor();
+    assert.equal(await page.locator('dialog[open] .sd-att-warn').count(), 0);
+    assert.equal(await page.locator('dialog[open] .sd-att-section .is-over').count(), 0);
+    assert.match(await page.locator('dialog[open] .sd-att-wd').textContent(), /Withdrawn: no attendance warning/);
+    assert.equal(await page.locator('dialog[open] .sd-att-unx .sd-att-value').textContent(), String(ids.unexcused));
+    assert.equal(await page.locator('dialog[open] .sd-att-list tbody tr[data-att-mark="A"]').count(), ids.unexcused);
+    await page.evaluate(() => document.querySelectorAll('dialog').forEach((d) => { d.close(); d.remove(); }));
+    // The active student with the same marks does get the warnings.
+    await page.evaluate((s) => { GT.ui.openStudent(s); }, ids.a);
+    await page.locator('dialog[open] .sd-att-warn[data-att-warn="fail"]').waitFor();
+    assert.equal(await page.locator('dialog[open] .sd-att-unx.is-over').count(), 1);
+    await page.evaluate(() => document.querySelectorAll('dialog').forEach((d) => { d.close(); d.remove(); }));
+    // Attendance: the Warnings card lists the active student only; the withdrawn row has no warning class.
+    await gotoView('attendance');
+    await page.locator(`.att-warn-list .aw-item[data-sid="${ids.a}"]`).waitFor();
+    assert.equal(await page.locator(`.att-warn-list .aw-item[data-sid="${ids.w}"]`).count(), 0);
+    const wRow = page.locator(`.att-grid tbody tr[data-sid="${ids.w}"]`);
+    if (!(await wRow.count())) await page.click('.view-root [data-act="withdrawn"]');
+    await wRow.waitFor();
+    assert.doesNotMatch(await wRow.getAttribute('class'), /w-fail|w-drop/);
+    assert.equal(await wRow.locator('.sr-unx.over').count(), 0);
+  });
+
+  await check('Settings: the unexcused-threshold placeholder covers the total-absence threshold; both thresholds highlight', async () => {
+    await resetSample();
+    await gotoView('settings');
+    const item = page.locator('.view-settings [data-ph="unexcusedThreshold"]');
+    await item.waitFor();
+    const text = await item.textContent();
+    assert.match(text, /total-absence threshold/i);
+    assert.match(text, /Total-absence threshold: off/);
+    await item.locator('[data-act="open-view"]').click();
+    await page.waitForFunction(() => GT.store.state.ui.activeView === 'attendance');
+    await page.locator('[data-card="settings"] [data-f="tthr"]').waitFor();
+    // Optional total threshold: 5 highlights the Total cell of everyone above 5; empty turns it off.
+    const h0 = await historyCount();
+    await page.fill('[data-f="tthr"]', '5');
+    await page.press('[data-f="tthr"]', 'Enter');
+    await page.waitForFunction(() => GT.store.course().attendance.totalAbsenceThreshold === 5);
+    const logged = await historySince(h0);
+    assert.equal(logged.length, 1);
+    assert.deepEqual([logged[0].kind, logged[0].field, logged[0].oldValue, logged[0].newValue], ['settings', 'Total-absence threshold', 'off', '5']);
+    const over = await page.evaluate(() => {
+      const c = GT.store.course();
+      return c.students.filter((s) => GT.attendance.summary(c, s.id).overTotalThreshold).length;
+    });
+    assert.ok(over > 0);
+    await page.waitForFunction((n) => document.querySelectorAll('.att-grid tbody td.sr-tot.over').length === n, over);
+    assert.deepEqual(await attSummaryMismatches(), []);
+    // The Needs-confirmation item shows the new value.
+    await gotoView('settings');
+    assert.match(await page.locator('.view-settings [data-ph="unexcusedThreshold"]').textContent(), /more than 5 absences in total/);
+    await gotoView('attendance');
+    // A bad threshold is refused inline and not saved.
+    await page.fill('[data-f="thr"]', '2.5');
+    await page.press('[data-f="thr"]', 'Enter');
+    await page.waitForFunction(() => document.querySelector('[data-err="thr"]').textContent.trim() !== '');
+    assert.equal(await page.evaluate(() => GT.store.course().attendance.unexcusedThreshold), 3);
+    await page.fill('[data-f="tthr"]', '');
+    await page.press('[data-f="tthr"]', 'Enter');
+    await page.waitForFunction(() => GT.store.course().attendance.totalAbsenceThreshold === null);
+  });
+
+  await check('privacy mode blurs every student name (.pii) in the Grades, Students and Attendance views', async () => {
     await resetSample();
     await page.click('#btn-privacy');
     await page.waitForFunction(() => document.body.classList.contains('privacy-on'));
-    for (const view of ['grades', 'students']) {
+    for (const view of ['grades', 'students', 'attendance']) {
       await gotoView(view);
       const r = await page.evaluate(() => {
         const names = new Set();
@@ -1123,7 +1741,7 @@ async function run() {
     }
     await page.click('#btn-privacy');
     await page.waitForFunction(() => !document.body.classList.contains('privacy-on'));
-    const filter = await page.locator('.view-students .pii').first().evaluate((e) => getComputedStyle(e).filter);
+    const filter = await page.locator('#view .pii').first().evaluate((e) => getComputedStyle(e).filter);
     assert.equal(filter, 'none');
   });
 
@@ -1240,6 +1858,40 @@ async function run() {
     assert.equal(JSON.parse(await idbStored('state')).courses[0].code, 'FLUSH-B');
   });
 
+  await check('a mark made just before a reload is kept (synchronous copy when the page goes away), also mid-save', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    await page.evaluate(() => GT.store.flush());
+    const sid = (await studentsByName())[0].id;
+    const want = (await markOf(sid, 5)) === 'A' ? 'E' : 'A';
+    await attCell(sid, 5).click();
+    await page.keyboard.press(want.toLowerCase());
+    assert.equal(await markOf(sid, 5), want);
+    assert.equal(await page.evaluate(() => GT.store.saveStatus().phase), 'pending', 'the autosave has not run yet');
+    await page.reload(); // at once: the IndexedDB save started on pagehide cannot commit in time
+    await ready();
+    assert.equal(await markOf(sid, 5), want, 'a mark made right before a reload was lost');
+    // A save that is still running when the page goes away (it never commits): the change is kept too.
+    const want2 = want === 'A' ? 'E' : 'A';
+    await page.evaluate(async ([s, m]) => {
+      GT.storage.save = () => new Promise(() => {}); // a save that dies with the page
+      const ses = GT.store.course().attendance.sessions[5];
+      GT.store.transact('Mark', (c) => GT.attendance.setMark(c, s, ses.id, m));
+      await new Promise((res) => setTimeout(res, 450));
+      if (GT.store.saveStatus().phase !== 'saving') throw new Error('expected a running save');
+    }, [sid, want2]);
+    await page.reload();
+    await ready();
+    assert.equal(await markOf(sid, 5), want2, 'a mark saved by a save that never finished was lost');
+    // The next IndexedDB save includes the copy and removes it, so it can never win over newer data.
+    await page.evaluate(() => GT.store.transact('Edit', (c) => { c.title = c.title + '.'; }));
+    await page.evaluate(() => GT.store.flush());
+    assert.equal(await page.evaluate(() => localStorage.getItem('grade-tracker:state')), null);
+    const stored = JSON.parse(await idbStored('state'));
+    const ses5 = stored.courses[0].attendance.sessions[5].id;
+    assert.equal(stored.courses[0].attendance.records[sid][ses5], want2);
+  });
+
   await check('keyboard focus stays on the tabs and the status bar across autosave re-renders', async () => {
     await resetSample();
     await page.waitForTimeout(600); // let the reset autosave finish
@@ -1251,10 +1903,16 @@ async function run() {
     await page.keyboard.press('ArrowRight');
     await page.waitForTimeout(1000); // navigation autosaves; the 'saved' notification re-renders the shell
     assert.equal(await focused(), 'tab-students');
+    // The tab after Students (Attendance since stage 3), read from the tab strip.
+    const next = await page.evaluate(() => {
+      const ids = [...document.querySelectorAll('#tabs .tab')].map((t) => t.getAttribute('data-view'));
+      return ids[ids.indexOf('students') + 1];
+    });
+    assert.equal(next, 'attendance');
     await page.keyboard.press('ArrowRight');
-    await page.waitForFunction(() => GT.store.state.ui.activeView === 'settings');
+    await page.waitForFunction((v) => GT.store.state.ui.activeView === v, next);
     await page.waitForTimeout(700);
-    assert.equal(await focused(), 'tab-settings');
+    assert.equal(await focused(), 'tab-' + next);
     await page.focus('#statusbar [data-act="shortcuts"]');
     await page.evaluate(() => GT.store.transact('Title', (c) => { c.title = c.title + '.'; }));
     await page.waitForTimeout(700);

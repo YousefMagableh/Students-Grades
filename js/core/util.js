@@ -88,13 +88,23 @@
     return { kind: 'invalid', text: raw.trim() };
   }
 
-  /** Parses a non-negative whole-number field (weeks late, absence counts): "2" -> 2.
-   * Returns null when empty or invalid, including fractions ("1.5") and percentages ("88%"). */
+  /** Typed text a count field accepts: digits only, optionally followed by ".0" ("2", "02", "2.0"). */
+  var COUNT_RE = /^\d+(\.0*)?$/;
+
+  /** Parses a non-negative whole-number field (weeks late, absence counts, thresholds): "2" -> 2.
+   * Text must be plain digits (optionally "2.0"; spaces around are fine) and at most MAX_INPUT_ABS.
+   * Returns null when empty or invalid, including fractions ("1.5"), percentages ("88%"), signs
+   * ("-1", "+2"), separators ("1,000") and scientific notation ("1e3", which would store 1000).
+   * A number is accepted when it is a whole number from 0 to MAX_INPUT_ABS. */
   function parseCount(input) {
-    if (typeof input === 'string' && /%\s*$/.test(input)) return null;
-    var p = parseScoreInput(input);
-    if (p.kind !== 'number' || p.value < 0 || Math.floor(p.value) !== p.value) return null;
-    return p.value;
+    if (typeof input === 'number') {
+      return isSaneNumber(input) && input >= 0 && Math.floor(input) === input ? input + 0 : null; // -0 -> 0
+    }
+    if (typeof input !== 'string') return null;
+    var s = input.trim(); // also trims non-breaking spaces
+    if (!COUNT_RE.test(s)) return null;
+    var v = Number(s);
+    return isSaneNumber(v) ? v : null;
   }
 
   /** Formats a number for display with at most `decimals` places, trimming trailing zeros

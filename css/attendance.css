@@ -1,0 +1,463 @@
+/* Grade Tracker - Attendance view (GT.views.attendance). Colors come only from the tokens in base.css,
+ * so the light and dark themes both work. Column widths and sticky offsets match W in js/ui/attendance.js. */
+
+.view-attendance { gap: 12px; }
+
+/* ------------------------------------------------------------------ header: course, mode */
+
+.att-head { align-items: flex-start; }
+.att-head-text { min-width: 0; }
+.att-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0; }
+.att-title-sub { font-weight: 500; color: var(--text-muted); font-size: 16px; }
+.att-sub { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.att-sub .chip .icon { width: 13px; height: 13px; }
+.att-warn-chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* the mode selector: three small cards, each with its one-line explanation */
+.att-modes {
+  display: flex; gap: 3px; flex-wrap: wrap; padding: 3px;
+  background: var(--bg-sunken); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.att-mode {
+  appearance: none; border: 0; background: transparent; font: inherit; color: var(--text-muted);
+  display: flex; flex-direction: column; gap: 1px; text-align: left; max-width: 236px;
+  padding: 6px 12px 7px; border-radius: 6px; cursor: pointer;
+}
+.att-mode .am-name { font-weight: 650; font-size: 13px; color: var(--text); }
+.att-mode .am-help { font-size: 11.5px; line-height: 1.3; }
+.att-mode:hover { background: var(--bg-hover); }
+.att-mode[aria-pressed="true"] { background: var(--bg-elev); box-shadow: var(--shadow-sm), inset 0 0 0 1.5px var(--accent); }
+.att-mode[aria-pressed="true"] .am-name { color: var(--accent); }
+.att-mode:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+
+/* ------------------------------------------------------------------ toolbar and legend */
+
+.att-toolbar { row-gap: 8px; }
+.att-toolbar .search input { width: 230px; }
+.att-toolbar [hidden] { display: none; }
+.att-count { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.att-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; font-size: 12px; color: var(--text-muted); }
+.att-legend > span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.att-legend .lg-hint { color: var(--text-faint); white-space: normal; }
+.lg-m {
+  display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 18px;
+  border-radius: 4px; border: 1px solid var(--border); background: var(--bg-elev);
+  font-size: 11px; font-weight: 700;
+}
+.lg-m.mp { color: var(--success); }
+.lg-m.ma { background: var(--danger-soft); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); }
+.lg-m.me { background: var(--info-soft); color: var(--info); border-color: color-mix(in srgb, var(--info) 30%, var(--border)); }
+
+/* ------------------------------------------------------------------ the marking grid */
+
+.att-wrap {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  /* --att-top: the box's page offset (set by attendance.js), so the box ends at the bottom of the window */
+  max-height: max(340px, calc(100vh - var(--att-top, 300px) - 16px));
+  min-height: 220px;
+  overscroll-behavior: contain;
+}
+
+.att-grid {
+  --att-line: color-mix(in srgb, var(--border) 85%, transparent);
+  --att-sel: color-mix(in srgb, var(--accent) 17%, transparent);
+  --att-hover: color-mix(in srgb, var(--text) 4%, transparent);
+  --att-computed: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-elev));
+  --att-unheld: color-mix(in srgb, var(--bg-sunken) 70%, var(--bg-elev));
+  --att-dot: color-mix(in srgb, var(--text-faint) 45%, transparent);
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 13px;
+  color: var(--text);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.att-grid:focus { outline: none; }
+.att-grid:focus-visible:not([aria-activedescendant]) { outline: 2px solid var(--focus); outline-offset: -2px; }
+
+.att-grid th, .att-grid td {
+  height: 30px;
+  padding: 0 6px;
+  border-right: 1px solid var(--att-line);
+  border-bottom: 1px solid var(--att-line);
+  background-color: var(--bg-elev);
+  white-space: nowrap;
+  vertical-align: middle;
+  text-align: left;
+}
+/* Only cells whose text can be long clip it (fewer clip layers = faster layout of 59 x 36 cells). */
+.att-grid thead th, .att-grid td.c-last, .att-grid td.c-first, .att-grid td.sr-warn, .att-grid tfoot th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.att-grid .num { text-align: right; font-variant-numeric: tabular-nums; }
+.att-grid tbody td { cursor: cell; }
+.att-grid tbody td.sc, .att-grid tbody td.sr { cursor: default; }
+
+/* column widths (the first row decides with table-layout: fixed) */
+.att-grid .c-no { width: 46px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.att-grid .c-last { width: 128px; font-weight: 550; }
+.att-grid .c-first { width: 112px; font-weight: 550; }
+.att-grid th.ses { width: 48px; }
+.att-grid .sr-exc { width: 66px; }
+.att-grid .sr-unx { width: 80px; }
+.att-grid .sr-tot { width: 60px; }
+.att-grid .sr-arate { width: 64px; }
+.att-grid .sr-urate { width: 80px; }
+.att-grid .sr-streak { width: 64px; }
+.att-grid .sr-warn { width: 178px; }
+
+/* sticky identity columns (left) */
+.att-grid .sc { position: sticky; z-index: 1; }
+.att-grid .sc1, .att-grid .sc-span { left: 0; }
+.att-grid .sc2 { left: 46px; }
+.att-grid .sc3 { left: 174px; border-right: 1px solid var(--border-strong); }
+.att-grid .sc-span { border-right: 1px solid var(--border-strong); }
+
+/* sticky summary columns (right): Excused, Unexcused, Total, Absence rate, Unexcused rate, Longest streak, warning */
+.att-grid .sr { position: sticky; z-index: 1; background-color: var(--att-computed); }
+.att-grid .sr-warn { right: 0; }
+.att-grid .sr-streak { right: 178px; }
+.att-grid .sr-urate { right: 242px; }
+.att-grid .sr-arate { right: 322px; }
+.att-grid .sr-tot { right: 386px; }
+.att-grid .sr-unx { right: 446px; }
+.att-grid .sr-exc { right: 526px; box-shadow: inset 1px 0 0 var(--border-strong); }
+.att-grid .sr-span { right: 0; box-shadow: inset 1px 0 0 var(--border-strong); }
+/* Not enough room for them AND at least 6 session columns (a small or zoomed window): attendance.js adds
+ * .sr-static and they scroll with the sessions instead of covering them (headers still stick to the top). */
+.att-grid.sr-static tbody td.sr { position: static; }
+.att-grid.sr-static thead th.sr { right: auto; z-index: 3; }
+.att-grid.sr-static tfoot .sr-span { right: auto; z-index: 3; }
+
+.att-narrow-note {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12.5px; color: var(--text-muted);
+}
+.att-narrow-note[hidden] { display: none; }
+.att-narrow-note > .icon { flex: none; color: var(--info); }
+.att-narrow-note > span { flex: 1 1 220px; min-width: 0; }
+.att-narrow-note .btn { padding-top: 2px; padding-bottom: 2px; }
+
+/* header row (sticky top) */
+.att-grid thead th {
+  position: sticky; top: 0; z-index: 3;
+  height: auto; padding: 5px 6px;
+  background-color: var(--bg-sunken);
+  border-bottom: 1px solid var(--border-strong);
+  font-size: 12px; font-weight: 650; line-height: 1.2;
+  vertical-align: bottom;
+  white-space: normal;
+}
+.att-grid thead th.sc, .att-grid thead th.sr { z-index: 4; }
+.att-grid thead th.sr { background-color: color-mix(in srgb, var(--bg-sunken) 80%, var(--bg-active)); padding: 4px 5px; font-size: 11px; font-weight: 600; }
+.att-grid thead th.sr-exc { box-shadow: inset 1px 0 0 var(--border-strong); }
+.att-grid .h-sub { display: block; margin-top: 1px; font-size: 10.5px; font-weight: 500; color: var(--text-muted); }
+.att-grid thead th.num .h-sub { text-align: right; }
+
+.att-grid thead th.ses { padding: 0; text-align: center; vertical-align: bottom; }
+.ses-btn {
+  all: unset; box-sizing: border-box; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
+  width: 100%; min-height: 44px; padding: 4px 1px 5px; line-height: 1.15; color: var(--text);
+}
+.ses-btn .s-wd { font-size: 10.5px; font-weight: 600; color: var(--text-muted); }
+.ses-btn .s-md { font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+.ses-btn .s-lb {
+  max-width: 100%; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 9.5px; font-weight: 600; color: var(--accent);
+}
+.ses-btn:hover { background: var(--bg-hover); }
+.ses-btn:hover .s-md { color: var(--accent); }
+.ses-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+/* a session nobody has marked yet is lighter */
+.att-grid thead th.unheld { background-color: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-elev)); }
+.att-grid thead th.unheld .s-md { color: var(--text-faint); font-weight: 500; }
+.att-grid thead th.unheld .s-wd { color: var(--text-faint); font-weight: 500; }
+.att-grid thead th.today { box-shadow: inset 0 3px 0 var(--accent); }
+.att-grid thead th.today .s-md, .att-grid thead th.today .s-wd { color: var(--accent); }
+.att-grid thead th.hdr-active { box-shadow: inset 0 -3px 0 var(--focus); }
+.att-grid thead th.today.hdr-active { box-shadow: inset 0 3px 0 var(--accent), inset 0 -3px 0 var(--focus); }
+
+/* mark cells: P subtle (success text), A danger-soft, E info-soft, blank = not recorded */
+.att-grid tbody td.m { text-align: center; font-weight: 700; font-size: 12.5px; padding: 0; }
+.att-grid tbody td.mp { color: var(--success); font-weight: 600; }
+.att-grid tbody td.ma { background-color: var(--danger-soft); color: var(--danger); }
+.att-grid tbody td.me { background-color: var(--info-soft); color: var(--info); }
+.att-grid tbody td.u { background-color: var(--att-unheld); }
+/* a blank cell in a held session: a faint dot (not recorded for this student) */
+.att-grid tbody td:not([class]):empty {
+  background-image: radial-gradient(circle, var(--att-dot) 1.4px, transparent 1.9px);
+  background-repeat: no-repeat; background-position: center;
+}
+
+/* names and withdrawn rows */
+.att-grid tbody td.c-last, .att-grid tbody td.c-first { font-weight: 550; }
+.att-grid .wd-badge { font-size: 10px; padding: 2px 5px; margin-left: 4px; }
+.att-grid tbody tr.wd td { color: var(--withdrawn-text); }
+.att-grid tbody tr.wd td.c-last, .att-grid tbody tr.wd td.c-first { font-weight: 450; }
+.att-grid tbody tr.wd td.m { opacity: 0.6; }
+
+/* summary cells */
+.att-grid tbody td.sr.zero { color: var(--text-faint); }
+.att-grid tbody td.sr.over {
+  background-color: var(--warn-bg); color: var(--warn); font-weight: 700;
+  box-shadow: inset 0 0 0 1px var(--warn-border);
+}
+.att-grid tbody td.sr-warn { padding: 0 5px; }
+.att-chip { font-size: 11px; font-weight: 650; padding: 2px 7px; line-height: 1.35; }
+.att-chip .att-chip-note { font-size: 0.9em; font-weight: 500; }
+/* In the grid the chip takes two short lines, so "(warning only)" stays in view in a narrow column
+ * (T5: a warning never changes a grade) and the row keeps its height. */
+.att-grid .att-chip {
+  display: inline-block; max-width: 100%; vertical-align: middle;
+  padding: 1px 6px; border-radius: 6px;
+  font-size: 10.5px; line-height: 1.15; white-space: normal;
+}
+.att-grid .att-chip .att-chip-note { display: block; font-size: 9.5px; }
+.chip.danger.att-chip { border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+
+/* warning rows: a stripe on the No cell, so it shows on the left too */
+.att-grid tbody tr.w-fail td.c-no { background-image: linear-gradient(to right, var(--danger) 0 3px, transparent 3px); }
+.att-grid tbody tr.w-drop td.c-no { background-image: linear-gradient(to right, var(--warn) 0 3px, transparent 3px); }
+
+/* hover, range and the active cell */
+.att-grid tbody tr:hover td:not(.c-no) { background-image: linear-gradient(var(--att-hover), var(--att-hover)); }
+.att-grid tbody td.in-range, .att-grid tbody tr:hover td.in-range { background-image: linear-gradient(var(--att-sel), var(--att-sel)); }
+.att-grid tbody td.is-active { box-shadow: inset 0 0 0 2px var(--focus); }
+.att-grid:not(:focus) tbody td.is-active { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--focus) 45%, transparent); }
+.att-grid tbody tr.row-active td.c-last { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--focus) 55%, transparent); }
+
+/* footer: per-session counts for active students (4 sticky rows) */
+.att-grid tfoot th, .att-grid tfoot td {
+  position: sticky; z-index: 3;
+  height: 22px; padding: 0 3px;
+  background-color: var(--bg-sunken);
+  border-bottom: 0;
+  font-size: 11.5px; font-weight: 650; color: var(--text-muted);
+  text-align: center; font-variant-numeric: tabular-nums;
+}
+.att-grid tfoot tr.f1 > * { bottom: 66px; border-top: 1px solid var(--border-strong); }
+.att-grid tfoot tr.f2 > * { bottom: 44px; }
+.att-grid tfoot tr.f3 > * { bottom: 22px; }
+.att-grid tfoot tr.f4 > * { bottom: 0; }
+.att-grid tfoot .sc-span, .att-grid tfoot .sr-span { z-index: 4; }
+.att-grid tfoot .sr-span { background-color: color-mix(in srgb, var(--bg-sunken) 80%, var(--bg-active)); text-align: left; padding-left: 8px; }
+.att-grid tfoot .f-label { text-align: left; padding-left: 8px; color: var(--text); }
+.att-grid .f-note { margin-left: 6px; font-weight: 500; color: var(--text-faint); }
+.att-grid tfoot td.fp { color: var(--success); }
+.att-grid tfoot td.fa { color: var(--danger); }
+.att-grid tfoot td.fe { color: var(--info); }
+.att-grid tfoot td.fu { color: var(--warn); }
+.att-grid tfoot td.zero { color: var(--text-faint); font-weight: 500; }
+.att-grid tfoot td.u { background-color: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-elev)); }
+
+.att-grid .no-rows td { height: auto; cursor: default; }
+.att-grid .no-rows-msg { position: sticky; left: 0; padding: 24px 16px; color: var(--text-muted); white-space: normal; }
+
+/* a row or card that was just jumped to */
+@keyframes att-flash-ring { 0%, 35% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 3px transparent; } }
+@keyframes att-flash-cell { 0%, 40% { background-color: var(--accent-soft); } }
+.card.att-flash { animation: att-flash-ring 1.6s var(--ease); }
+.att-grid tbody tr.att-flash td:not(.m), .att-totals tbody tr.att-flash td { animation: att-flash-cell 1.6s var(--ease); }
+
+/* ------------------------------------------------------------------ empty states */
+
+.att-off, .att-empty { text-align: center; }
+.att-off-state { padding: 44px 24px; }
+.att-off-state p, .att-empty p { max-width: 620px; margin-left: auto; margin-right: auto; }
+.att-off-ico { width: 40px; height: 40px; color: var(--text-faint); margin-bottom: 8px; }
+.att-off-kept { display: inline-flex; align-items: center; gap: 6px; color: var(--success); }
+.att-off-modes {
+  list-style: none; margin: 18px auto 0; padding: 0; max-width: 620px; text-align: left;
+  display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--text-muted);
+}
+.att-empty { border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); background: var(--bg-elev); }
+.att-nocore { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ------------------------------------------------------------------ totals-only mode */
+
+.att-totals-bar { align-items: center; }
+.att-held { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.att-held label { font-size: 13px; font-weight: 600; }
+.att-held .help { font-size: 12px; color: var(--text-faint); }
+.att-held .help.is-needed { color: var(--warn); font-weight: 600; }
+.att-totals-note { display: flex; align-items: flex-start; gap: 8px; }
+.att-totals-note .icon { flex: none; margin-top: 2px; color: var(--info); }
+.att-totals-wrap { width: fit-content; max-width: 100%; max-height: max(340px, calc(100vh - 260px)); }
+.att-totals { width: auto; }
+.att-totals th .h-sub { display: block; font-size: 10.5px; font-weight: 500; color: var(--text-faint); }
+.att-totals td { padding-top: 5px; padding-bottom: 5px; }
+.att-totals td.t-name { min-width: 180px; font-weight: 550; }
+.att-totals td.t-in { min-width: 120px; }
+.att-totals input.att-num { width: 72px; }
+.att-totals input.att-num.over:not(.is-invalid) { background: var(--warn-bg); border-color: var(--warn-border); color: var(--text); font-weight: 700; }
+.att-totals td.over { background: var(--warn-bg); color: var(--warn); font-weight: 700; }
+.att-totals td.too-many { color: var(--danger); font-weight: 700; }
+.att-totals .row-withdrawn td { color: var(--withdrawn-text); }
+
+/* shared: small whole-number inputs and their inline errors */
+.att-num { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
+.att-ferr { display: block; color: var(--danger); font-size: 12px; font-weight: 550; margin-top: 3px; }
+.att-ferr:empty { display: none; }
+
+/* ------------------------------------------------------------------ cards: warnings, settings */
+
+.att-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 14px; align-items: start; }
+.att-cards .card-header h2 { display: inline-flex; align-items: center; gap: 7px; font-size: 15px; }
+.att-cards .card-header h2 .icon { color: var(--text-muted); }
+
+.att-no-warn { display: flex; align-items: center; gap: 6px; margin: 0; }
+.att-no-warn .icon { color: var(--success); }
+.att-warn-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.aw-item {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev);
+}
+.aw-main { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.aw-no { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.aw-name { font-weight: 650; }
+.aw-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.aw-detail { grid-column: 1; line-height: 1.4; }
+.aw-actions { grid-column: 2; grid-row: 1 / span 2; display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
+
+.att-set { display: flex; flex-direction: column; gap: 16px; }
+.att-set .field > label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; color: var(--text); }
+.att-set .field .check { font-weight: 600; }
+.att-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.att-set .help { line-height: 1.45; }
+.att-confirm { margin-left: 4px; vertical-align: middle; }
+.att-rule { border: 0; padding: 0; margin: 0; min-width: 0; }
+.att-rule legend { padding: 0; margin-bottom: 4px; font-size: 13px; font-weight: 600; }
+.att-rule-row label { font-weight: 500; }
+.att-rule-sep { color: var(--text-faint); }
+.att-policy p { margin: 0; }
+.att-policy p + p { margin-top: 6px; }
+
+/* ------------------------------------------------------------------ session manager (dialog) */
+
+.sm-intro { margin-bottom: 10px; font-size: 13px; }
+.sm-summary { font-size: 12.5px; color: var(--text-muted); margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.sm-table-wrap { max-height: min(40vh, 360px); }
+.sm-table th, .sm-table td { padding: 4px 8px; }
+.sm-table tr.sm-today td { background: var(--accent-soft); }
+.sm-table .sm-wd { display: none; }
+.sm-actions { text-align: right; white-space: nowrap; }
+.sm-actions .btn { min-width: 28px; min-height: 28px; }
+.sm-del { color: var(--danger); }
+.sm-del:hover { background: var(--danger-soft); }
+.sm-empty { display: flex; align-items: center; gap: 8px; }
+.sm-add, .sm-gen { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.sm-add h3, .sm-gen h3 { font-size: 13px; margin: 0 0 8px; }
+.sm-add .field-row { align-items: flex-end; }
+.sm-label-field { flex: 1 1 200px; }
+.sm-label-field input { width: 100%; }
+.sm-gen-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sm-gen-head h3 { margin: 0; }
+.sm-gen-body { margin-top: 10px; }
+.sm-gen-body[hidden] { display: none; }
+.sm-days { border: 0; padding: 0; margin: 12px 0; display: flex; gap: 6px 14px; flex-wrap: wrap; align-items: center; }
+.sm-days legend { padding: 0; margin-bottom: 4px; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.sm-g-preview { font-size: 13px; margin: 10px 0 4px; display: flex; align-items: center; gap: 6px; min-height: 1.4em; }
+.sm-g-preview .icon { color: var(--info); flex: none; }
+.sm-err { color: var(--danger); font-size: 12.5px; min-height: 1em; margin: 6px 0; }
+
+/* ------------------------------------------------------------------ roll call (dialog) */
+
+.rc-top { display: flex; align-items: flex-end; gap: 12px 16px; flex-wrap: wrap; }
+.rc-ses-field select { min-width: 280px; }
+.rc-progress { font-size: 13px; font-variant-numeric: tabular-nums; padding-bottom: 7px; }
+.rc-top .btn { margin-left: auto; }
+.rc-help { margin: 10px 0 6px; font-size: 12px; color: var(--text-faint); }
+.rc-list {
+  list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius);
+  max-height: min(52vh, 560px); overflow: auto; overscroll-behavior: contain;
+}
+.rc-row { display: flex; align-items: center; gap: 12px; padding: 6px 10px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.rc-row:last-child { border-bottom: 0; }
+.rc-row.is-current { background: var(--accent-soft); box-shadow: inset 4px 0 0 var(--accent); }
+.rc-no { width: 30px; flex: none; text-align: right; color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.rc-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 600; }
+.rc-btns { display: flex; align-items: center; gap: 6px; flex: none; }
+.rc-b {
+  appearance: none; font: inherit; cursor: pointer;
+  width: 66px; height: 44px; border-radius: 8px;
+  border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--text-muted);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  font-size: 17px; font-weight: 750; line-height: 1;
+}
+.rc-b .rc-bl { font-size: 10px; font-weight: 600; }
+.rc-b:hover { background: var(--bg-hover); color: var(--text); }
+.rc-b:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.rc-p[aria-pressed="true"] { background: var(--success-soft); border-color: var(--success); color: var(--success); }
+.rc-a[aria-pressed="true"] { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+.rc-e[aria-pressed="true"] { background: var(--info-soft); border-color: var(--info); color: var(--info); }
+.rc-x { color: var(--text-faint); }
+.rc-row[data-mark=""] .rc-x { visibility: hidden; }
+.rc-help[hidden] { display: none; }
+.rc-end {
+  display: flex; align-items: flex-start; gap: 8px; margin: 8px 0 6px; padding: 5px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--success-soft);
+  font-size: 12.5px; color: var(--text);
+}
+.rc-end[hidden] { display: none; }
+.rc-end > .icon { flex: none; margin-top: 2px; color: var(--success); }
+
+/* ------------------------------------------------------------------ narrow screens */
+
+@media (max-width: 1100px) {
+  .att-mode { max-width: 200px; }
+}
+
+@media (max-width: 720px) {
+  .att-toolbar .search { flex: 1 1 150px; }
+  .att-toolbar .search input { width: 100%; }
+  .att-toolbar .btn .bl {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .att-legend .lg-hint { display: none; }
+  .att-modes { width: 100%; }
+  .att-mode { flex: 1 1 0; max-width: none; padding: 6px 8px; }
+  .att-mode .am-help { display: none; }
+  /* Only No and Last Name stay pinned on the left, and the summary scrolls with the sessions. */
+  .att-grid .sc3 { position: static; }
+  .att-grid thead th.sc3 { position: sticky; left: auto; z-index: 3; }
+  .att-grid .sc2 { border-right: 1px solid var(--border-strong); }
+  .att-grid .sr, .att-grid tbody td.sr { position: static; }
+  /* The footer label spans No, Last and First: let its First-name part scroll away like the body's
+   * (it sticks at -112px, the First column's width), so it never covers the first session counts. */
+  .att-grid tfoot .sc-span { left: -112px; padding-left: 120px; }
+  .att-grid thead th.sr { position: sticky; right: auto; z-index: 3; }
+  .att-grid tfoot .sr-span { position: sticky; right: auto; }
+  .att-wrap { max-height: max(300px, calc(100vh - 200px)); }
+  .att-cards { grid-template-columns: minmax(0, 1fr); }
+  .aw-item { grid-template-columns: minmax(0, 1fr); }
+  .aw-actions { grid-column: 1; grid-row: auto; flex-direction: row; }
+  .rc-row { flex-wrap: wrap; row-gap: 4px; }
+  .rc-name { flex: 1 1 calc(100% - 44px); }
+  .rc-btns { width: 100%; justify-content: flex-end; }
+  .rc-b { width: 60px; }
+  .rc-ses-field select { min-width: 0; width: 100%; }
+  /* Session manager: no # and Day columns, the weekday goes into the date, so edit AND delete fit. */
+  .sm-table .sm-c-no, .sm-table .sm-c-day, .sm-table .sm-yr { display: none; }
+  .sm-table .sm-wd { display: inline; }
+  .sm-table th, .sm-table td { padding: 4px 6px; }
+  .sm-table .sm-c-label { overflow-wrap: anywhere; }
+  .sm-actions .btn { min-width: 32px; min-height: 32px; }
+}
+
+@media print {
+  .att-toolbar, .att-legend, .att-narrow-note, .att-modes, .aw-actions, .att-set-card, .att-warn-chip { display: none !important; }
+  .att-wrap, .att-totals-wrap { max-height: none; overflow: visible; border: 0; width: auto; }
+  .att-grid thead th, .att-grid tfoot td, .att-grid tfoot th, .att-grid .sc, .att-grid .sr { position: static; }
+  .att-grid tbody td.is-active, .att-grid tbody td.in-range, .att-grid tbody tr.row-active td { box-shadow: none !important; background-image: none !important; }
+}

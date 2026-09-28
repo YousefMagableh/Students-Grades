@@ -1869,25 +1869,151 @@
       (sub ? '<div class="sd-tile-sub">' + sub + '</div>' : '') + '</div>';
   }
 
-  function attendanceHtml(course, sid) {
-    if (!GT.attendance || typeof GT.attendance.summary !== 'function') return '';
+  // Attendance section of the student detail (stage 3, T3-T5, X7). Numbers come from GT.attendance.summary,
+  // the same numbers as the Grades and Attendance tabs. Words: "Excused (allowed, instructor-approved)" and
+  // "Absent (not allowed, unexcused)" (DECISIONS 3). Nothing is shown when attendance is off.
+
+  function attDate(iso, withYear) {
+    if (!util.isIsoDate(iso)) return String(iso || '');
+    var md = util.MONTH_SHORT[parseInt(iso.slice(5, 7), 10) - 1] + ' ' + parseInt(iso.slice(8, 10), 10);
+    return util.WEEKDAY_SHORT[util.weekday(iso)] + ' ' + md + (withYear ? ', ' + iso.slice(0, 4) : '');
+  }
+
+  function attShortDate(iso) {
+    if (!util.isIsoDate(iso)) return String(iso || '');
+    return util.MONTH_SHORT[parseInt(iso.slice(5, 7), 10) - 1] + ' ' + parseInt(iso.slice(8, 10), 10);
+  }
+
+  function attNum(x) { return typeof x === 'number' && isFinite(x) ? x : 0; }
+
+  function attPct(x) { return typeof x === 'number' && isFinite(x) ? util.formatPercent(x, 1) : '—'; }
+
+  /** The student's held sessions in date order with their mark ('P' | 'A' | 'E' | ''). */
+  function attMarksByDate(course, sid) {
+    var held = [];
+    try { held = GT.attendance.heldSessions(course) || []; } catch (e) { held = []; }
+    var rec = course.attendance && util.isPlainObject(course.attendance.records) ? course.attendance.records : {};
+    var row = util.hasOwn(rec, sid) && util.isPlainObject(rec[sid]) ? rec[sid] : {};
+    return held.map(function (ses) {
+      var m = util.hasOwn(row, ses.id) ? row[ses.id] : '';
+      return { ses: ses, mark: m === 'P' || m === 'A' || m === 'E' ? m : '' };
+    });
+  }
+
+  function attTile(label, value, cls, title) {
+    return '<div class="sd-att-tile' + (cls ? ' ' + cls : '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' +
+      '<div class="sd-att-label">' + label + '</div><div class="sd-att-value">' + value + '</div></div>';
+  }
+
+  /** s: the student (optional). A withdrawn student keeps the numbers and the absences by date but gets no
+   * warning (no F/drop or threshold callout, no highlight): warnings cover active students only (STAGE3 §1),
+   * the same rule as the Attendance tab and the Grades grid. */
+  function attendanceHtml(course, sid, s) {
+    var A = GT.attendance;
+    if (!A || typeof A.summary !== 'function') return '';
     if (!course.attendance || course.attendance.mode === 'off') return '';
     var a;
-    try { a = GT.attendance.summary(course, sid); } catch (e) { return ''; }
+    try { a = A.summary(course, sid); } catch (e) { return ''; }
     if (!a) return '';
-    function n(x) { return typeof x === 'number' && isFinite(x) ? x : 0; }
-    var rec = n(a.recorded);
-    var rate = function (x) { return rec > 0 ? util.formatPercent(100 * x / rec, 1) : '—'; };
+    var att = course.attendance;
+    var totals = a.mode === 'totals';
+    var rec = attNum(a.recorded);
+    var thr = typeof att.unexcusedThreshold === 'number' ? att.unexcusedThreshold : null;
+    var tthr = typeof att.totalAbsenceThreshold === 'number' ? att.totalAbsenceThreshold : null;
+    var drop = typeof att.dropStreak === 'number' ? att.dropStreak : 3;
+    var countE = att.excusedCountsTowardStreak === true;
+    var wd = !!(s && s.status === 'withdrawn');
+    var warning = wd ? null : a.warning;
+    var over = !wd && !!a.overThreshold;
+    var overT = !wd && !!a.overTotalThreshold;
+
+    var head = '<div class="sd-hist-head"><h4 class="section-label">Attendance <span class="muted">(' + (totals ? 'totals only' : 'per session') + ')</span></h4>' +
+      (GT.views && GT.views.attendance ? '<button type="button" class="btn btn-sm btn-ghost no-print" data-sd="attendance" data-fk="sd-attendance">' +
+        'Open in Attendance' + icon('chevron-right') + '</button>' : '') + '</div>';
+
+    var tiles = '<div class="sd-att-tiles">' +
+      attTile('Excused <span class="sd-att-sub">(allowed)</span>', String(attNum(a.excused)), 'sd-att-exc', 'Excused absences: allowed, approved by the instructor') +
+      attTile('Unexcused <span class="sd-att-sub">(not allowed)</span>',
+        (over ? icon('alert', 'icon-sm') + ' ' : '') + attNum(a.unexcused), 'sd-att-unx' + (over ? ' is-over' : ''),
+        'Unexcused absences: not allowed' + (over && thr !== null ? '. Above the unexcused-absence threshold (' + thr + ')' : '')) +
+      attTile('Total absences', (overT ? icon('alert', 'icon-sm') + ' ' : '') + attNum(a.totalAbsences), 'sd-att-tot' + (overT ? ' is-over' : ''),
+        'Excused + unexcused' + (overT && tthr !== null ? '. Above the total-absence threshold (' + tthr + ')' : '')) +
+      attTile('Absence rate', attPct(a.absenceRate), 'sd-att-arate', 'Total absences as a percentage of the recorded sessions') +
+      attTile('Unexcused rate', attPct(a.unexcusedRate), 'sd-att-urate', 'Unexcused absences as a percentage of the recorded sessions') +
+      attTile('Longest streak', totals ? '<span class="sd-att-na">n/a</span>' : String(attNum(a.longestStreak)), 'sd-att-streak',
+        totals ? 'n/a in totals mode: streaks need the date of each absence' : 'Most absences in a row') +
+      '</div>';
+
+    var basis;
+    if (totals) {
+      basis = 'Out of ' + plural(rec, 'session') + ' held so far (typed in the Attendance tab). Absence dates are not recorded in totals mode, so streak warnings are n/a.';
+    } else {
+      var unmarked = attNum(a.unmarked);
+      basis = 'Out of ' + plural(rec, 'recorded session') + (unmarked ? ' (' + attNum(a.held) + ' held; ' + plural(unmarked, 'session') + ' without a mark for this student)' : '') + '. ' +
+        (countE ? 'Excused absences count toward a streak (course setting).' : 'Only unexcused absences make a streak; an excused absence breaks it (course setting).');
+    }
+
+    // Warnings (T4, T5): never change the grade.
     var warn = '';
-    if (a.warning === 'fail') warn += '<div class="callout callout-danger">' + icon('alert') + ' ' + n(a.longestStreak) + ' consecutive absences: the syllabus rule says F. Warning only; the grade is not changed automatically.</div>';
-    else if (a.warning === 'drop') warn += '<div class="callout callout-warn">' + icon('alert') + ' ' + n(a.longestStreak) + ' consecutive absences: the syllabus rule says one letter grade drop. Warning only; the grade is not changed automatically.</div>';
-    if (a.overThreshold) warn += '<div class="callout callout-warn">' + icon('alert') + ' Unexcused absences are above the course threshold.</div>';
-    return '<section class="sd-section"><h4 class="section-label">Attendance</h4><dl class="dl sd-att">' +
-      '<dt>Recorded sessions</dt><dd class="num">' + rec + '</dd>' +
-      '<dt>Total absences</dt><dd class="num">' + n(a.totalAbsences) + ' <span class="muted">(' + n(a.unexcused) + ' unexcused, ' + n(a.excused) + ' excused)</span></dd>' +
-      '<dt>Absence rate</dt><dd class="num">' + rate(n(a.totalAbsences)) + '</dd>' +
-      '<dt>Unexcused rate</dt><dd class="num">' + rate(n(a.unexcused)) + '</dd>' +
-      '<dt>Longest absence streak</dt><dd class="num">' + n(a.longestStreak) + '</dd></dl>' + warn + '</section>';
+    var runs = Array.isArray(a.streaks) ? a.streaks : [];
+    var warnRuns = runs.filter(function (r) { return r && attNum(r.length) >= drop; });
+    var runText = warnRuns.map(function (r) {
+      var dates = Array.isArray(r.dates) && r.dates.length ? r.dates : [r.startDate, r.endDate];
+      return dates.map(attShortDate).join(', ');
+    }).join('; ');
+    if (warning === 'fail' || warning === 'drop') {
+      warn += '<div class="callout ' + (warning === 'fail' ? 'callout-danger' : 'callout-warn') + ' sd-att-warn" data-att-warn="' + warning + '">' + icon('alert') +
+        '<span><strong>' + attNum(a.longestStreak) + ' absences in a row' + (runText ? ' (' + esc(runText) + ')' : '') + ':</strong> the syllabus says ' +
+        (warning === 'fail' ? 'F' : 'one letter grade drop') + '. Warning only: the grade is not changed automatically.</span></div>';
+    }
+    if (over) {
+      warn += '<div class="callout callout-warn sd-att-warn" data-att-warn="threshold">' + icon('alert') + '<span>' + plural(attNum(a.unexcused), 'unexcused absence') +
+        ': above the unexcused-absence threshold' + (thr !== null ? ' (' + thr + ')' : '') + '.</span></div>';
+    }
+    if (overT) {
+      warn += '<div class="callout callout-warn sd-att-warn" data-att-warn="total-threshold">' + icon('alert') + '<span>' + plural(attNum(a.totalAbsences), 'absence') +
+        ' in total (excused + unexcused): above the total-absence threshold' + (tthr !== null ? ' (' + tthr + ')' : '') + '.</span></div>';
+    }
+    if (wd && (a.warning || a.overThreshold || a.overTotalThreshold)) {
+      warn += '<p class="small muted sd-att-wd" data-att-warn="withdrawn">Withdrawn: no attendance warning (warnings cover active students only).</p>';
+    }
+    if (a.moreAbsencesThanSessions) {
+      warn += '<div class="callout callout-warn sd-att-warn" data-att-warn="too-many">' + icon('alert') +
+        '<span>More absences than sessions held (' + rec + '). Check the numbers in the Attendance tab.</span></div>';
+    }
+
+    // Absences by date (per-session mode): excused vs unexcused, and which ones form a warning run.
+    var list = '';
+    if (!totals) {
+      var inRun = {};
+      warnRuns.forEach(function (r) { (r.sessionIds || []).forEach(function (id) { inRun[id] = r.length; }); });
+      var byDate = attMarksByDate(course, sid);
+      var absences = byDate.filter(function (x) { return x.mark === 'A' || x.mark === 'E'; });
+      var missing = byDate.filter(function (x) { return !x.mark; });
+      if (absences.length) {
+        list = '<div class="table-wrap sd-att-wrap"><table class="table sd-att-list"><thead><tr><th scope="col">Date</th><th scope="col">Absence</th><th scope="col">Note</th></tr></thead><tbody>' +
+          absences.map(function (x) {
+            var s = x.ses;
+            var kind = x.mark === 'A'
+              ? '<span class="sd-att-mark ma">A</span> Absent <span class="muted">(not allowed, unexcused)</span>'
+              : '<span class="sd-att-mark me">E</span> Excused <span class="muted">(allowed, instructor-approved)</span>';
+            var note = [];
+            if (s.label) note.push(esc(s.label));
+            if (inRun[s.id]) note.push('<span class="badge' + (wd ? '' : ' badge-warn') + '">part of ' + inRun[s.id] + ' in a row</span>');
+            return '<tr data-att-date="' + esc(s.date) + '" data-att-mark="' + x.mark + '"><td class="nowrap">' + esc(attDate(s.date, true)) + '</td><td>' + kind + '</td>' +
+              '<td>' + note.join(' ') + '</td></tr>';
+          }).join('') + '</tbody></table></div>';
+      } else {
+        list = '<p class="muted sd-att-none">' + icon('check', 'icon-sm') + ' No absences recorded' + (rec ? '' : ' yet') + '.</p>';
+      }
+      if (missing.length) {
+        list += '<p class="small muted sd-att-missing">No mark for this student on: ' +
+          esc(missing.slice(0, 12).map(function (x) { return attShortDate(x.ses.date); }).join(', ') + (missing.length > 12 ? ', …' : '')) +
+          ' (not counted, and a streak stops there).</p>';
+      }
+    }
+
+    return '<section class="sd-section sd-att-section">' + head + tiles + '<p class="small muted sd-att-basis">' + esc(basis) + '</p>' + warn + list + '</section>';
   }
 
   /** True when a history entry concerns the student: its own entries, and summary entries that list the
@@ -2071,7 +2197,7 @@
         : (r.letter ? '<span class="badge" title="Suggested letter from the cutoffs; no final letter yet">' + esc(r.letter) + ' · suggested</span>' : '')) + '</td></tr>' +
       '</tfoot></table></div></section>';
 
-    h += attendanceHtml(course, sid);
+    h += attendanceHtml(course, sid, s);
 
     h += '<section class="sd-section"><h4 class="section-label"><label for="sd-notes">Notes</label></h4>' +
       '<textarea id="sd-notes" class="pii sd-notes" data-fk="sd-notes" rows="3" aria-label="Notes for ' + esc(studentRef(s)) + '">' + esc(s.notes) + '</textarea>' +
@@ -2169,6 +2295,10 @@
         // Show the full, filterable log for this student (the dialog lists only the newest 100).
         if (closeDialog) closeDialog(null);
         GT.app.navigate('history', { studentId: studentId });
+      } else if (act === 'attendance' && GT.app && GT.app.navigate) {
+        // The student's row in the Attendance tab (per session: the grid, at their longest streak).
+        if (closeDialog) closeDialog(null);
+        GT.app.navigate('attendance', { studentId: studentId });
       }
     });
     /** Final letter from the drop-down (letters stay editable when the scores are finalized). */

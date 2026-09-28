@@ -13,7 +13,12 @@
   var db = null;
   var memory = null;
   var loadNote = null;     // set by load() when the latest copy was unreadable and an older copy was loaded
-  var lsLeftover = true;   // a localStorage copy may exist next to IndexedDB (removed after the first IndexedDB save)
+  // With IndexedDB, a localStorage copy may exist next to it: left over from an earlier session (IndexedDB
+  // failed then) or written by saveSync() as an emergency copy when the page was hidden or closed. It is
+  // removed by the first IndexedDB save that includes everything in it (a save started after it was written).
+  var lsCopy = true;       // such a copy may exist
+  var lsCopySeq = 0;       // saveSeq when it was written (0: an earlier session, so any IndexedDB save covers it)
+  var saveSeq = 0;         // counts save() and saveSync() calls, in the order their data was taken
 
   function openDb() {
     return new Promise(function (resolve, reject) {
@@ -140,6 +145,7 @@
   /** Saves the whole state. Keeps the previous save as a fallback copy. */
   function save(state) {
     var json = JSON.stringify(state);
+    var seq = ++saveSeq;
     if (backend === 'indexeddb') {
       return idbRequest('readwrite', function (s) {
         var getReq = s.get('state');
@@ -149,15 +155,18 @@
         };
         return null;
       }).then(function () {
-        // IndexedDB now holds the newest data: drop any older localStorage copy so it cannot win later.
-        if (lsLeftover) {
-          lsLeftover = false;
+        // IndexedDB now holds everything the localStorage copy has: drop that copy so it cannot win later.
+        // A copy written after this save took its data (saveSync while the save ran) is newer: keep it.
+        if (lsCopy && seq > lsCopySeq) {
+          lsCopy = false;
           try { root.localStorage.removeItem(LS_KEY); root.localStorage.removeItem(LS_PREV); } catch (e) { /* ignore */ }
         }
       }).catch(function (err) {
         // Fall back to localStorage if IndexedDB starts failing (quota, private mode).
         if (lsAvailable()) {
           backend = 'localstorage';
+          // An emergency copy written after this save took its data is newer: do not overwrite it.
+          if (lsCopy && lsCopySeq > seq) return;
           return lsSave(json);
         }
         throw err;
@@ -166,6 +175,28 @@
     if (backend === 'localstorage') return Promise.resolve().then(function () { return lsSave(json); });
     memory = json;
     return Promise.resolve();
+  }
+
+  /** Emergency copy for a page that is being hidden or closed. An IndexedDB save is asynchronous and does
+   * not commit if the page unloads first, so the state is also written synchronously to localStorage.
+   * load() prefers this copy while it is newer (meta.lastSavedAt) than the IndexedDB copy, and the next
+   * IndexedDB save that includes it removes it. Only for the IndexedDB backend: a localStorage save already
+   * completes before the page goes away, and the memory backend keeps nothing. Returns true when written;
+   * never throws (a full localStorage just means no emergency copy). */
+  function saveSync(state) {
+    if (backend !== 'indexeddb') return false;
+    try {
+      var json = JSON.stringify(state);
+      var ls = root.localStorage;
+      // IndexedDB keeps the previous version; one copy here is enough (and halves the space needed).
+      try { ls.removeItem(LS_PREV); } catch (e) { /* ignore */ }
+      ls.setItem(LS_KEY, json);
+    } catch (e2) {
+      return false;
+    }
+    lsCopy = true;
+    lsCopySeq = ++saveSeq;
+    return true;
   }
 
   function lsSave(json) {
@@ -212,6 +243,7 @@
     init: init,
     load: load,
     save: save,
+    saveSync: saveSync,
     clear: clear,
     requestPersistence: requestPersistence,
     backend: function () { return backend; },

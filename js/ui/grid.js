@@ -1459,8 +1459,12 @@
       }
     }
     if (!targets.length) {
-      if (skipped || skippedNo) ui.toast('Names and teams are not cleared with Delete. Press F2 (or double-click) to edit the cell.', { type: 'info' });
-      else notifyReadOnly();
+      if (skipped || skippedNo) {
+        ui.toast((skippedNo ? 'No, names and teams are not cleared with Delete (select only No cells to clear them).' :
+          'Names and teams are not cleared with Delete.') + ' Press F2 (or double-click) to edit the cell.', { type: 'info' });
+      } else {
+        notifyReadOnly();
+      }
       return;
     }
     var left = [];

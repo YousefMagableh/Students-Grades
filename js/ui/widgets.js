@@ -163,6 +163,7 @@
   // ------------------------------------------------------------------ dialogs (native <dialog>)
 
   var dialog = ui.dialog = {};
+  var dialogSeq = 0;
 
   /** Generic dialog. opts: { title, bodyHtml | body (Element), buttons: [{ text, value, primary, danger, validate }],
    *  wide, xwide, onMount(dlgEl, close), initialFocus (selector) }. Resolves with the clicked button value
@@ -172,15 +173,16 @@
       var prevFocus = document.activeElement;
       var dlg = document.createElement('dialog');
       dlg.className = 'dlg' + (opts.wide ? ' wide' : '') + (opts.xwide ? ' xwide' : '');
-      dlg.setAttribute('aria-labelledby', 'dlg-title');
+      // Unique title id per dialog (a dialog can open over another), kept so the dialog has an accessible name.
+      var titleId = 'dlg-title-' + (++dialogSeq);
+      dlg.setAttribute('aria-labelledby', titleId);
       dlg.innerHTML =
         '<form method="dialog" class="dlg-form" novalidate>' +
-        '<div class="dlg-head"><h2 id="dlg-title"></h2>' +
+        '<div class="dlg-head"><h2 id="' + titleId + '"></h2>' +
         '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-dlg-close aria-label="Close">' + ui.icon('x') + '</button></div>' +
         '<div class="dlg-body"></div><div class="dlg-error" role="alert"></div>' +
         '<div class="dlg-foot"></div></form>';
-      dlg.querySelector('#dlg-title').textContent = opts.title || '';
-      dlg.querySelector('#dlg-title').removeAttribute('id');
+      dlg.querySelector('.dlg-head h2').textContent = opts.title || '';
       var body = dlg.querySelector('.dlg-body');
       if (opts.body) body.appendChild(opts.body); else body.innerHTML = opts.bodyHtml || '';
       var foot = dlg.querySelector('.dlg-foot');

@@ -23,7 +23,7 @@
   --border-strong: #c7cdd6;
   --text: #17202b;
   --text-muted: #5b6675;
-  --text-faint: #8a94a3;
+  --text-faint: #6b7585;      /* 4.6:1 on --bg-elev: it carries small help and hint text */
   --accent: #2f5fd0;
   --accent-hover: #264fb3;
   --accent-soft: #e8eefc;
@@ -31,6 +31,7 @@
   --focus: #2f5fd0;
   --danger: #c2372b;
   --danger-soft: #fdecea;
+  --danger-text: #ffffff;     /* text on a solid --danger button */
   --warn: #9a6700;
   --warn-bg: #fff4c7;
   --warn-border: #f0d368;
@@ -50,7 +51,13 @@
   --cell-invalid-bg: #fde2df;
   --cell-invalid-text: #a4241a;
   --cell-range-bg: #fff1c2;
-  --withdrawn-text: #9aa3af;
+  --withdrawn-text: #6b7380;  /* greyed out but readable (4.8:1); the Withdrawn badge marks the row too */
+
+  /* Toasts are dark in the light theme and light in the dark theme */
+  --toast-success: #5fd08f;
+  --toast-warn: #f2cc60;
+  --toast-error: #ff8a7e;
+  --backdrop: rgba(15, 20, 25, 0.45);
 
   color-scheme: light;
 }
@@ -65,7 +72,7 @@ html[data-theme="dark"] {
   --border-strong: #3a4552;
   --text: #e6eaef;
   --text-muted: #a3adba;
-  --text-faint: #6f7a88;
+  --text-faint: #808b99;
   --accent: #7aa2ff;
   --accent-hover: #93b4ff;
   --accent-soft: #1d2a45;
@@ -73,6 +80,7 @@ html[data-theme="dark"] {
   --focus: #7aa2ff;
   --danger: #ff7b6e;
   --danger-soft: #3a1c1a;
+  --danger-text: #1a0b09;
   --warn: #f2cc60;
   --warn-bg: #3a3012;
   --warn-border: #7a6420;
@@ -89,7 +97,11 @@ html[data-theme="dark"] {
   --cell-invalid-bg: #4a1f1b;
   --cell-invalid-text: #ffb3aa;
   --cell-range-bg: #3d3313;
-  --withdrawn-text: #66707c;
+  --withdrawn-text: #7d8794;
+  --toast-success: #1f7a45;
+  --toast-warn: #9a6700;
+  --toast-error: #c2372b;
+  --backdrop: rgba(0, 0, 0, 0.65);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.6);
@@ -107,7 +119,7 @@ html[data-theme="dark"] {
     --border-strong: #3a4552;
     --text: #e6eaef;
     --text-muted: #a3adba;
-    --text-faint: #6f7a88;
+    --text-faint: #808b99;
     --accent: #7aa2ff;
     --accent-hover: #93b4ff;
     --accent-soft: #1d2a45;
@@ -115,6 +127,7 @@ html[data-theme="dark"] {
     --focus: #7aa2ff;
     --danger: #ff7b6e;
     --danger-soft: #3a1c1a;
+    --danger-text: #1a0b09;
     --warn: #f2cc60;
     --warn-bg: #3a3012;
     --warn-border: #7a6420;
@@ -131,7 +144,11 @@ html[data-theme="dark"] {
     --cell-invalid-bg: #4a1f1b;
     --cell-invalid-text: #ffb3aa;
     --cell-range-bg: #3d3313;
-    --withdrawn-text: #66707c;
+    --withdrawn-text: #7d8794;
+    --toast-success: #1f7a45;
+    --toast-warn: #9a6700;
+    --toast-error: #c2372b;
+    --backdrop: rgba(0, 0, 0, 0.65);
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.6);
@@ -236,6 +253,7 @@ html { scroll-padding-top: calc(var(--head-h, 96px) + 8px); }
 .statusbar .dot.warn { background: var(--warn); }
 .statusbar .dot.error { background: var(--danger); }
 .statusbar .spacer { flex: 1; }
+.statusbar .sb-info { display: contents; } /* app.js rewrites only this part; its spans stay flex items */
 
 .page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .page-header h1 { margin: 0; }
@@ -258,7 +276,12 @@ html { scroll-padding-top: calc(var(--head-h, 96px) + 8px); }
 .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
 .btn-danger:hover { background: var(--danger-soft); }
-.btn-danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+/* Destructive confirm buttons also carry .btn-primary (dialogs look them up by it), so these rules must
+ * outrank .btn-primary:hover, or the button would turn accent blue on hover. */
+.btn-danger-solid, .btn-primary.btn-danger-solid { background: var(--danger); border-color: var(--danger); color: var(--danger-text); }
+.btn-danger-solid:hover, .btn-primary.btn-danger-solid:hover {
+  background: color-mix(in srgb, var(--danger) 85%, var(--text)); border-color: color-mix(in srgb, var(--danger) 85%, var(--text)); color: var(--danger-text);
+}
 .btn-ghost { border-color: transparent; background: transparent; }
 .btn-ghost:hover { background: var(--bg-hover); }
 .btn-sm { padding: 5px 9px; min-height: 26px; font-size: 12px; }
@@ -287,6 +310,9 @@ html { scroll-padding-top: calc(var(--head-h, 96px) + 8px); }
 textarea { min-height: 80px; resize: vertical; line-height: 1.4; }
 input[type="number"] { font-variant-numeric: tabular-nums; }
 .input:focus, select:focus, textarea:focus, input:focus { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
+/* An inset ring on a checked box is the same color as its fill, so checkboxes and radios get an outer ring. */
+input[type="checkbox"]:focus, input[type="radio"]:focus { outline: none; }
+input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
 /* Invalid input (shared by every view and dialog): red border, soft red fill. */
 input.is-invalid { border-color: var(--danger); background: var(--danger-soft); color: var(--text); }
 input.is-invalid:focus { outline-color: var(--danger); border-color: var(--danger); }
@@ -376,6 +402,9 @@ table.table { border-collapse: separate; border-spacing: 0; width: 100%; font-si
 }
 .menu [role="menuitem"] svg { width: 15px; height: 15px; color: var(--text-muted); flex: none; }
 .menu [role="menuitem"]:hover, .menu [role="menuitem"]:focus { background: var(--bg-hover); outline: none; }
+/* Keyboard focus needs more than the faint hover tint: a tinted fill plus an inset ring. */
+.menu [role="menuitem"]:focus-visible, .menu [role="menuitemcheckbox"]:focus-visible { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--focus); }
+.menu [role="menuitem"].danger:focus-visible { background: var(--danger-soft); }
 .menu [role="menuitem"][aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
 .menu [role="menuitem"].danger { color: var(--danger); }
 .menu [role="menuitem"].danger svg { color: var(--danger); }
@@ -384,12 +413,13 @@ table.table { border-collapse: separate; border-spacing: 0; width: 100%; font-si
 .menu .menu-hint { margin-left: auto; font-size: 11px; color: var(--text-faint); }
 
 dialog.dlg {
-  border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 0; width: min(520px, calc(100vw - 32px));
+  border: 1px solid var(--border-strong); border-radius: var(--radius-lg); padding: 0; width: min(520px, calc(100vw - 32px));
   background: var(--bg-elev); color: var(--text); box-shadow: var(--shadow-lg);
 }
 dialog.dlg.wide { width: min(860px, calc(100vw - 32px)); }
 dialog.dlg.xwide { width: min(1100px, calc(100vw - 32px)); }
-dialog.dlg::backdrop { background: rgba(15, 20, 25, 0.45); }
+/* The fallback is for browsers where ::backdrop does not inherit custom properties yet. */
+dialog.dlg::backdrop { background: var(--backdrop, rgba(15, 20, 25, 0.45)); }
 .dlg-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px 10px; }
 .dlg-head h2 { margin: 0; font-size: 16px; }
 .dlg-body { padding: 4px 18px 14px; max-height: min(70vh, 720px); overflow: auto; }
@@ -406,9 +436,9 @@ dialog.dlg::backdrop { background: rgba(15, 20, 25, 0.45); }
   box-shadow: var(--shadow-lg); font-size: 13px; animation: toast-in 0.18s var(--ease);
 }
 .toast svg { width: 16px; height: 16px; flex: none; }
-.toast.success svg { color: #5fd08f; }
-.toast.warn svg { color: #f2cc60; }
-.toast.error svg { color: #ff8a7e; }
+.toast.success svg { color: var(--toast-success); }
+.toast.warn svg { color: var(--toast-warn); }
+.toast.error svg { color: var(--toast-error); }
 .toast button { color: inherit; border-color: color-mix(in srgb, var(--bg) 40%, transparent); background: transparent; }
 @keyframes toast-in { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
 
@@ -450,11 +480,22 @@ button.chip { font: inherit; font-size: 12px; cursor: pointer; }
   /* On phones the header scrolls away with the page to leave room for the content. */
   .app-head { position: relative; }
   .tabs { padding: 0 8px; }
+  /* Inactive tabs show only their icon (the title stays readable by screen readers), so every tab fits. */
+  .tab { position: relative; padding: 10px 10px 9px; }
+  .tab:not([aria-selected="true"]) > span:not(.count) {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+    clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
   .view { padding: 12px 12px 28px; }
   .banner { padding: 8px 12px; }
   .course-picker select { max-width: 200px; }
   .search input { width: 160px; }
-  .topbar-actions .btn .label { display: none; }
+  /* Button text is hidden to save room (app.js sets aria-label), except the last-backup indicator. */
+  .topbar-actions .btn:not(#backup-chip) .label { display: none; }
+  .topbar-actions { gap: 4px; flex-wrap: nowrap; max-width: 100%; }
+  .topbar-actions #backup-chip { flex: 0 1 auto; min-width: 0; }
+  .topbar-actions #backup-chip .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .topbar-actions #backup-chip .label-prefix { display: none; }
 }
 
 @media print {

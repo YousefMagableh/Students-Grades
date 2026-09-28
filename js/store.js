@@ -35,9 +35,16 @@
     return model.findCourse(state, cid) || state.courses[0] || null;
   }
 
-  /** Memoized calc.computeCourse for a course (active course by default). */
+  /** The course named by an explicit id (null if it no longer exists), else the active course.
+   * An explicit id never falls back to another course, so a change cannot land in the wrong one. */
+  function targetCourse(id) {
+    if (!id) return course();
+    return state ? model.findCourse(state, id) || null : null;
+  }
+
+  /** Memoized calc.computeCourse for a course (active course by default; null for an unknown id). */
   function results(id) {
-    var c = course(id);
+    var c = targetCourse(id);
     if (!c) return null;
     var key = c.id + ':' + version;
     if (resultsCache.key !== key) resultsCache = { key: key, value: calc.computeCourse(c) };
@@ -97,8 +104,8 @@
    * Returns the mutator's return value. If the mutator throws, the course is restored and the error rethrown. */
   function transact(label, mutator, opts) {
     var o = opts || {};
-    var c = course(o.courseId);
-    if (!c) throw new Error('No course selected.');
+    var c = targetCourse(o.courseId);
+    if (!c) throw new Error(o.courseId ? 'Course not found (it may have been deleted).' : 'No course selected.');
     var before = snapshot(c);
     var ret;
     try {
@@ -270,7 +277,8 @@
     var ts = util.nowIso();
     state.meta.lastSavedAt = ts;
     saving = GT.storage.save(state).then(function () {
-      status.phase = 'saved';
+      // A change made while this save ran (timer pending or flushed) is not saved yet.
+      status.phase = saveTimer || dirtyWhileSaving ? 'pending' : 'saved';
       status.at = ts;
       status.error = null;
       status.backend = GT.storage.backend();
@@ -286,11 +294,18 @@
     return saving;
   }
 
-  /** Saves immediately (e.g. before the page is hidden). */
+  /** Saves immediately if anything is unsaved (e.g. before the page is hidden). A failed save is retried. */
   function flush() {
+    var hadTimer = !!saveTimer;
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-    if (status.phase === 'pending' || dirtyWhileSaving) return doSave();
+    if (hadTimer || status.phase === 'pending' || status.phase === 'error' || dirtyWhileSaving) return doSave();
     return saving || Promise.resolve();
+  }
+
+  /** Saves now even if nothing changed (e.g. the first save of a new, empty profile). */
+  function saveNow() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    return doSave();
   }
 
   function saveStatus() {
@@ -321,6 +336,7 @@
     moveCourse: moveCourse,
     replaceState: replaceState,
     flush: flush,
+    saveNow: saveNow,
     saveStatus: saveStatus,
     version: function () { return version; }
   };

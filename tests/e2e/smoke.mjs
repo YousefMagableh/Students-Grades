@@ -127,6 +127,39 @@ async function openMenuItem(buttonSel, label) {
   await page.locator('.menu [role="menuitem"]', { hasText: label }).first().click();
 }
 
+/** The raw value stored under a key of the app's IndexedDB object store (undefined if none). */
+function idbStored(key) {
+  return page.evaluate((k) => new Promise((resolve, reject) => {
+    const r = indexedDB.open('grade-tracker', 1);
+    r.onerror = () => reject(r.error);
+    r.onsuccess = () => {
+      const g = r.result.transaction('kv', 'readonly').objectStore('kv').get(k);
+      g.onsuccess = () => { r.result.close(); resolve(g.result); };
+      g.onerror = () => reject(g.error);
+    };
+  }), key);
+}
+
+/** Runs fn(page) in a separate browser context whose IndexedDB is disabled (localStorage backend).
+ * init(arg) runs before the app on every load of that page. */
+async function withLocalStoragePage(init, arg, fn) {
+  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 } });
+  try {
+    const p = await ctx.newPage();
+    p.setDefaultTimeout(10000);
+    watch(p);
+    await p.addInitScript(([initSrc, a]) => {
+      Object.defineProperty(window, 'indexedDB', { value: undefined, configurable: true });
+      if (initSrc) (0, eval)('(' + initSrc + ')')(a);
+    }, [init ? init.toString() : '', arg === undefined ? null : arg]);
+    await p.goto(APP_URL);
+    await p.waitForFunction(() => window.GT && GT.store && GT.store.state && document.querySelector('#tabs .tab'));
+    await fn(p);
+  } finally {
+    await ctx.close();
+  }
+}
+
 // ------------------------------------------------------------------ checks
 
 async function run() {
@@ -149,6 +182,17 @@ async function run() {
     assert.equal(info.backend, 'indexeddb');
     assert.equal(info.view, 'grades');
     await page.locator('#view .empty-state').waitFor();
+  });
+
+  await check('a fresh profile is saved at boot, before any edit', async () => {
+    let stored;
+    for (let i = 0; i < 20 && !stored; i++) {
+      stored = await idbStored('state');
+      if (!stored) await page.waitForTimeout(100);
+    }
+    assert.ok(stored, 'IndexedDB has no "state" after boot');
+    const courses = JSON.parse(stored).courses.map((c) => c.id);
+    assert.deepEqual(courses, await page.evaluate(() => GT.store.state.courses.map((c) => c.id)));
   });
 
   await check('load sample data from the course menu: 59 students in SE 4351', async () => {
@@ -555,6 +599,135 @@ async function run() {
     assert.equal(r.backend, 'indexeddb');
     assert.equal(r.tab, 'students');
     assert.equal(r.logged, true);
+  });
+
+  await check('an edit made while a save is running is still saved by flush() (page hidden)', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.flush());
+    const r = await page.evaluate(async () => {
+      const orig = GT.storage.save;
+      const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+      GT.storage.save = (st) => orig(st).then(() => sleep(200)); // a slow disk
+      try {
+        GT.store.transact('A', (c) => { c.code = 'FLUSH-A'; });
+        await sleep(450); // the save of A is running
+        GT.store.transact('B', (c) => { c.code = 'FLUSH-B'; });
+        await sleep(250); // the save of A has finished; B is waiting for its timer
+        const phase = GT.store.saveStatus().phase;
+        await GT.store.flush();
+        return { phase, after: GT.store.saveStatus().phase };
+      } finally {
+        GT.storage.save = orig;
+      }
+    });
+    assert.equal(r.phase, 'pending', 'B is not saved yet, so the status must not say saved');
+    assert.equal(r.after, 'saved');
+    assert.equal(JSON.parse(await idbStored('state')).courses[0].code, 'FLUSH-B');
+  });
+
+  await check('keyboard focus stays on the tabs and the status bar across autosave re-renders', async () => {
+    await resetSample();
+    await page.waitForTimeout(600); // let the reset autosave finish
+    const focused = () => page.evaluate(() => {
+      const a = document.activeElement;
+      return a ? (a.id || a.getAttribute('data-act') || a.tagName) : null;
+    });
+    await page.focus('#tab-grades');
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(1000); // navigation autosaves; the 'saved' notification re-renders the shell
+    assert.equal(await focused(), 'tab-students');
+    await page.keyboard.press('ArrowRight');
+    await page.waitForFunction(() => GT.store.state.ui.activeView === 'settings');
+    await page.waitForTimeout(700);
+    assert.equal(await focused(), 'tab-settings');
+    await page.focus('#statusbar [data-act="shortcuts"]');
+    await page.evaluate(() => GT.store.transact('Title', (c) => { c.title = c.title + '.'; }));
+    await page.waitForTimeout(700);
+    assert.equal(await focused(), 'shortcuts');
+    await gotoView('grades');
+  });
+
+  await check('dialogs are named by their title; transact() refuses a deleted course id', async () => {
+    await resetSample();
+    await page.evaluate(() => { GT.ui.dialog.confirm({ title: 'Probe dialog title', message: 'x' }); });
+    const name = await page.evaluate(() => {
+      const d = document.querySelector('dialog[open]');
+      const t = document.getElementById(d.getAttribute('aria-labelledby'));
+      return t && d.contains(t) ? t.textContent : null;
+    });
+    assert.equal(name, 'Probe dialog title');
+    await page.keyboard.press('Escape');
+    const r = await page.evaluate(() => {
+      const before = GT.store.state.courses.map((c) => c.title);
+      let error = null;
+      try { GT.store.transact('Stale', (c) => { c.title = 'WRONG COURSE'; }, { courseId: 'c_deleted_meanwhile' }); } catch (e) { error = e.message; }
+      return { error, same: JSON.stringify(before) === JSON.stringify(GT.store.state.courses.map((c) => c.title)) };
+    });
+    assert.match(String(r.error), /Course not found/);
+    assert.equal(r.same, true);
+  });
+
+  await check('a newer localStorage copy (IndexedDB failed last session) wins on load, then is removed', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.flush());
+    await page.evaluate(() => {
+      const st = JSON.parse(JSON.stringify(GT.store.state));
+      st.courses[0].code = 'FROM-LOCALSTORAGE';
+      st.meta.lastSavedAt = new Date(Date.now() + 60000).toISOString();
+      localStorage.setItem('grade-tracker:state', JSON.stringify(st));
+    });
+    await page.reload();
+    await ready();
+    assert.equal(await page.evaluate(() => GT.store.state.courses[0].code), 'FROM-LOCALSTORAGE');
+    await page.evaluate(() => GT.store.transact('Edit', (c) => { c.title = c.title + '.'; }));
+    await page.evaluate(() => GT.store.flush());
+    assert.equal(await page.evaluate(() => localStorage.getItem('grade-tracker:state')), null);
+    assert.equal(JSON.parse(await idbStored('state')).courses[0].code, 'FROM-LOCALSTORAGE');
+  });
+
+  await check('unreadable saved data shows the banner and is never overwritten (localStorage backend)', async () => {
+    const BAD = '{"app":"grade-tracker","courses":[{"code":"TRUNCATED';
+    await withLocalStoragePage((bad) => {
+      if (!sessionStorage.getItem('gt-seeded')) { sessionStorage.setItem('gt-seeded', '1'); localStorage.setItem('grade-tracker:state', bad); }
+    }, BAD, async (p) => {
+      assert.equal(await p.evaluate(() => GT.storage.backend()), 'localstorage');
+      await p.locator('#banners', { hasText: 'Saved data could not be read' }).waitFor();
+      await p.evaluate(() => GT.store.transact('Edit', (c) => { c.title = 'edited'; }));
+      await p.evaluate(() => GT.store.flush());
+      assert.equal(await p.evaluate(() => localStorage.getItem('grade-tracker:state')), BAD);
+      const [download] = await Promise.all([p.waitForEvent('download'), p.click('#banners [data-act="download-raw"]')]);
+      const file = path.join(TMP, 'unreadable.json');
+      await download.saveAs(file);
+      assert.equal(fs.readFileSync(file, 'utf8'), BAD);
+    });
+  });
+
+  await check('localStorage backend: a state larger than half the quota still saves', async () => {
+    await withLocalStoragePage(null, null, async (p) => {
+      await p.evaluate(() => GT.store.transact('Load sample data', (c) => GT.sample.loadInto(c), { source: 'sample', historyMode: 'bulk' }));
+      await p.evaluate(() => GT.store.flush());
+      const r = await p.evaluate(async () => {
+        const KEY = 'grade-tracker:state';
+        // Simulated quota: room for two copies of the current state, not for the old copy plus a bigger new one.
+        const limit = 2 * localStorage.getItem(KEY).length + 100;
+        const orig = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (k, v) {
+          let total = 0;
+          for (let i = 0; i < this.length; i++) { const key = this.key(i); if (key !== k) total += (this.getItem(key) || '').length; }
+          if (total + String(v).length > limit) throw new DOMException('Simulated quota', 'QuotaExceededError');
+          return orig.call(this, k, v);
+        };
+        try {
+          GT.store.transact('Notes', (c) => { c.students[0].notes = 'n'.repeat(2000); });
+          await GT.store.flush();
+          return { status: GT.store.saveStatus(), notes: JSON.parse(localStorage.getItem(KEY)).courses[0].students[0].notes.length };
+        } finally {
+          Storage.prototype.setItem = orig;
+        }
+      });
+      assert.equal(r.status.phase, 'saved', 'save failed: ' + r.status.error);
+      assert.equal(r.notes, 2000);
+    });
   });
 
   await check('delete all data (typed confirmation) empties storage, also after a reload', async () => {

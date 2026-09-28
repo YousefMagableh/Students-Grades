@@ -27,7 +27,9 @@
   var renderQueued = false;
   var dismissed = {};
   var otherTabOpen = false;
-  var loadProblem = null; // { raw, message } when saved data could not be read
+  var loadProblem = null; // { raw, message } when saved data could not be read (saving is blocked)
+  var recovered = null;   // { raw, message } when the latest autosave was unreadable and an older copy was loaded
+  var regionHtml = {};    // last markup written to each shell region (see setRegionHtml)
   var persisted = false;
 
   // ------------------------------------------------------------------ helpers
@@ -54,6 +56,31 @@
   };
 
   app.params = function () { return viewParams; };
+
+  /** Selector that finds the "same" control after its region is rebuilt, from its data-* identity. */
+  function focusSelector(el) {
+    var sel = el.tagName.toLowerCase(), any = false;
+    ['data-view', 'data-act', 'data-key', 'data-src'].forEach(function (a) {
+      var v = el.getAttribute(a);
+      if (v !== null) { sel += '[' + a + '="' + v.replace(/["\\]/g, '\\$&') + '"]'; any = true; }
+    });
+    return any ? sel : null;
+  }
+
+  /** Writes a shell region (tabs, banners, status bar) only when its markup changed: the store notifies on
+   * every edit and again after every autosave. When it does change, keyboard focus moves to the matching
+   * control in the new markup (or the region's first control, or the view), so it never drops to <body>. */
+  function setRegionHtml(host, html) {
+    if (regionHtml[host.id] === html) return;
+    var ae = document.activeElement;
+    var had = !!ae && ae !== host && host.contains(ae);
+    var sel = had ? focusSelector(ae) : null;
+    host.innerHTML = html;
+    regionHtml[host.id] = html;
+    if (!had) return;
+    var next = (sel && host.querySelector(sel)) || host.querySelector('[aria-selected="true"], button') || document.getElementById('view');
+    if (next) { try { next.focus({ preventScroll: true }); } catch (e) { next.focus(); } }
+  }
 
   function requestRender() {
     if (renderQueued) return;
@@ -87,6 +114,7 @@
     priv.setAttribute('aria-pressed', st.ui.privacy ? 'true' : 'false');
     priv.innerHTML = ui.icon(st.ui.privacy ? 'eye-off' : 'eye') + '<span class="label">Privacy</span>';
     priv.title = st.ui.privacy ? 'Privacy mode is on: names are blurred (click a name to reveal it)' : 'Blur student names (privacy mode)';
+    priv.setAttribute('aria-label', 'Privacy'); // the text label is hidden on phones
     document.body.classList.toggle('privacy-on', !!st.ui.privacy);
 
     var themeBtn = document.getElementById('btn-theme');
@@ -100,8 +128,10 @@
     var age = backupAgeDays();
     var stale = hasAnyData() && (age === null || age > BACKUP_REMINDER_DAYS);
     chip.className = 'btn btn-sm ' + (stale ? 'btn-backup-stale' : 'btn-ghost');
-    chip.innerHTML = ui.icon(stale ? 'alert' : 'save') + '<span class="label">' +
-      (st.meta.lastBackupAt ? 'Backup: ' + esc(ui.relativeTime(st.meta.lastBackupAt)) : 'No backup yet') + '</span>';
+    var chipText = st.meta.lastBackupAt ? 'Backup: ' + ui.relativeTime(st.meta.lastBackupAt) : 'No backup yet';
+    chip.innerHTML = ui.icon(stale ? 'alert' : 'save') + '<span class="label">' + (st.meta.lastBackupAt
+      ? '<span class="label-prefix">Backup: </span>' + esc(ui.relativeTime(st.meta.lastBackupAt)) : 'No backup yet') + '</span>';
+    chip.setAttribute('aria-label', chipText);
     chip.title = st.meta.lastBackupAt
       ? 'Last backup: ' + ui.dateTime(st.meta.lastBackupAt) + '. Click to download a new backup.'
       : 'No backup has been downloaded yet. Click to download one.';
@@ -114,11 +144,11 @@
     if (!GT.views[active] && views.length) active = views[0].id;
     var c = store.course();
     var pending = c ? model.unconfirmedPlaceholders(c).length : 0;
-    nav.innerHTML = views.map(function (v) {
+    setRegionHtml(nav, views.map(function (v) {
       var count = v.id === 'settings' && pending ? '<span class="count" title="' + pending + ' placeholder settings need confirmation">' + pending + '</span>' : '';
       return '<button class="tab" role="tab" type="button" id="tab-' + v.id + '" data-view="' + v.id + '" aria-controls="view" aria-selected="' +
         (v.id === active ? 'true' : 'false') + '" tabindex="' + (v.id === active ? '0' : '-1') + '">' + ui.icon(v.icon) + '<span>' + esc(v.title) + '</span>' + count + '</button>';
-    }).join('');
+    }).join(''));
     return active;
   }
 
@@ -135,6 +165,11 @@
       out.push(banner('danger', 'alert',
         '<strong>Saved data could not be read</strong> (' + esc(loadProblem.message) + '). Nothing has been overwritten. Download it, then restore it or start fresh.',
         '<button class="btn btn-sm" data-act="download-raw">Download saved data</button><button class="btn btn-sm btn-danger" data-act="start-fresh">Start fresh</button>'));
+    }
+    if (recovered && !dismissed.recovered) {
+      out.push(banner('warn', 'alert',
+        '<strong>The latest autosave could not be read</strong> (' + esc(recovered.message) + '). The previous saved copy was loaded instead, so your most recent change may be missing. Check it, and keep the unreadable copy if you may need it.',
+        '<button class="btn btn-sm" data-act="download-raw" data-src="recovered">Download unreadable copy</button><button class="btn btn-sm btn-ghost" data-act="dismiss" data-key="recovered">Dismiss</button>'));
     }
     if (status.backend === 'memory') {
       out.push(banner('danger', 'alert',
@@ -164,7 +199,7 @@
           GT.views.settings ? '<button class="btn btn-sm" data-act="goto" data-view="settings" data-section="assessments">Fix in Settings</button>' : ''));
       }
     }
-    host.innerHTML = out.join('');
+    setRegionHtml(host, out.join(''));
   }
 
   function banner(kind, icon, html, actions) {
@@ -182,12 +217,17 @@
     var saved = s.phase === 'saving' || s.phase === 'pending' ? 'Saving…'
       : s.phase === 'error' ? 'Save failed'
         : s.at ? 'Autosaved ' + new Date(s.at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Autosave on';
-    el.innerHTML =
+    // The Shortcuts button is written once and kept, so autosave updates never take its focus away.
+    var info = el.querySelector('.sb-info');
+    if (!info) {
+      el.innerHTML = '<span class="sb-info" id="statusbar-info"></span><span class="spacer"></span>' +
+        '<button class="btn btn-ghost btn-sm" data-act="shortcuts" type="button">' + ui.icon('keyboard') + ' Shortcuts</button>';
+      info = el.querySelector('.sb-info');
+    }
+    setRegionHtml(info,
       '<span><span class="dot ' + dot + '"></span>' + esc(saved) + '</span>' +
       '<span>' + ui.icon('database', 'icon-sm') + ' Stored in this browser (' + esc(backendLabel) + ')' + (persisted ? ', persistent' : '') + '</span>' +
-      '<span>' + ui.icon('lock', 'icon-sm') + ' Offline: no data leaves this computer</span>' +
-      '<span class="spacer"></span>' +
-      '<button class="btn btn-ghost btn-sm" data-act="shortcuts" type="button">' + ui.icon('keyboard') + ' Shortcuts</button>';
+      '<span>' + ui.icon('lock', 'icon-sm') + ' Offline: no data leaves this computer</span>');
   }
 
   // ------------------------------------------------------------------ view
@@ -541,8 +581,12 @@
         app.navigate(a.getAttribute('data-view'), sec ? { section: sec } : undefined);
       }
       else if (act === 'shortcuts') showShortcuts();
-      else if (act === 'download-raw' && loadProblem) {
-        ui.download('grade-tracker-unreadable-backup-' + ui.fileStamp() + '.json', JSON.stringify(loadProblem.raw), 'application/json');
+      else if (act === 'download-raw') {
+        var src = a.getAttribute('data-src') === 'recovered' ? recovered : loadProblem;
+        if (!src) return;
+        // Unreadable text is saved exactly as stored; a readable but invalid state as JSON.
+        var rawText = typeof src.raw === 'string' ? src.raw : JSON.stringify(src.raw);
+        ui.download('grade-tracker-unreadable-backup-' + ui.fileStamp() + '.json', rawText, 'application/json');
       } else if (act === 'start-fresh') {
         ui.dialog.confirm({
           title: 'Start fresh?', message: 'The unreadable saved data will be overwritten. Download it first if you have not.',
@@ -631,7 +675,11 @@
     GT.storage.init().then(function (info) {
       return GT.storage.load().then(function (raw) {
         var state;
-        if (raw) {
+        if (raw && raw.unreadable === true && typeof raw.raw === 'string') {
+          // Saved text exists but is not valid JSON: keep it untouched until the user decides.
+          loadProblem = { raw: raw.raw, message: 'the stored text is damaged: ' + raw.message };
+          state = model.createDefaultState();
+        } else if (raw) {
           try {
             state = model.normalizeState(raw);
           } catch (err) {
@@ -641,6 +689,7 @@
         } else {
           state = model.createDefaultState();
         }
+        recovered = GT.storage.loadNote ? GT.storage.loadNote() : null;
         store.init(state, info.backend);
         if (loadProblem) {
           // Do not overwrite unreadable saved data: keep it until the user decides.
@@ -652,7 +701,7 @@
         bindShell();
         watchOtherTabs();
         renderAll();
-        if (!raw) store.flush();
+        if (!raw) store.saveNow(); // first run: save the new empty courses right away
         if (info.backend !== 'memory') {
           GT.storage.requestPersistence().then(function (p) { persisted = !!p; renderStatus(); });
         }

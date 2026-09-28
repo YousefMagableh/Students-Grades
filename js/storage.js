@@ -12,6 +12,8 @@
   var backend = 'memory';
   var db = null;
   var memory = null;
+  var loadNote = null;     // set by load() when the latest copy was unreadable and an older copy was loaded
+  var lsLeftover = true;   // a localStorage copy may exist next to IndexedDB (removed after the first IndexedDB save)
 
   function openDb() {
     return new Promise(function (resolve, reject) {
@@ -67,33 +69,72 @@
     });
   }
 
-  /** Loads the saved state (a plain object) or null. Falls back to the previous copy if the latest is unreadable. */
-  function load() {
-    if (backend === 'indexeddb') {
-      return idbRequest('readonly', function (s) { return s.get('state'); }).then(function (v) {
-        if (v) return typeof v === 'string' ? JSON.parse(v) : v;
-        // Data saved earlier via localStorage (e.g. IndexedDB became available later).
-        return lsAvailable() ? lsLoad() : null;
-      }).catch(function () {
-        return idbRequest('readonly', function (s) { return s.get('state-prev'); }).then(function (v) {
-          return v ? (typeof v === 'string' ? JSON.parse(v) : v) : null;
-        });
-      });
+  /** Parses one stored copy: null when empty, { value } when readable, { raw, message } when not. */
+  function readCopy(v) {
+    if (v === undefined || v === null || v === '') return null;
+    if (typeof v !== 'string') return { value: v };
+    try { return { value: JSON.parse(v) }; } catch (e) {
+      return { raw: v, message: e && e.message ? e.message : String(e) };
     }
-    if (backend === 'localstorage') return Promise.resolve(lsLoad());
-    return Promise.resolve(memory ? JSON.parse(memory) : null);
   }
 
-  function lsLoad() {
-    var raw = null;
-    try { raw = root.localStorage.getItem(LS_KEY); } catch (e) { raw = null; }
-    if (!raw) return null;
-    try { return JSON.parse(raw); } catch (e2) {
-      try {
-        var prev = root.localStorage.getItem(LS_PREV);
-        return prev ? JSON.parse(prev) : null;
-      } catch (e3) { return null; }
+  /** Picks what to load from the latest and the previous copy (raw stored values).
+   * Returns null (nothing saved), { state, note } (note set when the latest copy was unreadable and the
+   * previous one is used) or { unreadable: { raw, message } } when no copy can be read. */
+  function choose(latestRaw, prevRaw) {
+    var latest = readCopy(latestRaw);
+    if (!latest) return null;
+    if ('value' in latest) return { state: latest.value, note: null };
+    var prev = readCopy(prevRaw);
+    var bad = { raw: latest.raw, message: latest.message };
+    if (prev && 'value' in prev) return { state: prev.value, note: bad };
+    return { unreadable: bad };
+  }
+
+  function savedAt(st) {
+    return st && st.meta && typeof st.meta.lastSavedAt === 'string' ? st.meta.lastSavedAt : '';
+  }
+
+  /** Turns a choice into load()'s result and remembers its note (see loadNote()). */
+  function finish(c) {
+    loadNote = c && c.note ? c.note : null;
+    if (!c) return null;
+    if (c.unreadable) return { unreadable: true, raw: c.unreadable.raw, message: c.unreadable.message };
+    return c.state;
+  }
+
+  function lsChoose() {
+    if (!lsAvailable()) return null;
+    var latest = null, prev = null;
+    try { latest = root.localStorage.getItem(LS_KEY); prev = root.localStorage.getItem(LS_PREV); } catch (e) { return null; }
+    return choose(latest, prev);
+  }
+
+  function idbGet(key) {
+    return idbRequest('readonly', function (s) { return s.get(key); });
+  }
+
+  /** Loads the saved state. Resolves null (nothing saved), the state (a plain object), or
+   * { unreadable: true, raw, message } when saved text exists but cannot be read (the caller must not
+   * overwrite it). If only the latest copy is unreadable, the previous copy is loaded and loadNote()
+   * describes the unreadable one. With IndexedDB, a newer localStorage copy (written after an IndexedDB
+   * failure in an earlier session) wins over the IndexedDB copy. */
+  function load() {
+    loadNote = null;
+    if (backend === 'indexeddb') {
+      return Promise.all([idbGet('state'), idbGet('state-prev')]).then(function (r) {
+        var fromIdb = choose(r[0], r[1]);
+        var fromLs = lsChoose();
+        if (fromLs && fromLs.state) {
+          if (!fromIdb) return finish(fromLs);
+          if (fromIdb.unreadable) return finish({ state: fromLs.state, note: fromIdb.unreadable });
+          if (savedAt(fromLs.state) > savedAt(fromIdb.state)) return finish({ state: fromLs.state, note: fromLs.note || fromIdb.note });
+        }
+        return finish(fromIdb);
+      });
     }
+    if (backend === 'localstorage') return Promise.resolve(finish(lsChoose()));
+    return Promise.resolve(memory ? JSON.parse(memory) : null);
   }
 
   /** Saves the whole state. Keeps the previous save as a fallback copy. */
@@ -107,6 +148,12 @@
           s.put(json, 'state');
         };
         return null;
+      }).then(function () {
+        // IndexedDB now holds the newest data: drop any older localStorage copy so it cannot win later.
+        if (lsLeftover) {
+          lsLeftover = false;
+          try { root.localStorage.removeItem(LS_KEY); root.localStorage.removeItem(LS_PREV); } catch (e) { /* ignore */ }
+        }
       }).catch(function (err) {
         // Fall back to localStorage if IndexedDB starts failing (quota, private mode).
         if (lsAvailable()) {
@@ -129,7 +176,13 @@
     } catch (e) {
       try { ls.removeItem(LS_PREV); } catch (e2) { /* ignore */ }
     }
-    ls.setItem(LS_KEY, json); // throws on quota errors -> reported by the store
+    try {
+      ls.setItem(LS_KEY, json);
+    } catch (e3) {
+      // Old copy + new copy may not fit although the new one alone does: drop the backup copy, retry once.
+      try { ls.removeItem(LS_PREV); } catch (e4) { /* ignore */ }
+      ls.setItem(LS_KEY, json); // throws on quota errors -> reported by the store
+    }
   }
 
   /** Deletes every copy of the data kept by this app in this browser. */
@@ -161,6 +214,8 @@
     save: save,
     clear: clear,
     requestPersistence: requestPersistence,
-    backend: function () { return backend; }
+    backend: function () { return backend; },
+    /** After load(): { raw, message } for a latest copy that could not be read while an older one was loaded, else null. */
+    loadNote: function () { return loadNote; }
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

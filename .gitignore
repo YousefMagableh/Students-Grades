@@ -1,0 +1,16 @@
+# Real grade data must never be committed.
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.tsv
+*.ods
+*backup*.json
+grade-tracker-*.json
+
+# Tooling
+node_modules/
+test-results/
+playwright-report/
+.DS_Store
+Thumbs.db

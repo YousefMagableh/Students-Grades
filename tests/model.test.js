@@ -619,12 +619,28 @@ describe('convertAssessmentToTeam / convertAssessmentToIndividual preserve visib
     return { c, t1, t2, t3, s1, s2, s3, s5, s6, s7, s8, s9, s10, loner };
   }
 
-  test('to team: every student sees the same value before and after', () => {
-    const { c } = setup();
+  // Team 3 (Student 07 and 08 empty, Student 09 50, Student 10 'abs'): blank cells do not vote
+  // (DESIGN 2.3), so the vote is 50 vs 'abs', a tie won by Student 09 (first by name). Team score 50;
+  // Student 10 keeps 'abs' as an override; Students 07 and 08 had no score and follow the team (50).
+  function expectedAfterToTeam(before, ids) {
+    const out = Object.assign({}, before);
+    [ids.s7, ids.s8].forEach((s) => { out[s.id] = { state: 'number', raw: 50, text: null }; });
+    return out;
+  }
+
+  test('to team: every entered score is preserved; members with no score follow the team score', () => {
+    const ids = setup();
+    const { c, t3, s7, s8, s10 } = ids;
     const before = visibleAll(c, 'a_t1');
     model.convertAssessmentToTeam(c, 'a_t1');
     assert.equal(byName(c, 'a_t1').teamGraded, true);
-    assert.deepEqual(visibleAll(c, 'a_t1'), before);
+    assert.deepEqual(visibleAll(c, 'a_t1'), expectedAfterToTeam(before, ids));
+    assert.equal(model.getEntry(c.teamScores, t3.id, 'a_t1').value, 50);
+    assert.deepEqual(model.getEntry(c.scores, s10.id, 'a_t1'), { value: null, text: 'abs', override: true });
+    [s7, s8].forEach((s) => {
+      assert.equal(model.getEntry(c.scores, s.id, 'a_t1'), null, 'no empty override');
+      assert.equal(calc.scoreDetail(c, s, byName(c, 'a_t1')).source, 'team');
+    });
   });
 
   test('to team: majority is the team score, differing member keeps an override, loner stays individual', () => {
@@ -652,13 +668,16 @@ describe('convertAssessmentToTeam / convertAssessmentToIndividual preserve visib
     assert.equal(o.override, true);
   });
 
-  test('to individual after to team: every student sees the same value, no overrides, team entries gone', () => {
-    const { c } = setup();
+  test('to individual after to team: every student keeps the value seen as team-graded, no overrides, team entries gone', () => {
+    const ids = setup();
+    const { c } = ids;
     const before = visibleAll(c, 'a_t1');
     model.convertAssessmentToTeam(c, 'a_t1');
+    const asTeam = visibleAll(c, 'a_t1');
+    assert.deepEqual(asTeam, expectedAfterToTeam(before, ids));
     model.convertAssessmentToIndividual(c, 'a_t1');
     assert.equal(byName(c, 'a_t1').teamGraded, false);
-    assert.deepEqual(visibleAll(c, 'a_t1'), before);
+    assert.deepEqual(visibleAll(c, 'a_t1'), asTeam);
     Object.keys(c.scores).forEach((sid) => {
       const e = c.scores[sid].a_t1;
       assert.ok(!e || e.override !== true, 'override flags must be cleared');
@@ -742,10 +761,46 @@ describe('moveStudentToTeam', () => {
     assert.equal(det(c, s).state, 'empty');
   });
 
-  test('without keepScores an existing override is kept', () => {
+  test('without keepScores an old-team override is dropped: the unequal split belonged to the old team', () => {
     const { c, t2, s } = setup();
     setScore(c, s, 'a_p1', 80, { override: true });
     model.moveStudentToTeam(c, s.id, t2.id);
+    assert.equal(det(c, s).raw, 70);
+    assert.equal(det(c, s).source, 'team');
+    assert.equal(model.getEntry(c.scores, s.id, 'a_p1'), null);
+  });
+
+  test('without keepScores to no team, an old override does not turn into an individual score', () => {
+    const { c, s } = setup();
+    setScore(c, s, 'a_p1', 80, { override: true });
+    model.moveStudentToTeam(c, s.id, null);
+    assert.equal(det(c, s).state, 'empty');
+  });
+
+  test('with keepScores, an empty score is not kept as an override (the student follows the new team)', () => {
+    const { c, t1, t2, s } = setup();
+    model.setEntry(c.teamScores, t1.id, 'a_p1', null);
+    model.moveStudentToTeam(c, s.id, t2.id, { keepScores: true });
+    assert.equal(model.getEntry(c.scores, s.id, 'a_p1'), null);
+    assert.equal(det(c, s).raw, 70);
+    assert.equal(det(c, s).source, 'team');
+  });
+
+  test('with keepScores, a differing late-work status is kept as an override (review F3)', () => {
+    const { c, t1, t3, s } = setup();
+    // Team 1: 88 one week late (adjusted 78); Team 3: 88 on time.
+    model.setEntry(c.teamScores, t1.id, 'a_p1', { value: 88, weeksLate: 1 });
+    assert.equal(det(c, s).adjusted, 78);
+    model.moveStudentToTeam(c, s.id, t3.id, { keepScores: true });
+    assert.equal(det(c, s).adjusted, 78);
+    assert.equal(det(c, s).source, 'override');
+    assert.deepEqual(model.getEntry(c.scores, s.id, 'a_p1'), { value: 88, weeksLate: 1, override: true });
+  });
+
+  test('moving a student into the team they are already in changes nothing', () => {
+    const { c, t1, s } = setup();
+    setScore(c, s, 'a_p1', 80, { override: true });
+    model.moveStudentToTeam(c, s.id, t1.id);
     assert.equal(det(c, s).raw, 80);
     assert.equal(det(c, s).source, 'override');
   });
@@ -790,5 +845,441 @@ describe('entryFromInput', () => {
 
   test('does not invent late info when the previous entry had none', () => {
     assert.deepEqual(model.entryFromInput('75', { value: 80 }), { value: 75 });
+  });
+});
+
+// ---------------------------------------------------------------- review round 1 regressions
+
+describe('restore never pollutes Object.prototype (review F2)', () => {
+  const CLEAN = () => ['a_t1', 'a_t2', 'ses_20260903'].forEach((k) => { delete Object.prototype[k]; delete Object[k]; });
+
+  test('"__proto__" and "constructor" owners in scores, teamScores and attendance are dropped', () => {
+    const base = roundTrip(course('SE4351'));
+    base.students = [{ id: 's1', lastName: 'Student 01', firstName: 'Alpha' }];
+    const json = JSON.stringify({ app: 'grade-tracker', kind: 'backup', state: { app: 'grade-tracker', courses: [base] } })
+      .replace('"scores":{}', '"scores":{"__proto__":{"a_t2":{"value":100}},"constructor":{"a_t1":{"value":77}},"s1":{"a_t1":{"value":50}}}')
+      .replace('"teamScores":{}', '"teamScores":{"__proto__":{"a_p1":{"value":90}}}')
+      .replace('"records":{}', '"records":{"__proto__":{"ses_20260903":"A"},"s1":{"__proto__":"A","ses_20260903":"P"}}')
+      .replace('"totals":{}', '"totals":{"__proto__":{"absent":2,"excused":0}}');
+    try {
+      const { state } = model.readBackup(JSON.parse(json));
+      assert.equal(({}).a_t2, undefined);
+      assert.equal(({}).a_p1, undefined);
+      assert.equal(({}).ses_20260903, undefined);
+      assert.equal(Object.a_t1, undefined);
+      const c = state.courses[0];
+      assert.deepEqual(c.scores, { s1: { a_t1: { value: 50 } } });
+      assert.deepEqual(c.teamScores, {});
+      assert.deepEqual(c.attendance.records, { s1: { ses_20260903: 'P' } });
+      assert.deepEqual(c.attendance.totals, {});
+      // The student's total uses only their own Test 1 score: 50 x 25 / 100 = 12.5.
+      assert.equal(calc.studentResult(c, c.students[0]).total, 12.5);
+    } finally {
+      CLEAN();
+    }
+  });
+
+  test('setEntry ignores unsafe keys and getEntry ignores inherited names', () => {
+    const map = {};
+    model.setEntry(map, '__proto__', 'a_t1', { value: 1 });
+    model.setEntry(map, 'constructor', 'a_t1', { value: 1 });
+    model.setEntry(map, 's_1', '__proto__', { value: 1 });
+    assert.equal(({}).a_t1, undefined);
+    assert.equal(Object.a_t1, undefined);
+    assert.deepEqual(map, {});
+    assert.equal(model.getEntry({}, 'toString', 'a_t1'), null);
+    assert.equal(model.getEntry({ s_1: {} }, 's_1', 'toString'), null);
+  });
+});
+
+describe('inherited names are not valid templates, marks or duplicate ids (review F4)', () => {
+  test('templates "toString", "constructor" and "__proto__" become custom with custom defaults', () => {
+    ['toString', 'constructor', '__proto__', 'valueOf'].forEach((tpl) => {
+      const c = model.normalizeCourse(JSON.parse('{"template":' + JSON.stringify(tpl) + '}'));
+      assert.equal(c.template, 'custom', tpl);
+      assert.equal(c.code, 'New Course');
+      assert.equal(c.title, 'Untitled course');
+    });
+    assert.equal(model.createCourse('constructor').template, 'custom');
+    assert.equal(model.createCourse('toString').code, 'New Course');
+  });
+
+  test('ids named like Object.prototype members are kept with their data', () => {
+    const c = model.normalizeCourse({
+      template: 'SE4351',
+      assessments: roundTrip(course('SE4351').assessments),
+      teams: [{ id: 'toString', name: 'Team 1' }],
+      students: [{ id: 'valueOf', lastName: 'Student 01', teamId: 'toString' }, { id: 's_2', lastName: 'Student 02', teamId: 'hasOwnProperty' }],
+      scores: { valueOf: { a_t1: { value: 70 } } },
+      attendance: { mode: 'per-session', sessions: [{ id: 'toString', date: '2026-09-03' }], records: { valueOf: { toString: 'A' } } }
+    });
+    assert.equal(c.students[0].id, 'valueOf');
+    assert.equal(c.students[0].teamId, 'toString');
+    assert.equal(c.students[1].teamId, null, 'a teamId naming an inherited member is dangling');
+    assert.equal(c.teams[0].id, 'toString');
+    assert.equal(c.attendance.sessions[0].id, 'toString');
+    assert.deepEqual(c.attendance.records, { valueOf: { toString: 'A' } });
+    assert.equal(calc.scoreDetail(c, c.students[0], model.findAssessment(c, 'a_t1')).raw, 70);
+  });
+
+  test('ids "__proto__", "constructor" and "prototype" are replaced', () => {
+    const c = model.normalizeCourse(JSON.parse('{"id":"__proto__","students":[{"id":"__proto__"},{"id":"constructor"}],' +
+      '"teams":[{"id":"prototype"}],"assessments":[{"id":"constructor","name":"X"}]}'));
+    assert.ok(c.id.startsWith('c_'));
+    c.students.forEach((s) => assert.ok(s.id.startsWith('s_'), s.id));
+    assert.ok(c.teams[0].id.startsWith('t_'));
+    assert.ok(c.assessments[0].id.startsWith('a_'));
+  });
+
+  test('attendance marks named like Object.prototype members are rejected', () => {
+    const c = model.normalizeCourse(JSON.parse('{"attendance":{"sessions":[{"id":"ses_1","date":"2026-09-03"}],' +
+      '"records":{"s_1":{"ses_1":"constructor"},"s_2":{"ses_1":"toString"},"s_3":{"ses_1":"__proto__"},"s_4":{"ses_1":"E"}}}}'));
+    assert.deepEqual(c.attendance.records, { s_4: { ses_1: 'E' } });
+  });
+
+  test('activeCourseId naming an inherited member falls back to the first course', () => {
+    const st = model.normalizeState({ app: 'grade-tracker', courses: [{ id: 'c_1' }], activeCourseId: 'constructor' });
+    assert.equal(st.activeCourseId, 'c_1');
+  });
+
+  test('duplicate export preset ids are made unique', () => {
+    const c = model.normalizeCourse({ exportPresets: [
+      { id: 'p1', name: 'A', columns: ['no'] }, { id: 'p1', name: 'B', columns: ['no'] }, { id: '__proto__', name: 'C', columns: [] }
+    ] });
+    const ids = c.exportPresets.map((p) => p.id);
+    assert.equal(ids[0], 'p1');
+    assert.equal(new Set(ids).size, 3);
+    assert.ok(ids[2].startsWith('xp_'));
+  });
+});
+
+describe('late-work info counts as part of a team score (review F3)', () => {
+  function team3() {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id });
+    const b = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    const d = addStudent(c, 'Student 03', 'Charlie', { teamId: t.id });
+    return { c, t, a, b, d };
+  }
+  const adjusted = (c, list, aid) => list.map((s) => calc.scoreDetail(c, s, byName(c, aid)).adjusted);
+
+  test('entryKey distinguishes weeks late and a waived penalty', () => {
+    assert.notEqual(model.entryKey({ value: 80 }), model.entryKey({ value: 80, weeksLate: 1 }));
+    assert.notEqual(model.entryKey({ value: 80, weeksLate: 2 }), model.entryKey({ value: 80, weeksLate: 2, waived: true }));
+    assert.equal(model.entryKey({ value: 80, waived: true }), model.entryKey({ value: 80 }), 'waived without weeks late changes nothing');
+    assert.equal(model.entryKey({ value: 80, override: true }), model.entryKey({ value: 80 }));
+  });
+
+  test('convertAssessmentToTeam keeps each adjusted score when late info differs', () => {
+    [
+      [{ value: 90, weeksLate: 1 }, { value: 90 }, { value: 90 }],
+      [{ value: 80 }, { value: 80, weeksLate: 1 }, { value: 80 }],
+      [{ value: 80, weeksLate: 2, waived: true }, { value: 80, weeksLate: 2 }, { value: 80, weeksLate: 2, waived: true }]
+    ].forEach((entries) => {
+      const { c, a, b, d } = team3();
+      [a, b, d].forEach((s, i) => model.setEntry(c.scores, s.id, 'a_t1', entries[i]));
+      const before = adjusted(c, [a, b, d], 'a_t1');
+      model.convertAssessmentToTeam(c, 'a_t1');
+      assert.deepEqual(adjusted(c, [a, b, d], 'a_t1'), before, JSON.stringify(entries));
+    });
+  });
+
+  test('a pasted team column with one late member makes that member an override', () => {
+    const { c, t, a, b, d } = team3();
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: a.id, entry: { value: 90 } },
+      { studentId: b.id, entry: { value: 90, weeksLate: 1 } },
+      { studentId: d.id, entry: { value: 90 } }
+    ]);
+    assert.equal(res.overridesCreated, 1);
+    assert.deepEqual(model.getEntry(c.teamScores, t.id, 'a_p1'), { value: 90 });
+    assert.deepEqual(adjusted(c, [a, b, d], 'a_p1'), [90, 80, 90]);
+  });
+});
+
+describe('convertAssessmentToTeam on an already team-graded item (review F5)', () => {
+  test('does nothing: team scores and overrides stay', () => {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const list = ['01', '02', '03'].map((n) => addStudent(c, `Student ${n}`, 'X', { teamId: t.id }));
+    setTeamScore(c, t, 'a_p1', 90);
+    setScore(c, list[2], 'a_p1', 70, { override: true });
+    const beforeTeam = roundTrip(c.teamScores);
+    const beforeScores = roundTrip(c.scores);
+    assert.deepEqual(model.convertAssessmentToTeam(c, 'a_p1'), { overridesCreated: 0 });
+    assert.deepEqual(c.teamScores, beforeTeam);
+    assert.deepEqual(c.scores, beforeScores);
+    assert.deepEqual(list.map((s) => visible(c, s, 'a_p1').raw), [90, 90, 70]);
+  });
+});
+
+describe('blank cells and withdrawn members in team votes (review F2, second review)', () => {
+  function setup(opts) {
+    const c = course(opts && opts.template);
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id, status: opts && opts.aWithdrawn ? 'withdrawn' : 'active' });
+    const b = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    const d = opts && opts.two ? null : addStudent(c, 'Student 03', 'Charlie', { teamId: t.id });
+    return { c, t, a, b, d };
+  }
+
+  test('a blank cell in a pasted team column does not create an empty override', () => {
+    const { c, t, a, b, d } = setup();
+    setScore(c, d, 'a_p1', 60, { override: true }); // an old override is cleared by the blank cell
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: a.id, entry: { value: 90 } },
+      { studentId: b.id, entry: { value: 90 } },
+      { studentId: d.id, entry: null }
+    ]);
+    assert.equal(res.overridesCreated, 0);
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 90);
+    assert.equal(model.getEntry(c.scores, d.id, 'a_p1'), null);
+    const x = calc.scoreDetail(c, d, byName(c, 'a_p1'));
+    assert.equal(x.raw, 90);
+    assert.equal(x.source, 'team');
+  });
+
+  test('a single number among blanks becomes the team score', () => {
+    const { c, t, a, b, d } = setup();
+    model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: a.id, entry: { value: null } },
+      { studentId: b.id, entry: null },
+      { studentId: d.id, entry: { value: 75 } }
+    ]);
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 75);
+    assert.deepEqual(c.scores, {});
+  });
+
+  test('an all-blank team clears the team score', () => {
+    const { c, t, a, b, d } = setup();
+    setTeamScore(c, t, 'a_p1', 88);
+    model.setTeamScoreFromMembers(c, 'a_p1', [a, b, d].map((s) => ({ studentId: s.id, entry: null })));
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1'), null);
+  });
+
+  test('a withdrawn member does not outvote an active member (SE 6362 team of 2)', () => {
+    const { c, t, a, b } = setup({ template: 'SE6362', two: true, aWithdrawn: true });
+    setScore(c, b, 'a_t1', 90);
+    model.convertAssessmentToTeam(c, 'a_t1');
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_t1').value, 90);
+    assert.equal(calc.scoreDetail(c, b, byName(c, 'a_t1')).source, 'team');
+    assert.equal(model.getEntry(c.scores, a.id, 'a_t1'), null);
+  });
+
+  test('a withdrawn member with a different number keeps it as an override but does not win a tie', () => {
+    const { c, t, a, b } = setup({ two: true, aWithdrawn: true });
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: a.id, entry: { value: 0 } },
+      { studentId: b.id, entry: { value: 85 } }
+    ]);
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 85);
+    assert.equal(res.overridesCreated, 1);
+    assert.deepEqual(model.getEntry(c.scores, a.id, 'a_p1'), { value: 0, override: true });
+  });
+
+  test('withdrawn members vote when no active member has a score', () => {
+    const { c, t, a, b } = setup({ two: true, aWithdrawn: true });
+    model.setTeamScoreFromMembers(c, 'a_p1', [
+      { studentId: a.id, entry: { value: 70 } },
+      { studentId: b.id, entry: null }
+    ]);
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1').value, 70);
+    assert.deepEqual(c.scores, {});
+  });
+});
+
+describe('partial-team paste (review F3, second review)', () => {
+  test('rows for part of a team set the team score; propagatedTo lists the other members it changed', () => {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id });
+    const b = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    const d = addStudent(c, 'Student 03', 'Charlie', { teamId: t.id });
+    const e = addStudent(c, 'Student 04', 'Delta', { teamId: t.id });
+    setTeamScore(c, t, 'a_p1', 90);
+    setScore(c, e, 'a_p1', 70, { override: true });
+    const res = model.setTeamScoreFromMembers(c, 'a_p1', [{ studentId: a.id, entry: { value: 80 } }]);
+    assert.deepEqual(sorted(res.propagatedTo), sorted([b.id, d.id]));
+    assert.deepEqual([a, b, d, e].map((s) => visible(c, s, 'a_p1').raw), [80, 80, 80, 70]);
+  });
+
+  test('propagatedTo is empty when every member is in the rows or nothing changes for the others', () => {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id });
+    addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    setTeamScore(c, t, 'a_p1', 90);
+    assert.deepEqual(model.setTeamScoreFromMembers(c, 'a_p1', [{ studentId: a.id, entry: { value: 90 } }]).propagatedTo, []);
+  });
+});
+
+describe('letter scale invariant: last is F with min 0 (review F7 / F4)', () => {
+  test('a scale without an F row gets F 0 appended, and a low total gets F', () => {
+    const c = model.normalizeCourse({ settings: { letterScale: [{ letter: 'A', min: 90 }, { letter: 'B', min: 80 }] } });
+    assert.deepEqual(c.settings.letterScale, [{ letter: 'A', min: 90 }, { letter: 'B', min: 80 }, { letter: 'F', min: 0 }]);
+    assert.equal(calc.letterFor(10, c.settings.letterScale), 'F');
+    assert.equal(calc.letterFor(85, c.settings.letterScale), 'B');
+  });
+
+  test('a bottom F above 0 is moved to 0; a bottom row already at 0 or below is kept', () => {
+    assert.deepEqual(model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'F', min: 50 }]),
+      [{ letter: 'A', min: 90 }, { letter: 'F', min: 0 }]);
+    assert.deepEqual(model.normalizeLetterScale([{ letter: 'A', min: 90 }, { letter: 'D-', min: 60 }]),
+      [{ letter: 'A', min: 90 }, { letter: 'D-', min: 60 }, { letter: 'F', min: 0 }]);
+    assert.deepEqual(model.normalizeLetterScale([{ letter: 'Pass', min: 50 }, { letter: 'Fail', min: 0 }]),
+      [{ letter: 'Pass', min: 50 }, { letter: 'Fail', min: 0 }]);
+    assert.deepEqual(model.normalizeLetterScale([], 'graduate'), GRAD_SCALE);
+  });
+
+  test('passingLetter falls back to a letter that exists in the scale', () => {
+    const c = model.normalizeCourse({ settings: { letterScale: [{ letter: 'A', min: 90 }, { letter: 'B', min: 80 }] } });
+    assert.equal(c.settings.passingLetter, 'B'); // lowest letter above F; the default D- is not in this scale
+    const g = model.normalizeCourse({ level: 'graduate', settings: { passingLetter: 'Q' } });
+    assert.equal(g.settings.passingLetter, 'C');
+    const k = model.normalizeCourse({ settings: { letterScale: UG_SCALE, passingLetter: 'C-' } });
+    assert.equal(k.settings.passingLetter, 'C-');
+  });
+});
+
+describe('negative or zero weights, max scores and late points (review F8)', () => {
+  test('createAssessment keeps weight >= 0 and max score > 0', () => {
+    const a = model.createAssessment({ name: 'X', weight: -10, maxScore: -100 });
+    assert.equal(a.weight, 0);
+    assert.equal(a.maxScore, 100);
+    assert.equal(model.createAssessment({ maxScore: 0 }).maxScore, 100);
+    assert.equal(model.createAssessment({ maxScore: 30, weight: 12.5 }).maxScore, 30);
+    assert.equal(model.createAssessment({ maxScore: 30, weight: 12.5 }).weight, 12.5);
+  });
+
+  test('normalizeCourse repairs negative weights, max scores and points per week', () => {
+    const c = model.normalizeCourse({
+      assessments: [{ id: 'a_x', name: 'X', weight: -10, maxScore: -5 }, { id: 'a_y', name: 'Y', weight: 1e308, maxScore: 1e308 }],
+      settings: { latePointsPerWeek: -10, curve: 1e308 }
+    });
+    assert.deepEqual(c.assessments.map((a) => [a.weight, a.maxScore]), [[0, 100], [0, 100]]);
+    assert.equal(c.settings.latePointsPerWeek, 0);
+    assert.equal(c.settings.curve, 0);
+  });
+});
+
+describe('placeholder notes and scoping (review F5, second review)', () => {
+  test('custom-course notes do not quote a syllabus', () => {
+    const c = course('custom');
+    ['lateWork', 'projectSplit'].forEach((k) => {
+      assert.ok(!/syllabus says|^syllabus:/i.test(model.placeholderInfo(c, k).note), `${k}: ${model.placeholderInfo(c, k).note}`);
+    });
+    assert.match(model.placeholderInfo(course('SE4351'), 'lateWork').note, /pre-approval/);
+    assert.match(model.placeholderInfo(course('SE6362'), 'projectSplit').note, /approx\. 10 \+ 20/);
+  });
+
+  test('termPaperWeight applies while the course has the Term Paper item', () => {
+    const g = course('SE6362');
+    g.assessments = g.assessments.filter((a) => a.id !== 'a_paper');
+    assert.ok(!model.placeholderKeys(g).includes('termPaperWeight'));
+    const u = course('SE4351');
+    u.assessments.push(model.createAssessment({ id: 'a_paper', name: 'Term Paper', category: 'paper' }));
+    assert.ok(model.placeholderKeys(u).includes('termPaperWeight'));
+  });
+
+  test('projectSplit applies to every course', () => {
+    ['SE4351', 'SE6362', 'custom'].forEach((tpl) => assert.ok(model.placeholderKeys(course(tpl)).includes('projectSplit'), tpl));
+  });
+});
+
+describe('restore requires the Grade Tracker marker (review F6, second review)', () => {
+  test('a bare object with a courses array but no "app" is rejected', () => {
+    assert.throws(() => model.readBackup({ courses: [{ title: 'x' }] }), /Not a Grade Tracker data file/);
+    assert.throws(() => model.normalizeState({ courses: [] }), /marker is missing/);
+  });
+
+  test('a wrapped backup whose inner state lacks "app" is still accepted (the envelope has it)', () => {
+    const st = roundTrip(model.createDefaultState());
+    delete st.app;
+    const r = model.readBackup({ app: 'grade-tracker', kind: 'backup', schemaVersion: 1, exportedAt: '2026-09-28T12:00:00.000Z', state: st });
+    assert.equal(r.state.courses.length, 2);
+  });
+});
+
+describe('override and late helpers (review F9)', () => {
+  function setup() {
+    const c = course('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id });
+    const b = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    return { c, t, a, b };
+  }
+  const det = (c, s) => calc.scoreDetail(c, s, byName(c, 'a_p1'));
+
+  test('entryFromInput: clearing an override cell drops the override flag (member follows the team)', () => {
+    const e = model.entryFromInput('', { value: 85, override: true });
+    assert.deepEqual(e, { value: null });
+    assert.ok(model.isBlankEntry(e));
+    assert.deepEqual(model.entryFromInput('', { value: 85, override: true, weeksLate: 1 }), { value: null, weeksLate: 1 });
+  });
+
+  test('setTeamScore, setOverride and clearOverride', () => {
+    const { c, t, a, b } = setup();
+    model.setTeamScore(c, t.id, 'a_p1', { value: 90, override: true });
+    assert.deepEqual(model.getEntry(c.teamScores, t.id, 'a_p1'), { value: 90 });
+    model.setOverride(c, b.id, 'a_p1', { value: 80 });
+    assert.equal(det(c, b).raw, 80);
+    assert.equal(det(c, b).source, 'override');
+    assert.equal(det(c, a).raw, 90);
+    assert.equal(model.clearOverride(c, b.id, 'a_p1'), true);
+    assert.equal(model.clearOverride(c, b.id, 'a_p1'), false);
+    assert.equal(det(c, b).raw, 90);
+    assert.equal(det(c, b).source, 'team');
+    model.setOverride(c, b.id, 'a_p1', null); // explicit "no score" override
+    assert.equal(det(c, b).state, 'empty');
+    assert.equal(det(c, b).source, 'override');
+    model.setTeamScore(c, t.id, 'a_p1', { value: null });
+    assert.equal(model.getEntry(c.teamScores, t.id, 'a_p1'), null);
+  });
+
+  test('withLate sets and clears weeks late and the waived flag', () => {
+    assert.deepEqual(model.withLate({ value: 90 }, 2, false), { value: 90, weeksLate: 2 });
+    assert.deepEqual(model.withLate({ value: 90, weeksLate: 2 }, 0, true), { value: 90, waived: true });
+    assert.deepEqual(model.withLate(null, 1), { value: null, weeksLate: 1 });
+    const src = { value: 70, override: true };
+    assert.deepEqual(model.withLate(src, 1, true), { value: 70, override: true, weeksLate: 1, waived: true });
+    assert.deepEqual(src, { value: 70, override: true }, 'input is not mutated');
+  });
+
+  test('removeAssessment deletes the item and every score for it', () => {
+    const { c, t, a, b } = setup();
+    setTeamScore(c, t, 'a_p1', 90);
+    setScore(c, b, 'a_p1', 80, { override: true });
+    setScore(c, a, 'a_t1', 70);
+    assert.equal(model.removeAssessment(c, 'a_p1'), true);
+    assert.equal(model.findAssessment(c, 'a_p1'), null);
+    assert.deepEqual(c.teamScores, {});
+    assert.deepEqual(c.scores, { [a.id]: { a_t1: { value: 70 } } });
+    assert.equal(model.removeAssessment(c, 'a_p1'), false);
+  });
+
+  test('removeTeam moves members to no team and deletes the team scores', () => {
+    const { c, t, a, b } = setup();
+    setTeamScore(c, t, 'a_p1', 90);
+    setScore(c, b, 'a_p1', 80, { override: true });
+    const moved = model.removeTeam(c, t.id, { keepScores: true });
+    assert.deepEqual(sorted(moved), sorted([a.id, b.id]));
+    assert.deepEqual(c.teams, []);
+    assert.deepEqual(c.teamScores, {});
+    assert.equal(a.teamId, null);
+    assert.equal(det(c, a).raw, 90);
+    assert.equal(det(c, a).source, 'individual');
+    assert.equal(det(c, b).raw, 80);
+    assert.equal(model.getEntry(c.scores, b.id, 'a_p1').override, undefined);
+  });
+
+  test('removeTeam without keepScores leaves the former members without team-graded scores', () => {
+    const { c, t, a, b } = setup();
+    setTeamScore(c, t, 'a_p1', 90);
+    setScore(c, b, 'a_p1', 80, { override: true });
+    model.removeTeam(c, t.id);
+    assert.equal(det(c, a).state, 'empty');
+    assert.equal(det(c, b).state, 'empty');
+    assert.deepEqual(model.removeTeam(c, 't_missing'), []);
   });
 });

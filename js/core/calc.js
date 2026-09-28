@@ -27,13 +27,14 @@
   }
 
   /** Late penalty in points on this assessment's own scale (K4):
-   * weeksLate x pointsPerWeek, scaled by maxScore / 100. Zero when waived. */
+   * weeksLate x pointsPerWeek, scaled by maxScore / 100. Zero when waived; never negative. */
   function latePenalty(entry, assessment, settings) {
     if (!entry || entry.waived) return 0;
     var weeks = typeof entry.weeksLate === 'number' && entry.weeksLate > 0 ? entry.weeksLate : 0;
     if (!weeks) return 0;
     var perWeek = settings && typeof settings.latePointsPerWeek === 'number' ? settings.latePointsPerWeek : 10;
     var max = typeof assessment.maxScore === 'number' ? assessment.maxScore : 100;
+    if (!(perWeek > 0) || !(max > 0)) return 0;
     return fix(weeks * perWeek * max / 100);
   }
 
@@ -47,7 +48,10 @@
     var waived = !!(r.entry && r.entry.waived);
     var penalty = missing ? 0 : latePenalty(r.entry, assessment, course.settings);
     var adjusted = missing ? null : (penalty > 0 ? fix(Math.max(0, p.value - penalty)) : p.value);
-    var weighted = (missing || !(max > 0)) ? 0 : fix(adjusted * weight / max);
+    // Unrounded product, summed by studentResult; `weighted` is the display value (fix applied).
+    // Rounding each item before summing would drift on max scores such as 30 (79.9999999999).
+    var weightedUnrounded = (missing || !(max > 0)) ? 0 : adjusted * weight / max;
+    var weighted = fix(weightedUnrounded);
     return {
       assessmentId: assessment.id,
       state: p.state,
@@ -62,7 +66,8 @@
       waived: waived,
       penalty: penalty,
       adjusted: adjusted,
-      weighted: weighted
+      weighted: weighted,
+      weightedUnrounded: weightedUnrounded
     };
   }
 
@@ -96,7 +101,7 @@
     course.assessments.forEach(function (a) {
       var d = scoreDetail(course, student, a);
       items[a.id] = d;
-      weighted.push(d.weighted);
+      weighted.push(d.weightedUnrounded);
       if (d.missing && (a.weight || 0) > 0) missingCount++;
       if (d.state === 'invalid') invalidCount++;
       if (d.outOfRange) outOfRangeCount++;
@@ -104,7 +109,7 @@
       if (d.weeksLate > 0) lateCount++;
     });
     var curve = typeof course.settings.curve === 'number' && isFinite(course.settings.curve) ? course.settings.curve : 0;
-    var weightedSum = util.sum(weighted);
+    var weightedSum = util.sum(weighted); // fix applied once, to the sum of unrounded items
     var totalUnrounded = fix(weightedSum + curve);
     var total = roundTotal(totalUnrounded, course.settings.rounding);
     return {
@@ -128,9 +133,14 @@
     };
   }
 
+  /** Weight check (A3): ok when the weights sum to 100 and none is negative. */
   function weightStatus(course) {
-    var s = util.sum(course.assessments.map(function (a) { return a.weight || 0; }));
-    return { sum: s, ok: Math.abs(s - 100) < 1e-9 };
+    var negative = false;
+    var s = util.sum(course.assessments.map(function (a) {
+      if ((a.weight || 0) < 0) negative = true;
+      return a.weight || 0;
+    }));
+    return { sum: s, ok: Math.abs(s - 100) < 1e-9 && !negative };
   }
 
   /** Results for every student plus class-level figures (K7). */
@@ -140,7 +150,9 @@
     course.students.forEach(function (s) {
       var r = studentResult(course, s);
       byId[s.id] = r;
-      if (r.active) active.push(r);
+      // A non-finite total (only possible with absurd weights set in code) is kept out of the
+      // average, rank and percentile instead of turning them into NaN.
+      if (r.active && typeof r.total === 'number' && isFinite(r.total)) active.push(r);
     });
     var n = active.length;
     var average = n ? fix(util.sum(active.map(function (r) { return r.total; })) / n) : null;
@@ -158,10 +170,46 @@
     });
     return {
       byId: byId,
-      activeIds: active.map(function (r) { return r.studentId; }),
+      activeIds: course.students.filter(function (s) { return byId[s.id].active; }).map(function (s) { return s.id; }),
       average: average,
       weights: weightStatus(course)
     };
+  }
+
+  /** Smallest unrounded total (weighted sum + curve, before the rounding mode) that earns `letter`
+   * with these settings: the cutoff itself with rounding 'none', ceil(cutoff) - 0.5 with 'integer',
+   * and the cutoff rounded up to 0.01, minus 0.005, with 'hundredth' (Excel ROUND is half away from
+   * zero). Meant for cutoffs above 0. Returns null when the letter is not in the scale. */
+  function minTotalForLetter(letter, settings) {
+    var s = settings || {};
+    var scale = sortedScale(s.letterScale);
+    var cut = null;
+    for (var i = 0; i < scale.length; i++) {
+      if (scale[i].letter === letter) { cut = fix(scale[i].min); break; }
+    }
+    if (cut === null) return null;
+    if (s.rounding === 'integer') return fix(Math.ceil(cut) - 0.5);
+    if (s.rounding === 'hundredth') return fix(Math.ceil(fix(cut * 100)) / 100 - 0.005);
+    return cut;
+  }
+
+  /** What-if (ST2): the score on `assessmentId` (on its own scale, on time) that brings the student
+   * to `letter`, with every other item at its current value (empty = 0). The item's own current
+   * score is ignored. Returns { needed, reachable: needed <= maxScore, alreadyReached: needed <= 0 },
+   * or null when the letter or assessment is unknown or the item has no weight or max score. */
+  function neededScore(course, student, assessmentId, letter) {
+    var a = model.findAssessment(course, assessmentId);
+    if (!a || !((a.weight || 0) > 0) || !(a.maxScore > 0)) return null;
+    var min = minTotalForLetter(letter, course.settings);
+    if (min === null) return null;
+    var r = studentResult(course, student);
+    var others = 0; // unrounded, like the total (fixing it here would add up to 5e-11 of error)
+    course.assessments.forEach(function (x) { if (x.id !== a.id) others += r.items[x.id].weightedUnrounded; });
+    var exact = (min - r.curve - others) * a.maxScore / a.weight;
+    var needed = fix(exact);
+    // A repeating decimal (max 30: 26.666…) rounded down would fall a hair short; round it up instead.
+    if (exact - needed > 1e-12) needed = fix(needed + Math.pow(10, -util.FIX_DECIMALS));
+    return { needed: needed, reachable: needed <= a.maxScore, alreadyReached: needed <= 0 };
   }
 
   function compareByName(a, b) {
@@ -205,6 +253,8 @@
     studentResult: studentResult,
     weightStatus: weightStatus,
     computeCourse: computeCourse,
+    minTotalForLetter: minTotalForLetter,
+    neededScore: neededScore,
     compareByName: compareByName,
     sortStudents: sortStudents
   };

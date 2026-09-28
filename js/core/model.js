@@ -4,6 +4,8 @@
   'use strict';
   var isNode = typeof module === 'object' && module.exports;
   var util = isNode ? require('./util.js') : root.GT.util;
+  var hasOwn = util.hasOwn;
+  var isSafeKey = util.isSafeKey;
 
   var SCHEMA_VERSION = 1;
   var APP_ID = 'grade-tracker';
@@ -25,6 +27,34 @@
 
   function defaultPassingLetter(level) {
     return level === 'graduate' ? 'C' : 'D-';
+  }
+
+  /** Cleans a letter scale (restore, Settings edits): drops malformed rows, sorts by min descending,
+   * and keeps the invariant "last is F with min 0": a bottom F above 0 is moved to 0, and a scale
+   * whose lowest cutoff is above 0 gets { letter: 'F', min: 0 } appended. An empty result falls
+   * back to the default scale for the level. Returns a new array. */
+  function normalizeLetterScale(list, level) {
+    var scale = (Array.isArray(list) ? list : []).filter(function (x) {
+      return util.isPlainObject(x) && typeof x.letter === 'string' && x.letter !== '' && util.isSaneNumber(x.min);
+    }).map(function (x) { return { letter: x.letter, min: x.min }; });
+    if (!scale.length) return defaultLetterScale(level);
+    scale.sort(function (a, b) { return b.min - a.min; });
+    var last = scale[scale.length - 1];
+    if (last.min > 0) {
+      if (last.letter === 'F') last.min = 0;
+      else scale.push({ letter: 'F', min: 0 });
+    }
+    return scale;
+  }
+
+  /** The passing letter to use with `scale`: `preferred` when the scale has it, else the level's
+   * default when present, else the lowest letter above the bottom (failing) one. */
+  function passingLetterFor(scale, preferred, level) {
+    var has = function (l) { return typeof l === 'string' && scale.some(function (x) { return x.letter === l; }); };
+    if (has(preferred)) return preferred;
+    var dflt = defaultPassingLetter(level);
+    if (has(dflt)) return dflt;
+    return scale.length > 1 ? scale[scale.length - 2].letter : (scale[0] ? scale[0].letter : dflt);
   }
 
   // ---------------------------------------------------------------- sessions (T1)
@@ -107,9 +137,13 @@
     lateWork: {
       label: 'Late-work exceptions',
       note: function (c) {
-        return c.template === 'SE6362'
-          ? 'Syllabus: 10 points deducted for each week passed. Pre-approval exceptions and scaling for non-100 max scores are assumptions.'
-          : 'Syllabus: 10 points deducted for each week passed, if without pre-approval. Which cases count as pre-approved, and scaling for non-100 max scores, are assumptions.';
+        if (c.template === 'SE6362') {
+          return 'Syllabus: 10 points deducted for each week passed. Pre-approval exceptions and scaling for non-100 max scores are assumptions.';
+        }
+        if (c.template === 'SE4351') {
+          return 'Syllabus: 10 points deducted for each week passed, if without pre-approval. Which cases count as pre-approved, and scaling for non-100 max scores, are assumptions.';
+        }
+        return 'No syllabus rule on file for this course. Default: 10 points per week late (scaled for non-100 max scores) unless the penalty is waived.';
       }
     },
     maxScores: {
@@ -119,9 +153,13 @@
     projectSplit: {
       label: 'Project split',
       note: function (c) {
-        return c.template === 'SE4351'
-          ? 'Syllabus lists Questionnaire (2 x 2.5 = 5) + Presentation and Deliverable (25) inside the 30% Project. Defaults use Project I 10% and Project II 20% (team-graded). Split or rename project items in Settings when confirmed.'
-          : 'Syllabus says "Project (approx. 10 + 20) 30%". Defaults use Project I 10% and Project II 20% (team-graded).';
+        if (c.template === 'SE4351') {
+          return 'Syllabus lists Questionnaire (2 x 2.5 = 5) + Presentation and Deliverable (25) inside the 30% Project. Defaults use Project I 10% and Project II 20% (team-graded). Split or rename project items in Settings when confirmed.';
+        }
+        if (c.template === 'SE6362') {
+          return 'Syllabus says "Project (approx. 10 + 20) 30%". Defaults use Project I 10% and Project II 20% (team-graded).';
+        }
+        return 'Default project items: Project I 10% and Project II 20% (team-graded). Split or rename them in Settings as needed.';
       }
     },
     termPaperWeight: {
@@ -140,10 +178,12 @@
     }
   };
 
+  /** Placeholder keys for a course. projectSplit applies to every course (both syllabi say
+   * "approx. 10 + 20"); termPaperWeight only while the course has the Term Paper item (a_paper). */
   function placeholderKeys(course) {
     var keys = ['letterScale', 'rounding', 'curve', 'lateWork', 'maxScores', 'projectSplit'];
     var hasPaper = (course.assessments || []).some(function (a) { return a.id === 'a_paper'; });
-    if (course.template === 'SE6362' || hasPaper) keys.push('termPaperWeight');
+    if (hasPaper) keys.push('termPaperWeight');
     keys.push('unexcusedThreshold', 'passingLetter');
     return keys;
   }
@@ -155,9 +195,9 @@
   }
 
   function placeholderInfo(course, key) {
+    if (!hasOwn(PLACEHOLDERS, key)) return null;
     var p = PLACEHOLDERS[key];
-    if (!p) return null;
-    var st = (course.placeholders && course.placeholders[key]) || { confirmed: false, confirmedAt: null };
+    var st = (hasOwn(course.placeholders, key) && course.placeholders[key]) || { confirmed: false, confirmedAt: null };
     return { key: key, label: p.label, note: p.note(course), confirmed: !!st.confirmed, confirmedAt: st.confirmedAt || null };
   }
 
@@ -168,7 +208,7 @@
   }
 
   function isConfirmed(course, key) {
-    return !!(course.placeholders && course.placeholders[key] && course.placeholders[key].confirmed);
+    return !!(hasOwn(course.placeholders, key) && course.placeholders[key] && course.placeholders[key].confirmed);
   }
 
   // ---------------------------------------------------------------- factories
@@ -199,7 +239,7 @@
   }
 
   function createCourse(templateKey, overrides) {
-    var key = TEMPLATES[templateKey] ? templateKey : 'custom';
+    var key = hasOwn(TEMPLATES, templateKey) ? templateKey : 'custom';
     var t = TEMPLATES[key];
     var now = util.nowIso();
     var course = {
@@ -263,13 +303,14 @@
     return { id: id || util.uid('t'), name: name || 'Team' };
   }
 
+  /** New assessment. A max score must be above 0 (else 100) and a weight at least 0 (else 0). */
   function createAssessment(fields) {
     var f = fields || {};
     return {
       id: f.id || util.uid('a'),
       name: f.name ? String(f.name) : 'New assessment',
-      maxScore: typeof f.maxScore === 'number' && isFinite(f.maxScore) ? f.maxScore : 100,
-      weight: typeof f.weight === 'number' && isFinite(f.weight) ? f.weight : 0,
+      maxScore: util.isSaneNumber(f.maxScore) && f.maxScore > 0 ? f.maxScore : 100,
+      weight: util.isSaneNumber(f.weight) && f.weight >= 0 ? f.weight : 0,
       teamGraded: !!f.teamGraded,
       category: f.category || 'other'
     };
@@ -309,21 +350,30 @@
 
   // ---------------------------------------------------------------- score-entry helpers
 
+  /** The stored entry for owner/assessment in a scores or teamScores map, or null. */
   function getEntry(map, ownerId, assessmentId) {
-    return map && map[ownerId] && map[ownerId][assessmentId] ? map[ownerId][assessmentId] : null;
+    if (!hasOwn(map, ownerId)) return null;
+    var row = map[ownerId];
+    return hasOwn(row, assessmentId) && row[assessmentId] ? row[assessmentId] : null;
   }
 
+  /** Writes an entry, or deletes it when `entry` is null (an emptied owner row is removed).
+   * Unsafe keys ("__proto__", "constructor", "prototype") are ignored. */
   function setEntry(map, ownerId, assessmentId, entry) {
-    if (!map[ownerId]) map[ownerId] = {};
+    if (!isSafeKey(ownerId) || !isSafeKey(assessmentId)) return;
     if (entry === null || entry === undefined) {
+      if (!hasOwn(map, ownerId) || !util.isPlainObject(map[ownerId])) return;
       delete map[ownerId][assessmentId];
       if (Object.keys(map[ownerId]).length === 0) delete map[ownerId];
-    } else {
-      map[ownerId][assessmentId] = entry;
+      return;
     }
+    if (!hasOwn(map, ownerId) || !util.isPlainObject(map[ownerId])) map[ownerId] = {};
+    map[ownerId][assessmentId] = entry;
   }
 
-  /** Builds a ScoreEntry from user input (string or number). Keeps late info from `prev`. */
+  /** Builds a ScoreEntry from user input (string or number). Keeps late info from `prev`, and its
+   * override flag unless the input is empty: clearing an override cell hands the member back to
+   * the team score (K5). */
   function entryFromInput(input, prev) {
     var p = util.parseScoreInput(input);
     var e = {};
@@ -333,7 +383,7 @@
     if (prev) {
       if (prev.weeksLate) e.weeksLate = prev.weeksLate;
       if (prev.waived) e.waived = true;
-      if (prev.override) e.override = true;
+      if (prev.override && p.kind !== 'empty') e.override = true;
     }
     return e;
   }
@@ -344,11 +394,19 @@
     return (e.value === null || e.value === undefined) && !e.text && !e.weeksLate && !e.waived && !e.override;
   }
 
+  /** True when the entry holds a score: a number, or invalid text (late info alone is no score). */
+  function hasScore(e) {
+    return !!e && (typeof e.value === 'number' || (typeof e.text === 'string' && e.text !== ''));
+  }
+
+  /** Comparison key for "same visible score": the value (or invalid text) plus the late-work info
+   * that changes the score (weeks late, and whether that penalty is waived). */
   function entryKey(e) {
     if (!e) return 'empty';
-    if (typeof e.value === 'number') return 'n:' + e.value;
-    if (e.text) return 't:' + e.text;
-    return 'empty';
+    var k = typeof e.value === 'number' ? 'n:' + e.value : (e.text ? 't:' + e.text : 'empty');
+    var wl = typeof e.weeksLate === 'number' && e.weeksLate > 0 ? e.weeksLate : 0;
+    if (wl) k += '|late:' + wl + (e.waived ? ':waived' : '');
+    return k;
   }
 
   function sortedMembers(course, teamId) {
@@ -359,9 +417,9 @@
   }
 
   /** Given member entries of one team, returns the entry to use as the team score:
-   * the most frequent value; ties go to the value seen first in the given order. */
+   * the most frequent entryKey; ties go to the entry seen first in the given order. */
   function majorityEntry(entries) {
-    var counts = {}, firstIdx = {}, best = null;
+    var counts = Object.create(null), firstIdx = Object.create(null), best = null;
     entries.forEach(function (e, i) {
       var k = entryKey(e);
       counts[k] = (counts[k] || 0) + 1;
@@ -380,11 +438,28 @@
     return c;
   }
 
-  /** Sets team scores from per-member rows (paste/import of a team-graded column).
-   * rows: [{ studentId, entry }] (entry null = empty). Rows for students without a team are
-   * written as individual entries. Returns { overridesCreated, teamsSet }. */
+  /** What a team member sees for a team-graded item (own override, else the team score),
+   * whatever the assessment's teamGraded flag currently is. */
+  function memberEntry(course, student, assessmentId) {
+    var own = getEntry(course.scores, student.id, assessmentId);
+    if (own && own.override === true) return own;
+    return getEntry(course.teamScores, student.teamId, assessmentId);
+  }
+
+  /** Sets team scores from per-member rows (paste/import of a team-graded column; K5).
+   * rows: [{ studentId, entry }] (entry null = empty). For each team with rows:
+   * - Only rows holding a score vote (blank cells abstain). Withdrawn members vote only when no
+   *   active member of that team has a score in `rows`.
+   * - Team score = the most frequent vote (entryKey, so late info counts; ties: first in row
+   *   order). No votes at all clears the team score.
+   * - Blank rows and rows equal to the team score follow the team score (own entry and any
+   *   override removed); other rows keep their entry as an override. No empty override is created.
+   * - Members not in `rows` are not written. Without an override they see the new team score, like
+   *   typing it in one member's cell; `propagatedTo` lists those whose visible score changed.
+   * Rows for students without a team are written as individual entries.
+   * Returns { overridesCreated, teamsSet, propagatedTo }. */
   function setTeamScoreFromMembers(course, assessmentId, rows) {
-    var byTeam = {}, order = [], overridesCreated = 0, teamsSet = 0;
+    var byTeam = Object.create(null), order = [], overridesCreated = 0, teamsSet = 0, propagatedTo = [];
     rows.forEach(function (r) {
       var s = findStudent(course, r.studentId);
       if (!s) return;
@@ -397,14 +472,21 @@
     });
     order.forEach(function (teamId) {
       var list = byTeam[teamId];
-      var team = majorityEntry(list.map(function (x) { return x.entry; }));
-      var teamEntry = isBlankEntry(team) ? null : stripOverride(team);
+      var inRows = Object.create(null);
+      list.forEach(function (x) { inRows[x.student.id] = true; });
+      var others = teamMembers(course, teamId).filter(function (m) { return !inRows[m.id]; });
+      var othersBefore = others.map(function (m) { return entryKey(memberEntry(course, m, assessmentId)); });
+
+      var voters = list.filter(function (x) { return hasScore(x.entry) && x.student.status !== 'withdrawn'; });
+      if (!voters.length) voters = list.filter(function (x) { return hasScore(x.entry); });
+      var team = majorityEntry(voters.map(function (x) { return x.entry; }));
+      var teamEntry = team ? stripOverride(team) : null;
       setEntry(course.teamScores, teamId, assessmentId, teamEntry);
       teamsSet++;
       var teamKey = entryKey(teamEntry);
       list.forEach(function (x) {
-        if (entryKey(x.entry) !== teamKey) {
-          var o = stripOverride(x.entry) || { value: null };
+        if (hasScore(x.entry) && entryKey(x.entry) !== teamKey) {
+          var o = stripOverride(x.entry);
           o.override = true;
           setEntry(course.scores, x.student.id, assessmentId, o);
           overridesCreated++;
@@ -413,56 +495,97 @@
           setEntry(course.scores, x.student.id, assessmentId, null);
         }
       });
+      others.forEach(function (m, i) {
+        if (entryKey(memberEntry(course, m, assessmentId)) !== othersBefore[i]) propagatedTo.push(m.id);
+      });
     });
-    return { overridesCreated: overridesCreated, teamsSet: teamsSet };
+    return { overridesCreated: overridesCreated, teamsSet: teamsSet, propagatedTo: propagatedTo };
   }
 
   /** The entry a student currently sees for a team-graded assessment (override or team score),
    * or their individual entry when they have no team. Mirrors calc.resolveEntry. */
   function effectiveEntry(course, student, assessment) {
-    var own = getEntry(course.scores, student.id, assessment.id);
     if (assessment.teamGraded && student.teamId && findTeam(course, student.teamId)) {
-      if (own && own.override) return own;
-      return getEntry(course.teamScores, student.teamId, assessment.id);
+      return memberEntry(course, student, assessment.id);
     }
-    return own;
+    return getEntry(course.scores, student.id, assessment.id);
   }
 
-  /** Moves a student to another team (or to no team with newTeamId null).
-   * keepScores: keep the student's current team-graded scores (as overrides in the new team, or as
-   * individual entries without a team) wherever the new team's score would differ.
-   * Without keepScores, team-graded scores follow the new team (existing overrides are kept). */
+  /** Sets (or, with a blank entry, clears) a team's score for a team-graded assessment. */
+  function setTeamScore(course, teamId, assessmentId, entry) {
+    setEntry(course.teamScores, teamId, assessmentId, isBlankEntry(entry) ? null : stripOverride(entry));
+  }
+
+  /** Gives a team member an explicit override (K5): the entry is stored with override: true.
+   * An empty entry (null or { value: null }) is an explicit "no score for this member" override. */
+  function setOverride(course, studentId, assessmentId, entry) {
+    var o = stripOverride(entry) || { value: null };
+    o.override = true;
+    setEntry(course.scores, studentId, assessmentId, o);
+  }
+
+  /** Removes a member's override so they see the team score again. True when one was removed. */
+  function clearOverride(course, studentId, assessmentId) {
+    var own = getEntry(course.scores, studentId, assessmentId);
+    if (!own || own.override !== true) return false;
+    setEntry(course.scores, studentId, assessmentId, null);
+    return true;
+  }
+
+  /** Copy of `entry` (null = empty) with late-work info set (K4). weeksLate 0 or less removes it;
+   * waived is stored only when true. Other fields (value, text, override) are kept. */
+  function withLate(entry, weeksLate, waived) {
+    var e = entry ? util.clone(entry) : { value: null };
+    if (util.isSaneNumber(weeksLate) && weeksLate > 0) e.weeksLate = weeksLate; else delete e.weeksLate;
+    if (waived === true) e.waived = true; else delete e.waived;
+    return e;
+  }
+
+  /** Moves a student to another team, or to no team with newTeamId null. Nothing changes when the
+   * student is already in that team.
+   * Without keepScores, team-graded scores follow the new team: the student's own entries for
+   * team-graded items are removed, overrides included (an unequal split was agreed within the old
+   * team), so without a team those items are empty.
+   * With keepScores, the student's current team-graded scores are kept wherever the new team's
+   * score differs: as overrides in the new team, or as individual entries without a team. An empty
+   * score is not kept as an override; the student then follows the new team's score. */
   function moveStudentToTeam(course, studentId, newTeamId, opts) {
     var s = findStudent(course, studentId);
     if (!s) return;
     var target = newTeamId && findTeam(course, newTeamId) ? newTeamId : null;
+    var current = s.teamId && findTeam(course, s.teamId) ? s.teamId : null;
+    if (target === current) { s.teamId = target; return; }
     var keep = !!(opts && opts.keepScores);
-    var before = {};
+    var before = Object.create(null);
     course.assessments.forEach(function (a) {
       if (a.teamGraded) before[a.id] = effectiveEntry(course, s, a);
     });
     s.teamId = target;
-    if (!keep) return;
     course.assessments.forEach(function (a) {
       if (!a.teamGraded) return;
       var prev = before[a.id];
-      var now = effectiveEntry(course, s, a);
-      if (entryKey(prev) === entryKey(now)) return;
-      if (target) {
-        var o = stripOverride(prev) || { value: null };
-        o.override = true;
-        setEntry(course.scores, s.id, a.id, o);
+      if (!keep) {
+        setEntry(course.scores, s.id, a.id, null);
+      } else if (target) {
+        if (!hasScore(prev) || entryKey(prev) === entryKey(getEntry(course.teamScores, target, a.id))) {
+          setEntry(course.scores, s.id, a.id, null);
+        } else {
+          setOverride(course, s.id, a.id, prev);
+        }
       } else {
         setEntry(course.scores, s.id, a.id, isBlankEntry(prev) ? null : stripOverride(prev));
       }
     });
   }
 
-  /** Switches an assessment to team-graded, preserving every student's visible score
-   * (team score = majority of members; differing members keep an override). */
+  /** Switches an individually graded assessment to team-graded (K5). For each team, the members'
+   * individual entries (in name order) go through setTeamScoreFromMembers: every entered score is
+   * preserved (the majority becomes the team score, the rest overrides) and members without a
+   * score follow the team score. Students without a team keep individual entries.
+   * Does nothing when the assessment is already team-graded. Returns { overridesCreated }. */
   function convertAssessmentToTeam(course, assessmentId) {
     var a = findAssessment(course, assessmentId);
-    if (!a) return { overridesCreated: 0 };
+    if (!a || a.teamGraded) return { overridesCreated: 0 };
     var created = 0;
     course.teams.forEach(function (t) {
       var members = sortedMembers(course, t.id);
@@ -484,13 +607,9 @@
     var a = findAssessment(course, assessmentId);
     if (!a) return;
     course.students.forEach(function (s) {
-      var own = getEntry(course.scores, s.id, assessmentId);
-      var eff = null;
-      if (s.teamId && findTeam(course, s.teamId)) {
-        eff = own && own.override ? own : getEntry(course.teamScores, s.teamId, assessmentId);
-      } else {
-        eff = own;
-      }
+      var eff = s.teamId && findTeam(course, s.teamId)
+        ? memberEntry(course, s, assessmentId)
+        : getEntry(course.scores, s.id, assessmentId);
       setEntry(course.scores, s.id, assessmentId, isBlankEntry(eff) ? null : stripOverride(eff));
     });
     Object.keys(course.teamScores).forEach(function (tid) {
@@ -499,16 +618,50 @@
     a.teamGraded = false;
   }
 
+  function indexById(list, id) {
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return i;
+    return -1;
+  }
+
+  /** Deletes an assessment with every score for it (individual entries, overrides, team scores).
+   * Export presets are left alone; the exporter skips columns of missing assessments.
+   * Returns true when the assessment existed. */
+  function removeAssessment(course, assessmentId) {
+    var i = indexById(course.assessments, assessmentId);
+    if (i === -1) return false;
+    course.assessments.splice(i, 1);
+    Object.keys(course.scores).forEach(function (sid) { setEntry(course.scores, sid, assessmentId, null); });
+    Object.keys(course.teamScores).forEach(function (tid) { setEntry(course.teamScores, tid, assessmentId, null); });
+    return true;
+  }
+
+  /** Deletes a team. Its members move to no team through moveStudentToTeam (opts.keepScores keeps
+   * their current team-graded scores as individual entries), then the team's scores are deleted.
+   * Returns the ids of the members that were moved. */
+  function removeTeam(course, teamId, opts) {
+    var i = indexById(course.teams, teamId);
+    if (i === -1) return [];
+    var moved = teamMembers(course, teamId).map(function (s) { return s.id; });
+    moved.forEach(function (sid) { moveStudentToTeam(course, sid, null, opts); });
+    course.teams.splice(i, 1);
+    if (hasOwn(course.teamScores, teamId)) delete course.teamScores[teamId];
+    return moved;
+  }
+
   // ---------------------------------------------------------------- normalization
+  // Data read from files is untrusted: ids must pass util.isSafeKey, lookups use own properties
+  // only, and numbers must be finite and within util.MAX_INPUT_ABS.
 
   function num(x, dflt) {
-    return typeof x === 'number' && isFinite(x) ? x : dflt;
+    return util.isSaneNumber(x) ? x : dflt;
   }
 
   function normalizeEntry(e) {
     if (!util.isPlainObject(e)) return null;
-    var out = { value: typeof e.value === 'number' && isFinite(e.value) ? e.value : null };
-    if (out.value === null && typeof e.text === 'string' && e.text !== '') out.text = e.text;
+    var out = { value: null };
+    if (util.isSaneNumber(e.value)) out.value = e.value;
+    else if (typeof e.value === 'number' && isFinite(e.value)) out.text = String(e.value); // absurd size: show as invalid
+    if (out.value === null && !out.text && typeof e.text === 'string' && e.text !== '') out.text = e.text;
     var wl = num(e.weeksLate, 0);
     if (wl > 0) out.weeksLate = wl;
     if (e.waived === true) out.waived = true;
@@ -520,13 +673,11 @@
     var out = {};
     if (!util.isPlainObject(map)) return out;
     Object.keys(map).forEach(function (owner) {
-      if (!util.isPlainObject(map[owner])) return;
+      if (!isSafeKey(owner) || !util.isPlainObject(map[owner])) return;
       Object.keys(map[owner]).forEach(function (aid) {
+        if (!isSafeKey(aid)) return;
         var e = normalizeEntry(map[owner][aid]);
-        if (e) {
-          if (!out[owner]) out[owner] = {};
-          out[owner][aid] = e;
-        }
+        if (e) setEntry(out, owner, aid, e);
       });
     });
     return out;
@@ -536,12 +687,17 @@
   var ATTENDANCE_MODES = ['per-session', 'totals', 'off'];
   var MARKS = { P: true, A: true, E: true };
 
+  /** An id read from a file, or undefined (so a new one is made) when it is unsafe or already used. */
+  function freshId(id, seen) {
+    return isSafeKey(id) && !seen[id] ? id : undefined;
+  }
+
   function normalizeCourse(raw) {
     if (!util.isPlainObject(raw)) throw new Error('Course data is not an object.');
-    var template = TEMPLATES[raw.template] ? raw.template : 'custom';
+    var template = typeof raw.template === 'string' && hasOwn(TEMPLATES, raw.template) ? raw.template : 'custom';
     var level = raw.level === 'graduate' ? 'graduate' : 'undergraduate';
     var c = {
-      id: typeof raw.id === 'string' && raw.id ? raw.id : util.uid('c'),
+      id: isSafeKey(raw.id) ? raw.id : util.uid('c'),
       template: template,
       code: typeof raw.code === 'string' ? raw.code : TEMPLATES[template].code,
       title: typeof raw.title === 'string' ? raw.title : TEMPLATES[template].title,
@@ -551,10 +707,10 @@
       updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : util.nowIso()
     };
 
-    var seenA = {};
+    var seenA = Object.create(null);
     c.assessments = (Array.isArray(raw.assessments) ? raw.assessments : []).filter(util.isPlainObject).map(function (a) {
       var out = createAssessment({
-        id: typeof a.id === 'string' && a.id && !seenA[a.id] ? a.id : undefined,
+        id: freshId(a.id, seenA),
         name: typeof a.name === 'string' ? a.name : 'Assessment',
         maxScore: num(a.maxScore, 100),
         weight: num(a.weight, 0),
@@ -565,18 +721,17 @@
       return out;
     });
 
-    var seenT = {};
+    var seenT = Object.create(null);
     c.teams = (Array.isArray(raw.teams) ? raw.teams : []).filter(util.isPlainObject).map(function (t) {
-      var out = createTeam(typeof t.name === 'string' ? t.name : 'Team',
-        typeof t.id === 'string' && t.id && !seenT[t.id] ? t.id : undefined);
+      var out = createTeam(typeof t.name === 'string' ? t.name : 'Team', freshId(t.id, seenT));
       seenT[out.id] = true;
       return out;
     });
 
-    var seenS = {};
+    var seenS = Object.create(null);
     c.students = (Array.isArray(raw.students) ? raw.students : []).filter(util.isPlainObject).map(function (s) {
       var out = createStudent({
-        id: typeof s.id === 'string' && s.id && !seenS[s.id] ? s.id : undefined,
+        id: freshId(s.id, seenS),
         no: num(s.no, null),
         lastName: typeof s.lastName === 'string' ? s.lastName : '',
         firstName: typeof s.firstName === 'string' ? s.firstName : '',
@@ -593,45 +748,40 @@
 
     var rs = util.isPlainObject(raw.settings) ? raw.settings : {};
     var ds = defaultSettings(level);
-    var scale = Array.isArray(rs.letterScale) ? rs.letterScale.filter(function (x) {
-      return util.isPlainObject(x) && typeof x.letter === 'string' && x.letter !== '' && typeof x.min === 'number' && isFinite(x.min);
-    }).map(function (x) { return { letter: x.letter, min: x.min }; }) : [];
-    if (!scale.length) scale = ds.letterScale;
-    scale.sort(function (a, b) { return b.min - a.min; });
+    var scale = normalizeLetterScale(rs.letterScale, level);
     c.settings = {
       decimals: Math.max(0, Math.min(6, Math.round(num(rs.decimals, ds.decimals)))),
       rounding: ROUNDING_MODES.indexOf(rs.rounding) !== -1 ? rs.rounding : 'none',
       curve: num(rs.curve, 0),
-      latePointsPerWeek: num(rs.latePointsPerWeek, 10),
+      latePointsPerWeek: Math.max(0, num(rs.latePointsPerWeek, 10)),
       letterScale: scale,
-      passingLetter: typeof rs.passingLetter === 'string' && scale.some(function (x) { return x.letter === rs.passingLetter; })
-        ? rs.passingLetter : ds.passingLetter
+      passingLetter: passingLetterFor(scale, rs.passingLetter, level)
     };
 
     var ra = util.isPlainObject(raw.attendance) ? raw.attendance : {};
     var att = defaultAttendance(ATTENDANCE_MODES.indexOf(ra.mode) !== -1 ? ra.mode : 'off', []);
-    var seenSes = {};
+    var seenSes = Object.create(null);
     att.sessions = (Array.isArray(ra.sessions) ? ra.sessions : []).filter(function (x) {
       return util.isPlainObject(x) && util.isIsoDate(x.date);
     }).map(function (x) {
-      var id = typeof x.id === 'string' && x.id && !seenSes[x.id] ? x.id : util.uid('ses');
+      var id = freshId(x.id, seenSes) || util.uid('ses');
       seenSes[id] = true;
       return { id: id, date: x.date, label: typeof x.label === 'string' ? x.label : '' };
     }).sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
     if (util.isPlainObject(ra.records)) {
       Object.keys(ra.records).forEach(function (sid) {
+        if (!isSafeKey(sid)) return;
         var row = ra.records[sid];
         if (!util.isPlainObject(row)) return;
         Object.keys(row).forEach(function (sesId) {
-          if (MARKS[row[sesId]]) {
-            if (!att.records[sid]) att.records[sid] = {};
-            att.records[sid][sesId] = row[sesId];
-          }
+          var mark = row[sesId];
+          if (isSafeKey(sesId) && typeof mark === 'string' && hasOwn(MARKS, mark)) setEntry(att.records, sid, sesId, mark);
         });
       });
     }
     if (util.isPlainObject(ra.totals)) {
       Object.keys(ra.totals).forEach(function (sid) {
+        if (!isSafeKey(sid)) return;
         var t = ra.totals[sid];
         if (!util.isPlainObject(t)) return;
         att.totals[sid] = { absent: Math.max(0, num(t.absent, 0)), excused: Math.max(0, num(t.excused, 0)) };
@@ -647,7 +797,7 @@
     var ph = defaultPlaceholders(c);
     if (util.isPlainObject(raw.placeholders)) {
       Object.keys(ph).forEach(function (k) {
-        var p = raw.placeholders[k];
+        var p = hasOwn(raw.placeholders, k) ? raw.placeholders[k] : null;
         if (util.isPlainObject(p) && p.confirmed === true) {
           ph[k] = { confirmed: true, confirmedAt: typeof p.confirmedAt === 'string' ? p.confirmedAt : null };
         }
@@ -655,11 +805,14 @@
     }
     c.placeholders = ph;
 
+    var seenP = Object.create(null);
     c.exportPresets = (Array.isArray(raw.exportPresets) ? raw.exportPresets : []).filter(function (p) {
       return util.isPlainObject(p) && typeof p.name === 'string' && Array.isArray(p.columns);
     }).map(function (p) {
+      var id = freshId(p.id, seenP) || util.uid('xp');
+      seenP[id] = true;
       return {
-        id: typeof p.id === 'string' && p.id ? p.id : util.uid('xp'),
+        id: id,
         name: p.name,
         columns: p.columns.filter(function (k) { return typeof k === 'string'; })
       };
@@ -671,12 +824,17 @@
 
   function normalizeState(raw) {
     if (!util.isPlainObject(raw)) throw new Error('Not a Grade Tracker data file (expected a JSON object).');
-    if (raw.app !== undefined && raw.app !== APP_ID) throw new Error('Not a Grade Tracker data file (app is "' + raw.app + '").');
+    if (raw.app !== APP_ID) {
+      // Restore replaces all data (R4), so a JSON file from another tool must never pass.
+      throw new Error(raw.app === undefined
+        ? 'Not a Grade Tracker data file (the "app": "grade-tracker" marker is missing).'
+        : 'Not a Grade Tracker data file (app is "' + String(raw.app) + '").');
+    }
     if (typeof raw.schemaVersion === 'number' && raw.schemaVersion > SCHEMA_VERSION) {
       throw new Error('This data was saved by a newer version of Grade Tracker (schema ' + raw.schemaVersion + ').');
     }
     if (!Array.isArray(raw.courses)) throw new Error('Not a Grade Tracker data file (no course list).');
-    var seen = {};
+    var seen = Object.create(null);
     var courses = raw.courses.map(function (c) {
       var n = normalizeCourse(c);
       if (seen[n.id]) n.id = util.uid('c');
@@ -689,7 +847,8 @@
       app: APP_ID,
       schemaVersion: SCHEMA_VERSION,
       courses: courses,
-      activeCourseId: seen[raw.activeCourseId] ? raw.activeCourseId : (courses[0] ? courses[0].id : null),
+      activeCourseId: typeof raw.activeCourseId === 'string' && seen[raw.activeCourseId]
+        ? raw.activeCourseId : (courses[0] ? courses[0].id : null),
       ui: {
         theme: ['system', 'light', 'dark'].indexOf(ui.theme) !== -1 ? ui.theme : 'system',
         privacy: ui.privacy === true,
@@ -720,6 +879,8 @@
     if (!util.isPlainObject(obj)) throw new Error('This file is not a Grade Tracker backup.');
     var rawState = obj.kind === 'backup' && util.isPlainObject(obj.state) ? obj.state : obj;
     if (obj.kind === 'backup' && obj.app !== APP_ID) throw new Error('This file is not a Grade Tracker backup.');
+    // A wrapped backup carries the app marker on the envelope; a bare state must carry its own.
+    if (rawState !== obj && rawState.app === undefined) rawState = Object.assign({ app: APP_ID }, rawState);
     var state = normalizeState(rawState);
     return {
       state: state,
@@ -763,6 +924,8 @@
     ATTENDANCE_MODES: ATTENDANCE_MODES,
     defaultLetterScale: defaultLetterScale,
     defaultPassingLetter: defaultPassingLetter,
+    normalizeLetterScale: normalizeLetterScale,
+    passingLetterFor: passingLetterFor,
     defaultSettings: defaultSettings,
     defaultAttendance: defaultAttendance,
     generateSessions: generateSessions,
@@ -787,13 +950,20 @@
     setEntry: setEntry,
     entryFromInput: entryFromInput,
     isBlankEntry: isBlankEntry,
+    hasScore: hasScore,
     entryKey: entryKey,
     majorityEntry: majorityEntry,
     setTeamScoreFromMembers: setTeamScoreFromMembers,
     effectiveEntry: effectiveEntry,
+    setTeamScore: setTeamScore,
+    setOverride: setOverride,
+    clearOverride: clearOverride,
+    withLate: withLate,
     moveStudentToTeam: moveStudentToTeam,
     convertAssessmentToTeam: convertAssessmentToTeam,
     convertAssessmentToIndividual: convertAssessmentToIndividual,
+    removeAssessment: removeAssessment,
+    removeTeam: removeTeam,
     normalizeCourse: normalizeCourse,
     normalizeState: normalizeState,
     wrapBackup: wrapBackup,

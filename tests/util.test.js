@@ -207,3 +207,78 @@ describe('util dates (ISO YYYY-MM-DD, time-zone safe)', () => {
     assert.equal(util.weekday('2026-01-01'), 4); // Thursday
   });
 });
+
+// ---------------------------------------------------------------- review round 1 regressions
+
+describe('util.roundTo edge cases (review F6)', () => {
+  test('very large values round without turning into NaN', () => {
+    assert.equal(util.roundTo(1e19, 2), 1e19);
+    assert.equal(util.roundTo(1e20, 0), 1e20);
+    assert.equal(util.roundTo(1e22, 2), 1e22);
+    assert.equal(util.formatNumber(1e19, 2), '10000000000000000000');
+  });
+
+  test('negative decimals round to tens and hundreds like Excel ROUND(1234, -2)', () => {
+    assert.equal(util.roundTo(1234, -2), 1200);
+    assert.equal(util.roundTo(1250, -2), 1300);
+    assert.equal(util.roundTo(-1250, -2), -1300);
+    assert.equal(util.roundTo(85, -1), 90);
+  });
+
+  test('FIX_DECIMALS is the 10-decimal precision used by fix (for Excel ROUND parity)', () => {
+    assert.equal(util.FIX_DECIMALS, 10);
+    assert.equal(util.fix(4e-11), 0);
+    assert.equal(util.fix(2e-10), 2e-10);
+    assert.equal(util.fix(79.99999999999997), 80);
+  });
+});
+
+describe('util.parseScoreInput magnitude limit (review F6)', () => {
+  test('absurd magnitudes are invalid, so totals stay finite', () => {
+    assert.deepEqual(util.parseScoreInput('1e308'), { kind: 'invalid', text: '1e308' });
+    assert.equal(util.parseScoreInput('1e20').kind, 'invalid');
+    assert.equal(util.parseScoreInput('-2000000').kind, 'invalid');
+    assert.equal(util.parseScoreInput(1e7).kind, 'invalid');
+    assert.equal(util.parseScoreInput(Infinity).kind, 'invalid');
+  });
+
+  test('large but plausible values are still numbers (flagged out of range by calc instead)', () => {
+    assert.deepEqual(util.parseScoreInput('8500'), { kind: 'number', value: 8500 });
+    assert.deepEqual(util.parseScoreInput('1e6'), { kind: 'number', value: 1000000 });
+    assert.equal(util.MAX_INPUT_ABS, 1e6);
+  });
+});
+
+describe('util.parseCount (whole, non-negative numbers; review F7)', () => {
+  test('whole numbers parse', () => {
+    assert.equal(util.parseCount('2'), 2);
+    assert.equal(util.parseCount(' 0 '), 0);
+    assert.equal(util.parseCount(3), 3);
+  });
+
+  test('fractions, percentages, negatives, text and blanks are rejected', () => {
+    assert.equal(util.parseCount('1.5'), null);
+    assert.equal(util.parseCount(1.5), null);
+    assert.equal(util.parseCount('88%'), null);
+    assert.equal(util.parseCount('2 %'), null);
+    assert.equal(util.parseCount('-1'), null);
+    assert.equal(util.parseCount('two'), null);
+    assert.equal(util.parseCount(''), null);
+    assert.equal(util.parseCount(null), null);
+  });
+});
+
+describe('util.hasOwn and util.isSafeKey (review F2, F4)', () => {
+  test('hasOwn ignores inherited names', () => {
+    assert.equal(util.hasOwn({}, 'toString'), false);
+    assert.equal(util.hasOwn({}, 'constructor'), false);
+    assert.equal(util.hasOwn({ a: 1 }, 'a'), true);
+    assert.equal(util.hasOwn(null, 'a'), false);
+    assert.equal(util.hasOwn(JSON.parse('{"__proto__":1}'), '__proto__'), true);
+  });
+
+  test('isSafeKey rejects prototype keys and non-strings', () => {
+    ['__proto__', 'constructor', 'prototype', '', null, 5].forEach((k) => assert.equal(util.isSafeKey(k), false, String(k)));
+    ['s_1', 'toString', 'valueOf', 'a_t1'].forEach((k) => assert.equal(util.isSafeKey(k), true, k));
+  });
+});

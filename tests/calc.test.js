@@ -797,3 +797,190 @@ describe('late penalty (K4)', () => {
     assert.equal(x.weighted, 0);
   });
 });
+
+// ================================================================ review round 1 regressions
+
+describe('totals with non-100 max scores are exact (review F1)', () => {
+  // All five SE 4351 items with max 30. Exact totals, worked by hand:
+  // 20/30x10 + 20/30x20 + 22/30x25 + 28/30x40 + 26/30x5 = (200 + 400 + 550 + 1120 + 130) / 30 = 2400 / 30 = 80.
+  // 20/30x10 + 20/30x20 + 20/30x25 + 29/30x40 + 28/30x5 = (200 + 400 + 500 + 1160 + 140) / 30 = 2400 / 30 = 80.
+  // 20/30x10 + 20/30x20 + 22/30x25 + 28/30x40 + 23/30x5 = (200 + 400 + 550 + 1120 + 115) / 30 = 2385 / 30 = 79.5.
+  function max30(rounding) {
+    const c = course('SE4351');
+    c.assessments.forEach((a) => { a.maxScore = 30; });
+    if (rounding) c.settings.rounding = rounding;
+    return c;
+  }
+  function withRaws(c, raws, name) {
+    const s = addStudent(c, name, 'X');
+    FIVE.forEach((aid, i) => setScore(c, s, aid, raws[i]));
+    return s;
+  }
+
+  test('an exact total of 80 is 80 and B-, not 79.9999999999 and C+', () => {
+    const c = max30();
+    const s = withRaws(c, [20, 20, 22, 28, 26], 'Student 01');
+    const r = calc.studentResult(c, s);
+    assert.equal(r.weightedSum, 80);
+    assert.equal(r.total, 80);
+    assert.equal(r.letter, 'B-');
+    // Display values per item are still rounded to 10 decimals: 20 / 30 x 10 = 6.6666666667.
+    assert.equal(r.items[P1].weighted, 6.6666666667);
+  });
+
+  test('two students with the same exact total tie in rank and percentile', () => {
+    const c = max30();
+    const a = withRaws(c, [20, 20, 22, 28, 26], 'Student 01');
+    const b = withRaws(c, [20, 20, 20, 29, 28], 'Student 02');
+    const res = calc.computeCourse(c);
+    assert.equal(res.byId[a.id].total, 80);
+    assert.equal(res.byId[b.id].total, 80);
+    assert.equal(res.byId[b.id].letter, 'B-');
+    assert.equal(res.byId[a.id].rank, 1);
+    assert.equal(res.byId[b.id].rank, 1);
+    assert.equal(res.byId[a.id].percentile, res.byId[b.id].percentile);
+  });
+
+  test('integer rounding: an exact 79.5 rounds to 80 (B-) like Excel ROUND', () => {
+    const c = max30('integer');
+    const s = withRaws(c, [20, 20, 22, 28, 23], 'Student 01');
+    const r = calc.studentResult(c, s);
+    assert.equal(r.totalUnrounded, 79.5);
+    assert.equal(r.total, 80);
+    assert.equal(r.letter, 'B-');
+  });
+
+  test('every total on a max-30 grid matches exact arithmetic at the letter cutoffs', () => {
+    // Totals are k / 30 for integer k (common denominator 30); check all combinations that hit
+    // a cutoff exactly, varying Test 2 and Participation with the other items fixed.
+    const c = max30();
+    const s = addStudent(c, 'Student 01', 'X');
+    let checked = 0;
+    for (let t2 = 0; t2 <= 30; t2++) {
+      for (let part = 0; part <= 30; part++) {
+        [[20, 20, 22], [10, 30, 16], [19, 29, 1]].forEach(([p1, p2, t1]) => {
+          const k = p1 * 10 + p2 * 20 + t1 * 25 + t2 * 40 + part * 5; // total = k / 30
+          if (k % 30 !== 0) return;
+          [P1, P2, T1, T2, PART].forEach((aid, i) => setScore(c, s, aid, [p1, p2, t1, t2, part][i]));
+          const r = calc.studentResult(c, s);
+          assert.equal(r.total, k / 30, `raws ${[p1, p2, t1, t2, part]}`);
+          assert.equal(r.letter, calc.letterFor(k / 30, c.settings.letterScale));
+          checked++;
+        });
+      }
+    }
+    assert.ok(checked > 20, `expected many exact totals, checked ${checked}`);
+  });
+});
+
+describe('negative weights, max scores and late settings (review F8)', () => {
+  test('weightStatus is not ok when a weight is negative, even if the sum is 100', () => {
+    const c = course('SE4351');
+    c.assessments = [model.createAssessment({ name: 'X', weight: 10 }), model.createAssessment({ name: 'Y', weight: 10 })];
+    c.assessments[0].weight = 110;
+    c.assessments[1].weight = -10;
+    assert.deepEqual(calc.weightStatus(c), { sum: 100, ok: false });
+  });
+
+  test('the late penalty is never negative', () => {
+    assert.equal(calc.latePenalty({ value: 50, weeksLate: 1 }, { maxScore: -100 }, { latePointsPerWeek: 10 }), 0);
+    assert.equal(calc.latePenalty({ value: 50, weeksLate: 1 }, { maxScore: 100 }, { latePointsPerWeek: -10 }), 0);
+    assert.equal(calc.latePenalty({ value: 50, weeksLate: 1 }, { maxScore: 0 }, { latePointsPerWeek: 10 }), 0);
+  });
+});
+
+describe('non-finite totals stay out of class figures (review F6)', () => {
+  test('a student whose total overflows gets no rank and does not poison the average', () => {
+    const c = course('SE4351');
+    const a = addStudent(c, 'Student 01', 'Alpha');
+    const b = addStudent(c, 'Student 02', 'Bravo');
+    fillAll(c, a, 80);
+    fillAll(c, b, 90);
+    model.setEntry(c.scores, b.id, T1, null); // b has no Test 1 score: 9 + 18 + 36 + 4.5 = 67.5
+    asmt(c, T1).weight = 1e308; // only reachable by setting the weight in code; normalize rejects it
+    const res = calc.computeCourse(c);
+    assert.ok(!Number.isFinite(res.byId[a.id].total)); // 80 x 1e308 overflows
+    assert.equal(res.byId[a.id].rank, null);
+    assert.equal(res.byId[a.id].diffFromAverage, null);
+    assert.equal(res.byId[b.id].total, 67.5);
+    assert.equal(res.byId[b.id].rank, 1);
+    assert.equal(res.average, 67.5);
+    assert.deepEqual(res.activeIds, [a.id, b.id]);
+  });
+
+  test('a stored score above the input limit is shown as invalid after a restore', () => {
+    const raw = JSON.parse(JSON.stringify(course('SE4351')));
+    raw.students = [{ id: 's_1', lastName: 'Student 01' }];
+    raw.scores = { s_1: { a_t1: { value: 1e308 }, a_t2: { value: 50 } } };
+    const c = model.normalizeState({ app: 'grade-tracker', courses: [raw] }).courses[0];
+    assert.deepEqual(c.scores.s_1.a_t1, { value: null, text: '1e+308' });
+    const r = calc.studentResult(c, c.students[0]);
+    assert.equal(r.items[T1].state, 'invalid');
+    assert.equal(r.total, 20);
+  });
+});
+
+describe('what-if helpers (review F9: minTotalForLetter, neededScore)', () => {
+  test('minTotalForLetter inverts the rounding mode', () => {
+    const scale = course('SE4351').settings.letterScale;
+    assert.equal(calc.minTotalForLetter('A-', { letterScale: scale, rounding: 'none' }), 90);
+    assert.equal(calc.minTotalForLetter('A-', { letterScale: scale, rounding: 'integer' }), 89.5);
+    assert.equal(calc.minTotalForLetter('A-', { letterScale: scale, rounding: 'hundredth' }), 89.995);
+    assert.equal(calc.minTotalForLetter('B-', { letterScale: [{ letter: 'B-', min: 79.5 }, { letter: 'F', min: 0 }], rounding: 'integer' }), 79.5);
+    assert.equal(calc.minTotalForLetter('Z', { letterScale: scale, rounding: 'none' }), null);
+    // The returned totals really earn the letter, and a hair less does not.
+    ['none', 'integer', 'hundredth'].forEach((mode) => {
+      const min = calc.minTotalForLetter('A-', { letterScale: scale, rounding: mode });
+      assert.equal(calc.letterFor(calc.roundTotal(min, mode), scale), 'A-', mode);
+      assert.equal(calc.letterFor(calc.roundTotal(util.fix(min - 0.0001), mode), scale), 'B+', mode);
+    });
+  });
+
+  test('neededScore: Test 2 needed for a B with the 74.0 example items', () => {
+    // Project I 90 (9), Project II 85 (17), Test 1 80 (20), Participation 0: 46 without Test 2.
+    // B needs 83: (83 - 46) / 40 x 100 = 92.5.
+    const c = course('SE4351');
+    const s = studentWith(c, { [P1]: 90, [P2]: 85, [T1]: 80, [T2]: 10, [PART]: 0 });
+    const w = calc.neededScore(c, s, T2, 'B');
+    assert.deepEqual(w, { needed: 92.5, reachable: true, alreadyReached: false });
+    setScore(c, s, T2, 92.5);
+    assert.equal(calc.studentResult(c, s).letter, 'B');
+    // A+ needs (97 - 46) / 40 x 100 = 127.5: not reachable. F is already reached (needs <= 0).
+    assert.equal(calc.neededScore(c, s, T2, 'A+').reachable, false);
+    assert.equal(calc.neededScore(c, s, T2, 'F').alreadyReached, true);
+  });
+
+  test('neededScore with a repeating decimal is rounded up, so entering it really reaches the letter', () => {
+    // Max scores 7, 30, 45, 15 (Test 2), 3. Other items: 3/7 x 10 + 23/30 x 20 + 10/45 x 25 + 1/3 x 5
+    // = 30/7 + 46/3 + 50/9 + 5/3 = 1691/63. A+ needs 97: (97 - 1691/63) x 15/40 = 13260/504 = 26.30952380952…
+    // Rounded to 10 decimals that is 26.3095238095, which falls short (Test 2's factor 40/15 magnifies
+    // the cut digits), so the helper returns 26.3095238096.
+    const c = course('SE4351');
+    [[P1, 7], [P2, 30], [T1, 45], [T2, 15], [PART, 3]].forEach(([aid, max]) => { asmt(c, aid).maxScore = max; });
+    const s = studentWith(c, { [P1]: 3, [P2]: 23, [T1]: 10, [PART]: 1 });
+    const w = calc.neededScore(c, s, T2, 'A+');
+    assert.equal(w.needed, 26.3095238096);
+    assert.equal(w.reachable, false); // above the max of 15
+    setScore(c, s, T2, w.needed);
+    assert.equal(calc.studentResult(c, s).letter, 'A+');
+    setScore(c, s, T2, 26.3095238095);
+    assert.equal(calc.studentResult(c, s).letter, 'A');
+    // The other targets are repeating decimals too; each returned score reaches its letter.
+    ['C+', 'B-', 'B'].forEach((letter) => {
+      const x = calc.neededScore(c, s, T2, letter);
+      setScore(c, s, T2, x.needed);
+      assert.equal(calc.studentResult(c, s).letter, letter, `${letter} with ${x.needed}`);
+    });
+  });
+
+  test('neededScore follows rounding and curve, and is null for weight-0 items or unknown letters', () => {
+    const c = course('SE6362');
+    c.settings.rounding = 'integer';
+    c.settings.curve = 1;
+    const s = studentWith(c, { [P1]: 90, [P2]: 85, [T1]: 80, [PART]: 0 });
+    // A- needs an unrounded total of 89.5; minus curve 1 and 46 from the other items: 42.5 / 40 x 100 = 106.25.
+    assert.equal(calc.neededScore(c, s, T2, 'A-').needed, 106.25);
+    assert.equal(calc.neededScore(c, s, PAPER, 'A'), null);
+    assert.equal(calc.neededScore(c, s, T2, 'A+'), null);
+  });
+});

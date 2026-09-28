@@ -90,7 +90,7 @@ Course = {
 }
 
 Assessment = { id: 'a_…', name: 'Project I', maxScore: 100, weight: 10, teamGraded: true,
-               category: 'project'|'test'|'participation'|'paper'|'other' }
+               category: 'project'|'test'|'participation'|'paper'|'other' }   // maxScore > 0, weight >= 0
 Team       = { id: 't_…', name: 'Team 1' }
 Student    = { id: 's_…', no: 1, lastName: 'Student 01', firstName: 'Alpha',
                teamId: 't_…'|null, status: 'active'|'withdrawn', notes: '' }
@@ -104,12 +104,12 @@ ScoreEntry = {
 }
 
 Settings = {
-  decimals: 2,                        // display only
+  decimals: 2,                        // display only (not a placeholder: it never changes a grade)
   rounding: 'none'|'hundredth'|'integer',
   curve: 0,                           // flat points added to the total
-  latePointsPerWeek: 10,              // K4
+  latePointsPerWeek: 10,              // K4, >= 0
   letterScale: [{ letter: 'A+', min: 97 }, …, { letter: 'F', min: 0 }],  // descending min; last is F with min 0
-  passingLetter: 'D-'|'C'             // lowest passing letter (pass rate, ST2)
+  passingLetter: 'D-'|'C'             // lowest passing letter (pass rate, ST2); always a letter of the scale
 }
 
 Attendance = {                        // stage 3 fills in behavior; shape exists from stage 1
@@ -144,38 +144,119 @@ Default state (`model.createDefaultState()`): both template courses with **no st
 ### 2.2 Placeholders ("needs confirmation" badges)
 
 `model.PLACEHOLDERS` is a catalog `{ key: { label, note(course) } }`. Keys:
-`letterScale`, `rounding`, `curve`, `lateWork`, `maxScores`, `projectSplit`, `termPaperWeight`
-(SE6362 template only), `unexcusedThreshold`, `passingLetter`.
+`letterScale`, `rounding`, `curve`, `lateWork`, `maxScores`, `projectSplit` (every course: both syllabi
+say "approx. 10 + 20"), `termPaperWeight` (only while the course has the `a_paper` assessment, which the
+SE6362 template creates), `unexcusedThreshold`, `passingLetter`. Display decimals (K3) is display-only
+and deliberately not a placeholder. Notes quote a syllabus only for the SE4351/SE6362 templates; custom
+courses get generic notes.
 `model.placeholderKeys(course)` returns the keys that apply to that course.
-`model.unconfirmedPlaceholders(course)` returns `[{ key, label, note }]` still unconfirmed.
+`model.placeholderInfo(course, key)` → `{ key, label, note, confirmed, confirmedAt }` or null;
+`model.isConfirmed(course, key)`.
+`model.unconfirmedPlaceholders(course)` returns `[{ key, label, note, … }]` still unconfirmed.
 Editing a value never auto-confirms; the user clicks "Mark confirmed" (and can undo that).
 
 ### 2.3 Helpers
 
-- `model.createDefaultState()`, `model.createCourse(template, overrides?)`, `model.createStudent(fields)`,
-  `model.createTeam(name)`, `model.createAssessment(fields)`
+Factories and constants:
+
+- `model.createDefaultState()`, `model.createCourse(template, overrides?)` (unknown template → `'custom'`),
+  `model.createStudent(fields)`, `model.createTeam(name, id?)`, `model.createAssessment(fields)`
+  (maxScore must be > 0, else 100; weight must be >= 0, else 0).
+- `model.TEMPLATES`, `model.FALL_2026_TR`, `model.generateSessions({ start, end, weekdays, exclude })`
+  (ids `ses_YYYYMMDD`), `model.defaultSettings(level)`, `model.defaultAttendance(mode, sessions)`,
+  `model.defaultLetterScale(level)`, `model.defaultPassingLetter(level)`, `model.ROUNDING_MODES`,
+  `model.ATTENDANCE_MODES`, `model.APP_ID`, `model.SCHEMA_VERSION`.
+- `model.normalizeLetterScale(list, level)` → cleaned copy: malformed rows dropped, sorted by `min`
+  descending, and the invariant "last is F with min 0" enforced (a bottom `F` above 0 moves to 0; a scale
+  whose lowest cutoff is above 0 gets `{ letter: 'F', min: 0 }` appended; empty → level default). Settings
+  edits of the scale must go through it. `model.passingLetterFor(scale, preferred, level)` → `preferred` if
+  in the scale, else the level default if in the scale, else the lowest letter above the bottom one.
+
+Normalize and backup (R4). Files are untrusted: ids must pass `util.isSafeKey` (not `__proto__`,
+`constructor`, `prototype`; otherwise a new id is made and data keyed by the bad id is dropped), lookups
+use own properties only (`util.hasOwn`), and numbers must be finite with |x| <= `util.MAX_INPUT_ABS` (1e6).
+A stored score above that limit becomes invalid text (shown and highlighted, counted as 0).
+
 - `model.normalizeState(raw)` → fills defaults, repairs shapes, throws `Error` with a readable message
-  for data that is not a Grade Tracker state. `model.normalizeCourse(course)` likewise.
+  for data that is not a Grade Tracker state; `raw.app` must be `'grade-tracker'`. `model.normalizeCourse(course)`
+  likewise (assessment weights < 0 → 0, maxScore <= 0 → 100, latePointsPerWeek < 0 → 0, letter scale via
+  `normalizeLetterScale`, duplicate ids made unique, including export preset ids).
 - `model.wrapBackup(state, isoNow)` → `{ app:'grade-tracker', kind:'backup', schemaVersion, exportedAt, state }`
 - `model.readBackup(obj)` → `{ state, summary: { exportedAt, courses: [{code, title, students}] } }` or throws.
+  Accepts the wrapped format (inner state may omit `app`) or a bare state that has `app: 'grade-tracker'`.
 - `model.duplicateCourse(course, isoNow)` → deep copy with new course id, `code + ' (copy)'`, history reset
   to one entry noting the source.
-- `model.studentName(s)` → `'Last, First'` (either part may be empty).
-- `model.findTeam(course, teamId)`, `model.findStudent`, `model.findAssessment`.
-- `model.nextStudentNo(course)` → max(no)+1.
-- `model.convertAssessmentToTeam(course, assessmentId)`: for each team, team score := most common member
-  value (ties → the value seen first when members are sorted by name); members whose value differs keep it
-  as an override. Members with no team keep individual entries.
+
+Lookups: `model.findTeam(course, teamId)`, `model.findStudent`, `model.findAssessment`, `model.findCourse(state, id)`,
+`model.teamMembers(course, teamId)` (storage order), `model.sortedMembers(course, teamId)` (name order),
+`model.studentName(s)` → `'Last, First'` (either part may be empty), `model.courseLabel(c)` → `'Code - Title'`,
+`model.nextStudentNo(course)` → max(no)+1.
+
+Score entries:
+
+- `model.getEntry(map, ownerId, assessmentId)` → entry or null (own properties only);
+  `model.setEntry(map, ownerId, assessmentId, entry|null)` (null deletes; an emptied owner row is removed;
+  unsafe keys are ignored).
+- `model.entryFromInput(input, prev?)` → ScoreEntry from typed/pasted text. Keeps `weeksLate`/`waived` from
+  `prev`, and `override` only when the input is not empty (clearing an override cell hands the member back
+  to the team score).
+- `model.isBlankEntry(e)` (no value, text, late info or override), `model.hasScore(e)` (a number or invalid
+  text; late info alone is not a score).
+- `model.entryKey(e)` → comparison key for "same visible score": value or text plus late info that changes
+  the score (`weeksLate` > 0, and `waived` with it), e.g. `'n:80|late:1'`. The override flag is ignored.
+- `model.majorityEntry(entries)` → most frequent `entryKey`, ties → first in the given order.
+- `model.effectiveEntry(course, student, assessment)` → what the student sees (mirrors `calc.resolveEntry`).
+- `model.withLate(entry|null, weeksLate, waived)` → copy with late info set (weeks <= 0 removes it; `waived`
+  stored only when true). The UI parses weeks with `util.parseCount` (whole numbers only).
+
+Team-graded items (K5). An override is the only way a member's score differs from the team's, and it is
+shown with a marker (written agreement needed), so the model never creates an **empty** override on its own:
+
+- `model.setTeamScore(course, teamId, assessmentId, entry)` (blank entry clears the team score).
+- `model.setOverride(course, studentId, assessmentId, entry)` → stores the entry with `override: true`
+  (an explicit empty override means "no score for this member"); `model.clearOverride(course, studentId,
+  assessmentId)` → true when an override was removed (the member follows the team score again).
+- `model.setTeamScoreFromMembers(course, assessmentId, rows)` (paste/import of a team-graded column):
+  `rows = [{studentId, entry}]`. Per team with rows: only rows holding a score vote (blank cells abstain);
+  withdrawn members vote only when no active member of that team has a score in `rows`. Team score = most
+  frequent vote by `entryKey` (so late info counts), ties → first in row order; no votes → team score
+  cleared. Blank rows and rows equal to the team score follow the team score (own entry and any override
+  removed); other rows keep their entry as an override. Team members **not** in `rows` are not written:
+  like typing in one member's cell, the new team score reaches every member without an override, and
+  `propagatedTo` lists the non-row members whose visible score changed so the grid can report it.
+  Rows for students without a team become individual entries.
+  Returns `{ overridesCreated, teamsSet, propagatedTo: [studentId] }`.
+- `model.convertAssessmentToTeam(course, assessmentId)`: no-op (returns `{ overridesCreated: 0 }`) when the
+  item is already team-graded. Otherwise, for each team, the members' individual entries in name order go
+  through `setTeamScoreFromMembers`: every entered score is preserved (majority → team score, ties → first
+  member by name, the rest → overrides) and members with no score follow the team score. Students without
+  a team keep individual entries. Returns `{ overridesCreated }`.
 - `model.convertAssessmentToIndividual(course, assessmentId)`: every member's effective entry is copied
   into `scores` (override flags cleared); team entries for that assessment are deleted.
-- `model.setTeamScoreFromMembers(course, assessmentId, rows)` (used by paste/import of team-graded columns):
-  `rows = [{studentId, entry}]`; per team: if all rows of a team agree → team score; else team score = most
-  frequent value and differing members become overrides. Returns `{ overridesCreated: n }`.
+- `model.moveStudentToTeam(course, studentId, newTeamId|null, { keepScores })` (G5 kind `'team-membership'`):
+  no-op when the student is already in that team. Without `keepScores`, team-graded scores follow the new
+  team: the student's own entries for team-graded items are removed, **overrides included** (an unequal
+  split was agreed within the old team), so without a team those items are empty. With `keepScores`, the
+  student's current visible team-graded scores are kept wherever the new team's score differs (by
+  `entryKey`): as overrides in the new team, or as individual entries when moving to no team; an empty
+  score is not kept as an override (the student follows the new team).
+- `model.removeTeam(course, teamId, { keepScores })` → moves every member to no team through
+  `moveStudentToTeam`, deletes the team and its team scores; returns the moved student ids.
+- `model.removeAssessment(course, assessmentId)` → deletes the item and every score for it (individual
+  entries, overrides, team scores); returns false when it did not exist. Export presets are left alone:
+  the exporter skips columns that reference a missing assessment.
 
 ## 3. Calculations (`GT.calc`) — K1–K8
 
-Numbers: all arithmetic results pass through `util.fix(x)` (round to 10 decimals) to remove binary noise.
-Weighted points use multiply-first: `adjusted * weight / maxScore`.
+Numbers: arithmetic results pass through `util.fix(x)` (round to `util.FIX_DECIMALS` = 10 decimals) to
+remove binary noise. Weighted points use multiply-first: `adjusted * weight / maxScore`. The total adds the
+**unrounded** weighted products and applies `fix` once to the sum: rounding each item first drifts on max
+scores such as 30 (an exact 80 became 79.9999999999, a C+ instead of B-).
+
+Input parsing (`GT.util`): `parseScoreInput` accepts numbers with |x| <= `util.MAX_INPUT_ABS` (1e6); larger
+values are `'invalid'` so totals stay finite. `parseCount` (weeks late, absence counts) accepts whole
+numbers >= 0 only (no fractions, no `%`). `roundTo(x, d)` is Excel `ROUND` (half away from zero, negative
+`d` allowed, safe for any finite magnitude).
 
 - `calc.parseEntry(entry)` → `{ state: 'empty'|'number'|'invalid', value: number|null, text: string|null }`.
 - `calc.resolveEntry(course, student, assessment)` → `{ entry, source, teamId }`:
@@ -184,14 +265,16 @@ Weighted points use multiply-first: `adjusted * weight / maxScore`.
     source `'override'`; else `teamScores[team][a]`, source `'team'`.
   - team-graded, no team → `scores[s][a]`, source `'individual'`.
   - missing entry → `null` (state `'empty'`).
-- `calc.latePenalty(entry, assessment, settings)` → `waived || !weeksLate ? 0 : weeksLate * latePointsPerWeek * maxScore / 100`.
+- `calc.latePenalty(entry, assessment, settings)` → `waived || !weeksLate ? 0 : weeksLate * latePointsPerWeek * maxScore / 100`,
+  and 0 when `latePointsPerWeek` or `maxScore` is not positive (never negative).
 - `calc.scoreDetail(course, student, assessment)` →
   `{ assessmentId, state, raw, text, source, teamId, override, missing, outOfRange, weeksLate, waived,
-     penalty, adjusted, weighted }` where
+     penalty, adjusted, weighted, weightedUnrounded }` where
   - `missing = state !== 'number'` (empty and invalid count as 0; invalid is also flagged),
   - `outOfRange = state === 'number' && (raw < 0 || raw > maxScore)` (value is still used as entered),
   - `adjusted = max(0, raw - penalty)` when a late penalty applies, else `raw`; `null` when missing,
-  - `weighted = missing || maxScore <= 0 ? 0 : fix(adjusted * weight / maxScore)`.
+  - `weightedUnrounded = missing || maxScore <= 0 ? 0 : adjusted * weight / maxScore` (used for the sum),
+  - `weighted = fix(weightedUnrounded)` (display value).
 - `calc.roundTotal(x, mode)` → `none`: x; `hundredth`: `util.roundTo(x, 2)`; `integer`: `util.roundTo(x, 0)`
   (half away from zero, same as Excel `ROUND`).
 - `calc.letterFor(total, scale)` → first entry (scale sorted by `min` descending) with `total >= min`,
@@ -199,7 +282,7 @@ Weighted points use multiply-first: `adjusted * weight / maxScore`.
 - `calc.studentResult(course, student)` →
   `{ studentId, active, items: {aid: detail}, weightedSum, curve, totalUnrounded, total, letter,
      incomplete, missingCount, invalidCount, outOfRangeCount, overrideCount, lateCount }`
-  - `weightedSum = fix(Σ weighted)`, `totalUnrounded = fix(weightedSum + curve)`, `total = roundTotal(totalUnrounded)`.
+  - `weightedSum = fix(Σ weightedUnrounded)`, `totalUnrounded = fix(weightedSum + curve)`, `total = roundTotal(totalUnrounded)`.
   - `incomplete = missingCount > 0` counting only assessments with `weight > 0`.
 - `calc.computeCourse(course)` → `{ byId: {sid: result + rank, percentile, diffFromAverage},
    activeIds, average, weights: { sum, ok } }`
@@ -208,7 +291,23 @@ Weighted points use multiply-first: `adjusted * weight / maxScore`.
   - Rank: competition ranking by `total` descending among active (1, 2, 2, 4).
   - Percentile: `100 * (# active with lower total) / (N − 1)`; N = 1 → 100. Ties share a percentile.
   - `diffFromAverage = fix(total − average)`.
-- `calc.weightStatus(course)` → `{ sum, ok: |sum − 100| < 1e-9 }`.
+  - A non-finite total (only possible when code sets absurd weights; normalize rejects them) is left out
+    of `average`, rank and percentile (those stay null for that student); `activeIds` lists every active student.
+- `calc.weightStatus(course)` → `{ sum, ok: |sum − 100| < 1e-9 and no weight < 0 }`.
+- `calc.minTotalForLetter(letter, settings)` → smallest `totalUnrounded` (after curve, before rounding)
+  that earns `letter`: the cutoff with rounding `'none'`, `ceil(cutoff) − 0.5` with `'integer'`, the cutoff
+  rounded up to 0.01 minus 0.005 with `'hundredth'`; null for a letter not in the scale. For cutoffs > 0.
+- `calc.neededScore(course, student, assessmentId, letter)` (what-if, ST2) → `{ needed, reachable, alreadyReached }`:
+  the on-time score on that item's own scale that reaches `letter` with every other item at its current
+  value (empty = 0; the item's own score is ignored), `reachable = needed <= maxScore`,
+  `alreadyReached = needed <= 0`; null for an unknown letter/item or an item with weight or max <= 0.
+  `needed` is exact to 10 decimals and rounded **up** at the 10th decimal when it is a repeating decimal,
+  so entering it reaches the letter; a UI that shows fewer decimals should also round up.
+
+Excel parity (E3, stage 4). To make exported formulas give the app's letters at exact cutoffs, the
+exporter mirrors this section: weighted cell `=MAX(0, raw − weeks*ppw*max/100)*weight/max` (no late term
+when waived or not late; empty → 0), total `=ROUND(SUM(weighted cells) + curve, 10)` (10 =
+`util.FIX_DECIMALS`), then the rounding mode's `ROUND(…, 2|0)` around it, then the letter `LOOKUP` on that.
 - `calc.compareByName(a, b)` → last name, then first name, then `no`; case-insensitive, numeric-aware.
 - `calc.sortStudents(course, results, key: 'name'|'total'|'no', dir: 'asc'|'desc')` → new array.
 

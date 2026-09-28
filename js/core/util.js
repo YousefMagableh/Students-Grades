@@ -4,32 +4,59 @@
   'use strict';
   var isNode = typeof module === 'object' && module.exports;
 
+  /** Decimal places kept by fix(). Exported so the Excel exporter can mirror it with ROUND(x, 10). */
+  var FIX_DECIMALS = 10;
+
+  /** Largest magnitude accepted as a typed or stored number (scores, weights, max scores, curve).
+   * Anything bigger is a typo; rejecting it keeps totals finite (no Infinity or NaN). */
+  var MAX_INPUT_ABS = 1e6;
+
   /** Removes binary floating-point noise: 0.1 + 0.2 -> 0.3, 81.02499999999999 -> 81.025. */
   function fix(x) {
     if (x === null || x === undefined || typeof x !== 'number' || !isFinite(x)) return x;
-    var r = Number(x.toFixed(10));
+    var r = Number(x.toFixed(FIX_DECIMALS));
     return r === 0 ? 0 : r; // normalize -0
   }
 
   /** Round half away from zero to `decimals` places, like Excel ROUND. Exact on decimal inputs:
-   * roundTo(81.025, 2) === 81.03 (plain Math.round(x * 100) / 100 gives 81.02). */
+   * roundTo(81.025, 2) === 81.03 (plain Math.round(x * 100) / 100 gives 81.02).
+   * Negative decimals round to tens, hundreds, ...: roundTo(1234, -2) === 1200. */
   function roundTo(x, decimals) {
     if (x === null || x === undefined || !isFinite(x)) return x;
-    var d = decimals || 0;
+    var d = Math.round(decimals || 0);
     var v = fix(x);
     var sign = v < 0 ? -1 : 1;
     var abs = Math.abs(v);
     var s = String(abs);
-    var out;
+    var out = NaN;
     if (s.indexOf('e') === -1) {
       // Shift the decimal point in the string representation, so 81.025 -> 8102.5 exactly.
-      var shifted = Math.round(Number(s + 'e' + d));
-      out = sign * Number(shifted + 'e-' + d);
-    } else {
+      var shifted = String(Math.round(Number(s + 'e' + d)));
+      if (shifted.indexOf('e') === -1) out = sign * Number(shifted + 'e' + (-d));
+    }
+    if (!isFinite(out)) {
+      // Very large or very small magnitudes (exponential notation): plain arithmetic is exact enough.
       var p = Math.pow(10, d);
       out = sign * (Math.round(abs * p) / p);
+      if (!isFinite(out)) out = v;
     }
     return out === 0 ? 0 : out;
+  }
+
+  /** Own-property check that ignores inherited names such as "constructor" or "toString". */
+  function hasOwn(obj, key) {
+    return obj !== null && obj !== undefined && Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  /** True for a non-empty string that is safe as a plain-object key (not "__proto__",
+   * "constructor" or "prototype"). Ids read from files are checked with this before use. */
+  function isSafeKey(k) {
+    return typeof k === 'string' && k !== '' && k !== '__proto__' && k !== 'constructor' && k !== 'prototype';
+  }
+
+  /** True for a finite number whose magnitude is at most MAX_INPUT_ABS. */
+  function isSaneNumber(v) {
+    return typeof v === 'number' && isFinite(v) && Math.abs(v) <= MAX_INPUT_ABS;
   }
 
   var NUMBER_RE = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
@@ -37,11 +64,12 @@
   /** Parses a user-typed or pasted score. Accepts "88", " 88.5 ", "+7", "-3", ".5", "88%",
    * the unicode minus sign, and a trailing "%" (dropped). Commas are NOT accepted
    * (ambiguous between decimal and thousands separators), so "88,5" is invalid.
+   * Magnitudes above MAX_INPUT_ABS (such as "1e308") are invalid, so totals stay finite.
    * Returns { kind: 'empty' } | { kind: 'number', value } | { kind: 'invalid', text }. */
   function parseScoreInput(input) {
     if (input === null || input === undefined) return { kind: 'empty' };
     if (typeof input === 'number') {
-      return isFinite(input) ? { kind: 'number', value: fix(input) } : { kind: 'invalid', text: String(input) };
+      return isSaneNumber(input) ? { kind: 'number', value: fix(input) } : { kind: 'invalid', text: String(input) };
     }
     var raw = String(input);
     var s = raw.replace(/ /g, ' ').trim();
@@ -50,15 +78,17 @@
     if (s.charAt(s.length - 1) === '%') s = s.slice(0, -1).trim();
     if (NUMBER_RE.test(s)) {
       var v = Number(s);
-      if (isFinite(v)) return { kind: 'number', value: fix(v) };
+      if (isSaneNumber(v)) return { kind: 'number', value: fix(v) };
     }
     return { kind: 'invalid', text: raw.trim() };
   }
 
-  /** Parses a non-negative integer-ish field (weeks late, counts). Returns null when invalid/empty. */
+  /** Parses a non-negative whole-number field (weeks late, absence counts): "2" -> 2.
+   * Returns null when empty or invalid, including fractions ("1.5") and percentages ("88%"). */
   function parseCount(input) {
+    if (typeof input === 'string' && /%\s*$/.test(input)) return null;
     var p = parseScoreInput(input);
-    if (p.kind !== 'number' || p.value < 0) return null;
+    if (p.kind !== 'number' || p.value < 0 || Math.floor(p.value) !== p.value) return null;
     return p.value;
   }
 
@@ -199,8 +229,13 @@
   }
 
   var api = {
+    FIX_DECIMALS: FIX_DECIMALS,
+    MAX_INPUT_ABS: MAX_INPUT_ABS,
     fix: fix,
     roundTo: roundTo,
+    hasOwn: hasOwn,
+    isSafeKey: isSafeKey,
+    isSaneNumber: isSaneNumber,
     parseScoreInput: parseScoreInput,
     parseCount: parseCount,
     formatNumber: formatNumber,

@@ -1,0 +1,320 @@
+/* Grade Tracker - application state: transactions, change history, undo/redo, autosave, subscriptions.
+ * See docs/DESIGN.md section 5. Browser only. Attaches GT.store.
+ *
+ * Rule: every change to course data goes through store.transact(), so that it is autosaved,
+ * undoable, and logged in the course's change history. */
+(function (root) {
+  'use strict';
+  var GT = root.GT;
+  var util = GT.util, model = GT.model, calc = GT.calc;
+
+  var UNDO_LIMIT = 200;
+  var SAVE_DELAY = 400;
+
+  var state = null;
+  var listeners = [];
+  var undoStacks = {};
+  var redoStacks = {};
+  var version = 0;
+  var resultsCache = { key: null, value: null };
+  var status = { phase: 'idle', at: null, error: null, backend: 'memory' };
+
+  // ------------------------------------------------------------------ basics
+
+  function init(loaded, backend) {
+    state = loaded;
+    status.backend = backend || 'memory';
+    version++;
+  }
+
+  function getState() { return state; }
+
+  function course(id) {
+    if (!state) return null;
+    var cid = id || state.activeCourseId;
+    return model.findCourse(state, cid) || state.courses[0] || null;
+  }
+
+  /** Memoized calc.computeCourse for a course (active course by default). */
+  function results(id) {
+    var c = course(id);
+    if (!c) return null;
+    var key = c.id + ':' + version;
+    if (resultsCache.key !== key) resultsCache = { key: key, value: calc.computeCourse(c) };
+    return resultsCache.value;
+  }
+
+  function subscribe(fn) {
+    listeners.push(fn);
+    return function () { listeners = listeners.filter(function (f) { return f !== fn; }); };
+  }
+
+  function notify(info) {
+    version++;
+    listeners.slice().forEach(function (fn) {
+      try { fn(info || {}); } catch (e) { if (root.console) console.error(e); }
+    });
+  }
+
+  // ------------------------------------------------------------------ snapshots (course without its history)
+
+  function snapshot(c) {
+    var copy = {};
+    Object.keys(c).forEach(function (k) {
+      if (k !== 'history') copy[k] = util.clone(c[k]);
+    });
+    return copy;
+  }
+
+  function restore(c, snap) {
+    Object.keys(c).forEach(function (k) {
+      if (k !== 'history' && k !== 'id' && !(k in snap)) delete c[k];
+    });
+    Object.keys(snap).forEach(function (k) {
+      if (k !== 'history' && k !== 'id') c[k] = snap[k];
+    });
+  }
+
+  function stack(map, id) {
+    if (!map[id]) map[id] = [];
+    return map[id];
+  }
+
+  function diffEntries(before, after, ts, source) {
+    if (!GT.history || !GT.history.diffCourse) return [];
+    try {
+      return GT.history.diffCourse(before, after, { ts: ts, source: source }) || [];
+    } catch (e) {
+      if (root.console) console.error('history diff failed', e);
+      return [];
+    }
+  }
+
+  // ------------------------------------------------------------------ transactions
+
+  /** Applies mutator(course) as one undoable, logged, autosaved change.
+   * opts: { source = 'edit', courseId, historyMode = 'diff' | 'bulk' | 'none', note, undoable = true }.
+   * Returns the mutator's return value. If the mutator throws, the course is restored and the error rethrown. */
+  function transact(label, mutator, opts) {
+    var o = opts || {};
+    var c = course(o.courseId);
+    if (!c) throw new Error('No course selected.');
+    var before = snapshot(c);
+    var ret;
+    try {
+      ret = mutator(c);
+    } catch (e) {
+      restore(c, before);
+      throw e;
+    }
+    var ts = util.nowIso();
+    var source = o.source || 'edit';
+    var mode = o.historyMode || 'diff';
+    var entries = [];
+    if (mode === 'diff') entries = diffEntries(before, c, ts, source);
+    var changed = entries.length > 0 || JSON.stringify(before) !== JSON.stringify(snapshot(c));
+    if (!changed) return ret;
+    if (mode === 'bulk' && GT.history && GT.history.bulkEntry) {
+      entries = [GT.history.bulkEntry({ ts: ts, source: source, field: label, note: o.note || '' })];
+    } else if (o.note) {
+      entries.forEach(function (e) { e.note = e.note ? e.note + ' | ' + o.note : o.note; });
+    }
+    if (!Array.isArray(c.history)) c.history = [];
+    Array.prototype.push.apply(c.history, entries);
+    if (o.undoable !== false) {
+      var u = stack(undoStacks, c.id);
+      u.push({ label: label, snapshot: before });
+      if (u.length > UNDO_LIMIT) u.shift();
+      redoStacks[c.id] = [];
+    }
+    c.updatedAt = ts;
+    scheduleSave();
+    notify({ type: 'transact', label: label, source: source, entries: entries, courseId: c.id });
+    return ret;
+  }
+
+  function stepHistory(fromStack, toStack, source) {
+    var c = course();
+    if (!c) return false;
+    var from = stack(fromStack, c.id);
+    if (!from.length) return false;
+    var step = from.pop();
+    var current = snapshot(c);
+    restore(c, step.snapshot);
+    var ts = util.nowIso();
+    var entries = diffEntries(current, c, ts, source);
+    var note = (source === 'undo' ? 'Undo of "' : 'Redo of "') + step.label + '"';
+    entries.forEach(function (e) { e.note = e.note ? e.note + ' | ' + note : note; });
+    Array.prototype.push.apply(c.history, entries);
+    stack(toStack, c.id).push({ label: step.label, snapshot: current });
+    c.updatedAt = ts;
+    scheduleSave();
+    notify({ type: source, label: step.label, entries: entries, courseId: c.id });
+    return true;
+  }
+
+  function undo() { return stepHistory(undoStacks, redoStacks, 'undo'); }
+  function redo() { return stepHistory(redoStacks, undoStacks, 'redo'); }
+
+  function peek(map) {
+    var c = course();
+    if (!c) return null;
+    var s = map[c.id];
+    return s && s.length ? s[s.length - 1].label : null;
+  }
+  function canUndo() { return !!peek(undoStacks); }
+  function canRedo() { return !!peek(redoStacks); }
+  function undoLabel() { return peek(undoStacks); }
+  function redoLabel() { return peek(redoStacks); }
+
+  /** Adds a note to an existing history entry (e.g. "changed per instructor email, Oct 12"). */
+  function annotateHistory(entryId, text) {
+    var c = course();
+    if (!c) return;
+    var e = (c.history || []).filter(function (h) { return h.id === entryId; })[0];
+    if (!e) return;
+    e.userNote = String(text || '');
+    e.userNoteAt = util.nowIso();
+    scheduleSave();
+    notify({ type: 'annotate' });
+  }
+
+  // ------------------------------------------------------------------ app-level (not undoable)
+
+  function setUi(patch) {
+    Object.keys(patch).forEach(function (k) { state.ui[k] = patch[k]; });
+    scheduleSave();
+    notify({ type: 'ui', patch: patch });
+  }
+
+  function setMeta(patch) {
+    Object.keys(patch).forEach(function (k) { state.meta[k] = patch[k]; });
+    scheduleSave();
+    notify({ type: 'meta', patch: patch });
+  }
+
+  function setActiveCourse(id) {
+    if (!model.findCourse(state, id)) return;
+    state.activeCourseId = id;
+    scheduleSave();
+    notify({ type: 'course-switch', courseId: id });
+  }
+
+  function addCourse(c) {
+    state.courses.push(c);
+    state.activeCourseId = c.id;
+    scheduleSave();
+    notify({ type: 'course-add', courseId: c.id });
+    return c;
+  }
+
+  function deleteCourse(id) {
+    var idx = -1;
+    state.courses.forEach(function (c, i) { if (c.id === id) idx = i; });
+    if (idx === -1) return;
+    state.courses.splice(idx, 1);
+    delete undoStacks[id];
+    delete redoStacks[id];
+    if (state.activeCourseId === id) {
+      state.activeCourseId = state.courses.length ? state.courses[Math.max(0, idx - 1)].id : null;
+    }
+    scheduleSave();
+    notify({ type: 'course-delete', courseId: id });
+  }
+
+  function moveCourse(id, delta) {
+    var i = -1;
+    state.courses.forEach(function (c, k) { if (c.id === id) i = k; });
+    var j = i + delta;
+    if (i < 0 || j < 0 || j >= state.courses.length) return;
+    var tmp = state.courses[i];
+    state.courses[i] = state.courses[j];
+    state.courses[j] = tmp;
+    scheduleSave();
+    notify({ type: 'course-order' });
+  }
+
+  /** Replaces all data (restore from backup, delete all). Clears undo/redo. */
+  function replaceState(newState, source) {
+    state = newState;
+    undoStacks = {};
+    redoStacks = {};
+    resultsCache = { key: null, value: null };
+    scheduleSave();
+    notify({ type: 'replace', source: source || 'restore' });
+  }
+
+  // ------------------------------------------------------------------ autosave
+
+  var saveTimer = null;
+  var saving = null;
+  var dirtyWhileSaving = false;
+
+  function scheduleSave() {
+    status.phase = 'pending';
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () { saveTimer = null; doSave(); }, SAVE_DELAY);
+  }
+
+  function doSave() {
+    if (!state) return Promise.resolve();
+    if (saving) { dirtyWhileSaving = true; return saving; }
+    status.phase = 'saving';
+    var ts = util.nowIso();
+    state.meta.lastSavedAt = ts;
+    saving = GT.storage.save(state).then(function () {
+      status.phase = 'saved';
+      status.at = ts;
+      status.error = null;
+      status.backend = GT.storage.backend();
+    }).catch(function (err) {
+      status.phase = 'error';
+      status.error = err && err.message ? err.message : String(err);
+      if (root.console) console.error('Save failed', err);
+    }).then(function () {
+      saving = null;
+      notify({ type: 'saved' });
+      if (dirtyWhileSaving) { dirtyWhileSaving = false; return doSave(); }
+    });
+    return saving;
+  }
+
+  /** Saves immediately (e.g. before the page is hidden). */
+  function flush() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    if (status.phase === 'pending' || dirtyWhileSaving) return doSave();
+    return saving || Promise.resolve();
+  }
+
+  function saveStatus() {
+    return { phase: status.phase, at: status.at, error: status.error, backend: status.backend };
+  }
+
+  GT.store = {
+    init: init,
+    get state() { return state; },
+    getState: getState,
+    course: course,
+    results: results,
+    subscribe: subscribe,
+    notify: notify,
+    transact: transact,
+    undo: undo,
+    redo: redo,
+    canUndo: canUndo,
+    canRedo: canRedo,
+    undoLabel: undoLabel,
+    redoLabel: redoLabel,
+    annotateHistory: annotateHistory,
+    setUi: setUi,
+    setMeta: setMeta,
+    setActiveCourse: setActiveCourse,
+    addCourse: addCourse,
+    deleteCourse: deleteCourse,
+    moveCourse: moveCourse,
+    replaceState: replaceState,
+    flush: flush,
+    saveStatus: saveStatus,
+    version: function () { return version; }
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : this);

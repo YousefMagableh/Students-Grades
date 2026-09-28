@@ -134,14 +134,24 @@
   function clamp(x, lo, hi) { return Math.min(hi, Math.max(lo, x)); }
   function roundHalf(x) { return util.fix(Math.round(x * 2) / 2); }
 
-  /** A 0..100 percentage on the assessment's own scale, rounded to 0.5 and kept within 0..max. */
+  /** A 0..100 percentage on the assessment's own scale, rounded to 0.5 and kept within 0..max.
+   * An assessment with a drop-down list (DECISIONS 8) gets the nearest list value instead (ties go
+   * to the higher value, like the 0.5 rounding): Participation out of 5 gets 3, 3.5, ..., 5. */
   function scaled(pct, assessment) {
     var max = assessment.maxScore;
     if (!(max > 0)) return 0;
-    return clamp(roundHalf(pct * max / 100), 0, max);
+    var list = model.choiceValues(assessment);
+    if (!list.length) return clamp(roundHalf(pct * max / 100), 0, max);
+    var exact = pct * max / 100, best = list[0], bestGap = Infinity;
+    list.forEach(function (v) { // highest first, so a tie keeps the higher value
+      var gap = util.fix(Math.abs(v - exact));
+      if (gap < bestGap) { best = v; bestGap = gap; }
+    });
+    return best;
   }
 
-  // Percentage generators for the template assessments (ids are stable, DESIGN 2.1).
+  // Percentage generators for the template assessments (ids are stable, DESIGN 2.1). Participation
+  // is out of 5 by default, so 60..100% becomes 3..5 in steps of 0.5 (see scaled).
   var GENERATORS = {
     a_p1: function (rng) { return rng.int(80, 98); },
     a_p2: function (rng) { return rng.int(78, 98); },
@@ -303,8 +313,9 @@
   // ---------------------------------------------------------------- entry point
 
   /** Replaces the course's teams, students, scores, team scores and attendance marks/totals with
-   * the sample dataset. Leaves assessments, settings, placeholders, history, export presets and
-   * the attendance mode/sessions alone, and writes no history (the store logs one bulk entry). */
+   * the sample dataset: no final letters, and the scores are not finalized (course.finalized = null).
+   * Leaves assessments, settings, placeholders, history, export presets and the attendance
+   * mode/sessions alone, and writes no history (the store logs one bulk entry). */
   function loadInto(course) {
     var spec = DATASETS[datasetKey(course)];
     var seed = String(course.template) + ':' + String(course.level);
@@ -332,6 +343,7 @@
     course.students = students;
     course.scores = {};
     course.teamScores = {};
+    course.finalized = null;
 
     var membersOf = {};
     teams.forEach(function (t) { membersOf[t.id] = []; });

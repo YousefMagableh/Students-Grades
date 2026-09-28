@@ -61,6 +61,30 @@
   font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere;
 }
 
+/* A band of final letters ("Final letters: 12 changed"): every student it changed, behind a disclosure. */
+.hist-details { margin-top: 4px; font-size: 12.5px; }
+.hist-details > summary {
+  display: inline-flex; align-items: center; gap: 3px; cursor: pointer; color: var(--accent); font-weight: 600;
+  border-radius: var(--radius); padding: 1px 2px; margin-left: -3px; list-style: none;
+}
+.hist-details > summary::-webkit-details-marker { display: none; }
+.hist-details > summary .icon { transition: transform .12s ease; }
+.hist-details[open] > summary .icon { transform: rotate(90deg); }
+.hist-details > summary:hover { color: var(--accent-hover); text-decoration: underline; }
+.hist-details > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.hist-dl {
+  list-style: none; margin: 6px 0 0; padding: 6px 0 0; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow-y: auto;
+}
+.hist-dl li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px; color: var(--text); }
+.hist-dl-who { overflow-wrap: anywhere; }
+.hist-dl-name { font-weight: 600; }
+.hist-dl-no { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hist-dl-change { white-space: nowrap; }
+.hist-dl-change .hist-arrow { margin: 0 4px; }
+/* Filtered to one student, a band entry shows only that student's part of it. */
+.hist-table tr.hist-part .hist-note { font-style: italic; }
+
 /* Your note */
 .hist-un { display: flex; align-items: flex-start; gap: 6px; }
 .hist-un-icon { color: var(--accent); display: inline-flex; margin-top: 1px; }
@@ -78,6 +102,7 @@
 .badge.hk-score { background: var(--bg-elev); color: var(--text); border-color: var(--border-strong); }
 .badge.hk-team-score { background: var(--group-3); color: var(--text); border-color: var(--border-strong); }
 .badge.hk-late { background: var(--group-2); color: var(--text); border-color: var(--border-strong); }
+.badge.hk-final { background: var(--group-1); color: var(--text); border-color: var(--border-strong); }
 .badge.hk-status { background: var(--group-4); color: var(--text); border-color: var(--border-strong); }
 .badge.hk-team { background: var(--group-5); color: var(--text); border-color: var(--border-strong); }
 .badge.hk-student { background: var(--group-6); color: var(--text); border-color: var(--border-strong); }
@@ -98,6 +123,12 @@
 .hist-dlg-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--text-muted); font-size: 12px; }
 .hist-dlg-meta time { margin-right: 4px; }
 .hist-dlg-change { overflow-wrap: anywhere; }
+.hist-dlg-shared { display: flex; gap: 6px; align-items: flex-start; margin: -6px 0 12px; }
+.hist-dlg-shared .icon { flex: none; margin-top: 2px; color: var(--info); }
+
+@media (prefers-reduced-motion: reduce) {
+  .hist-details > summary .icon { transition: none; }
+}
 
 @media (max-width: 720px) {
   .hist-f-search .search input { width: 180px; }
@@ -106,6 +137,8 @@
 
 @media print {
   .hist-filters, .hist-more, .view-history .page-header .toolbar, .hist-add-note, .hist-un-edit { display: none !important; }
+  .hist-dl { max-height: none; overflow: visible; }
+  .hist-details > summary .icon { display: none; }
   .hist-wrap { max-height: none; overflow: visible; }
   .hist-table { min-width: 0; }
 }

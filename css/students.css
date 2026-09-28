@@ -32,8 +32,20 @@
 .st-table .st-actions .btn { vertical-align: middle; }
 .st-table .st-status-btn { min-width: 78px; }
 .st-table .row-withdrawn .st-notes-text { color: var(--withdrawn-text); }
+/* Final letter (read-only here): a dot marks a letter that differs from the cutoff suggestion, red a letter not in the scale. */
+.st-table .st-final { white-space: nowrap; width: 1%; }
+.st-letter { display: inline-flex; align-items: center; gap: 4px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.st-letter.is-invalid { color: var(--cell-invalid-text); background: var(--cell-invalid-bg); padding: 0 6px; border-radius: 4px; }
+.st-letter-dot, .sd-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+.st-table .row-withdrawn .st-letter { color: var(--withdrawn-text); }
 .st-table .row-withdrawn .st-status-btn { color: var(--text); }
 .st-none { padding: 22px 16px; text-align: center; }
+/* Finalized scores: the roster is locked (notice with an Unlock button under the card header). */
+.st-lock-bar { padding: 10px 16px 0; }
+.st-lock-bar .st-lock-note { align-items: center; margin: 0; }
+.st-lock-bar .st-lock-note > span { flex: 1 1 auto; min-width: 0; }
+.st-lock-bar .st-lock-note .btn { flex: none; }
+@media (max-width: 560px) { .st-lock-bar .st-lock-note { flex-wrap: wrap; } }
 
 /* ------------------------------------------------------------------ teams card */
 
@@ -94,7 +106,18 @@
 .ts-table td.ts-cell { white-space: nowrap; }
 .ts-input { width: 84px; text-align: right; min-height: 28px; padding: 4px 8px; font-variant-numeric: tabular-nums; }
 .ts-input.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); border-color: var(--danger); }
+.ts-input[readonly] { background: var(--bg-sunken); color: var(--text-muted); cursor: not-allowed; }
+.st-lock-note { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 10px; }
+.st-lock-note .icon { color: var(--warn); flex: none; margin-top: 1px; }
 .ts-input.is-range { background: var(--cell-range-bg); border-color: var(--warn-border); }
+/* Team score of an item with a drop-down list (DECISIONS 8): only the list values can be chosen. */
+.ts-select { min-width: 84px; min-height: 28px; padding: 3px 6px; font-variant-numeric: tabular-nums; text-align: right; }
+.ts-select.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); border-color: var(--danger); }
+.ts-select.is-range { background: var(--cell-range-bg); border-color: var(--warn-border); }
+.ts-select:disabled { cursor: not-allowed; opacity: 1; background: var(--bg-sunken); color: var(--text-muted); }
+/* A value browsed to with the keyboard and not saved yet (Enter or leaving the list saves it). */
+.ts-select.is-pending { border-style: dashed; border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.ts-pending-hint { margin-top: 3px; font-size: 11.5px; font-weight: 600; color: var(--accent); white-space: nowrap; }
 .ts-ov-mark { color: var(--accent); font-size: 11px; font-weight: 700; margin-left: 2px; }
 .ts-ov-btn { gap: 4px; }
 .ts-ov-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -126,6 +149,9 @@
 .sf-grid { display: grid; grid-template-columns: 90px 1fr 1fr; gap: 12px; margin-bottom: 12px; }
 .dlg-body .sf-grid .field + .field { margin-top: 0; }
 .sf-grid input { width: 100%; }
+#sf-newteam-field[hidden] { display: none; } /* .field sets display: flex, which would override [hidden] */
+/* Edit form while the scores are finalized: No, names and team are read-only (notes stay editable). */
+.sf-grid input[readonly], #sf-team:disabled { background: var(--bg-sunken); color: var(--text-muted); cursor: not-allowed; opacity: 1; }
 @media (max-width: 560px) { .sf-grid { grid-template-columns: 1fr; } }
 
 .keep-table-wrap { max-height: 280px; margin-top: 8px; }
@@ -195,6 +221,27 @@
 .sd-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; border: 1px solid var(--border); vertical-align: 0; }
 .sd-raw.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); }
 .sd-raw.is-range { background: var(--cell-range-bg); }
+.sd-raw-choice { padding-top: 3px; padding-bottom: 3px; }
+.sd-choice { min-width: 76px; min-height: 28px; padding: 3px 6px; font-variant-numeric: tabular-nums; text-align: right; }
+.sd-choice.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); border-color: var(--danger); }
+.sd-choice.is-range { background: var(--cell-range-bg); border-color: var(--warn-border); }
+.sd-choice:disabled { cursor: not-allowed; opacity: 1; background: var(--bg-sunken); color: var(--text-muted); }
+/* A drop-down value browsed to with the keyboard and not saved yet (Enter or leaving the list saves it). */
+.sd-choice.is-pending, .sd-final-select.is-pending { border-style: dashed; border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.sd-pending-hint { margin-top: 3px; font-size: 11.5px; font-weight: 600; color: var(--accent); white-space: nowrap; text-align: left; }
+.sd-final-tile .sd-tile-value { flex-wrap: wrap; }
+.sd-tile-value .sd-pending-hint { flex-basis: 100%; margin-top: 0; white-space: normal; }
+
+/* Final letter tile: an editable drop-down; red when the stored letter is not in the scale. */
+.sd-final-tile .sd-tile-label label { cursor: pointer; }
+.sd-final-select { font-size: 18px; font-weight: 700; min-width: 108px; min-height: 34px; padding: 2px 8px; }
+.sd-final-select.is-invalid { background: var(--cell-invalid-bg); color: var(--cell-invalid-text); border-color: var(--danger); }
+.sd-final-bad { color: var(--danger); }
+.sd-final-bad .icon, .sd-order .icon { width: 13px; height: 13px; vertical-align: -2px; }
+.sd-differs { display: inline-flex; align-items: center; gap: 5px; }
+.sd-order { color: var(--warn); }
+.sd-lock { display: flex; gap: 8px; align-items: flex-start; }
+.sd-lock .icon { color: var(--warn); flex: none; margin-top: 1px; }
 .sd-flags .badge { margin: 1px 0; }
 .sd-weight { white-space: nowrap; }
 .sd-notes { width: 100%; }

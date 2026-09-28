@@ -23,6 +23,33 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 - **Data → Restore from backup** replaces all current data with a backup file.
 - Keep backup files private. This repository's `.gitignore` excludes `*.xlsx`, `*.csv`, and backup `*.json` files so real grades are never committed by accident.
 
+## Final grades: finalize, then assign letters
+
+The letter from the cutoffs is only a **suggestion** (the "Suggested" column). The instructor picks every
+student's **Final letter** by hand, usually in bands after sorting by total. Once final letters are
+assigned, they are the grades (the export and the statistics, added in later stages, use them).
+
+1. Enter every score. **Class/Project Participation** is out of 5 (5 = full marks, worth 5% of the total)
+   and is picked from a drop-down list: 5, 4.5, 4 … 0. Typing a value from the list also works; anything else
+   is refused, so no typo can be stored. Each assessment's list can be turned on or off in **Settings**.
+2. Optional: **Meeting view** (Grades tab) shows only the scores, Total, absences, participation, the
+   suggested and final letters and the rank, in larger text, sorted by total.
+3. **Finalize scores…** (Grades tab, or Settings → Grading status) checks for missing or invalid scores,
+   then locks the score cells so they cannot change by accident, and sorts by total, high to low.
+   Participation is a score too: set it before finalizing, or unlock first.
+4. Assign the letters in the **Final letter** column: click the first row of a band, Shift+click the last
+   one, press Enter and choose the letter (or type it, for example `b+`). Every selected student gets it in
+   one step (Ctrl+Z undoes the whole band). While sorted by total, a thin line marks where the letter changes.
+   - A dot marks a final letter that differs from the suggestion; a warning icon marks a letter that is
+     out of order with the totals (a lower total with a higher letter).
+   - **Copy suggested → final** fills the empty final letters from the cutoffs in one step.
+5. **Unlock scores…** on the banner makes the score cells editable again. Finalizing and unlocking are both
+   logged in **History**, like every final-letter change.
+
+Rows never jump while you edit: a sort is applied once, like in Excel. When the values no longer match
+the order, **Order changed: re-sort** appears in the toolbar. Each score column's ⋯ menu can fill the empty
+cells, set every active student to one value, or clear the column, each in one step you can undo.
+
 ## Development
 
 - `npm test` runs the unit tests (Node 22, no dependencies).

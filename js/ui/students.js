@@ -2,7 +2,12 @@
  * (GT.ui.openRosterPaste) and the student detail dialog (GT.ui.openStudent).
  * Browser only. Every change goes through GT.store.transact (autosaved, undoable, logged).
  * Privacy: every element that shows a student name or notes carries class "pii"; toasts and menu
- * headings use the student's No instead of the name. */
+ * headings use the student's No instead of the name.
+ * Finalized scores (STAGE2B): like the Grades tab, the roster is locked. Adding students (form or roster
+ * paste), No / name / team edits, team moves, renumbering, deleting a student and deleting a team that
+ * has members or team scores are refused with "Scores are finalized. Unlock them to edit." (and an
+ * Unlock action). Notes, withdraw / reinstate, team names and final letters stay editable. The checks
+ * sit in the flows themselves (not only on the buttons), so every entry point is covered. */
 (function (root) {
   'use strict';
   var GT = root.GT;
@@ -14,6 +19,9 @@
   var FILTERS = ['all', 'active', 'withdrawn'];
   var SORTS = ['no', 'name', 'team', 'status'];
   var NEW_TEAM = '__new_team__';
+  var LOCKED_MSG = 'Scores are finalized. Unlock them to edit.';
+  var ADD_LOCKED_MSG = 'Scores are finalized. Unlock them to add students.';
+  var KEEP_CURRENT = '__current__';  // <select> value that stands for "keep the stored value" (not on the list)
 
   var boundEl = null;
   var searchText = '';
@@ -63,6 +71,49 @@
   }
 
   function isWithdrawn(s) { return s.status === 'withdrawn'; }
+
+  // ------------------------------------------------------------------ finalized scores, final letters, drop-down lists
+  // (STAGE2B, DECISIONS 8). The core helpers are used when present; the fallbacks keep the view working.
+
+  /** True when the course's scores are finalized (score cells locked; final letters stay editable). */
+  function isLocked(course) {
+    if (!course) return false;
+    if (typeof model.isFinalized === 'function') {
+      try { return !!model.isFinalized(course); } catch (e) { /* fall back */ }
+    }
+    return !!(course.finalized && typeof course.finalized === 'object' && typeof course.finalized.at === 'string' && course.finalized.at !== '');
+  }
+
+  function finalLetterOf(s) {
+    if (typeof model.finalLetterOf === 'function') return model.finalLetterOf(s);
+    return s && typeof s.finalLetter === 'string' && s.finalLetter.trim() !== '' ? s.finalLetter : null;
+  }
+
+  /** The course's letters, highest cutoff first (the order of the Final letter drop-down). */
+  function scaleLetters(course) {
+    if (typeof model.scaleLetters === 'function') return model.scaleLetters(course);
+    var seen = [];
+    (course.settings.letterScale || []).slice().sort(function (a, b) { return b.min - a.min; }).forEach(function (r) {
+      if (r && typeof r.letter === 'string' && seen.indexOf(r.letter) === -1) seen.push(r.letter);
+    });
+    return seen;
+  }
+
+  function choiceValues(a) {
+    return typeof model.choiceValues === 'function' ? model.choiceValues(a) : [];
+  }
+
+  /** A drop-down value as the list shows it: 4.5, 0.25 (up to 6 decimals, no trailing zeros). */
+  function choiceText(v) { return util.formatNumber(v, 6); }
+
+  /** Final letter of a result (or the stored one), with its flags: { letter, valid, differs, suggested, orderIssue }. */
+  function finalInfo(course, s, r) {
+    var fl = r && r.finalLetter !== undefined ? r.finalLetter : finalLetterOf(s);
+    var suggested = r ? r.letter : '';
+    var valid = r && typeof r.finalLetterValid === 'boolean' ? r.finalLetterValid : (fl === null || scaleLetters(course).indexOf(fl) !== -1);
+    var differs = r && typeof r.letterDiffers === 'boolean' ? r.letterDiffers : (fl !== null && fl !== suggested);
+    return { letter: fl, valid: valid, differs: differs, suggested: suggested, orderIssue: !!(r && r.orderIssue) };
+  }
 
   /** Raw text as entered: the number, or the invalid text, or ''. */
   function entryText(e) {
@@ -129,6 +180,11 @@
       info.value = a.value;
       info.dirty = a.value !== a.defaultValue;
       try { info.start = a.selectionStart; info.end = a.selectionEnd; } catch (e) { info.start = null; }
+    } else if (a.tagName === 'SELECT' && a.hasAttribute('data-ts-pending')) {
+      info.value = a.value;   // a team-score drop-down browsed to with the keyboard, not saved yet
+      info.dirty = true;
+      info.pending = true;
+      info.kbd = tsKbdSel === a;
     }
     return info;
   }
@@ -138,6 +194,10 @@
     var t = host.querySelector('[data-fk="' + cssKey(info.key) + '"]');
     if (!t) return;
     if (info.dirty && typeof info.value === 'string') t.value = info.value;
+    if (info.pending && isTeamSelect(t) && t.value === info.value && t.value !== savedTeamValue(t)) {
+      setTeamPending(t, true);
+      if (info.kbd) tsKbdSel = t;
+    }
     try { t.focus({ preventScroll: true }); } catch (e) { t.focus(); }
     if (info.start !== null && info.start !== undefined && t.setSelectionRange) {
       try { t.setSelectionRange(info.start, info.end); } catch (e2) { /* not a text input */ }
@@ -275,10 +335,13 @@
     });
   }
 
-  /** Moves students to a team (or to no team with null), asking about their team-graded scores first. */
+  /** Moves students to a team (or to no team with null), asking about their team-graded scores first.
+   * Refused while the scores are finalized: a move changes team cells and can change totals (a student
+   * without a score takes the new team's score), so it is locked like the Team cells of the grid. */
   function moveStudents(ids, targetTeamId, label) {
     var course = GT.store.course();
     if (!course) return Promise.resolve(null);
+    if (refuseLocked(course)) return Promise.resolve(null);
     var target = targetTeamId ? model.findTeam(course, targetTeamId) : null;
     var list = ids.map(function (id) { return model.findStudent(course, id); }).filter(function (s) {
       if (!s) return false;
@@ -335,26 +398,32 @@
     };
   }
 
-  /** Opens the add (studentId null) or edit dialog. Resolves with the student id, or null. */
+  /** Opens the add (studentId null) or edit dialog. Resolves with the student id, or null.
+   * Finalized scores: adding is refused; editing opens with No, names and team read-only (notes only). */
   function openStudentForm(studentId) {
     var course = GT.store.course();
     if (!course) return Promise.resolve(null);
     var s = studentId ? model.findStudent(course, studentId) : null;
     if (studentId && !s) { ui.toast('That student no longer exists.', { type: 'warn' }); return Promise.resolve(null); }
     var isNew = !s;
+    if (isNew && refuseLocked(course, ADD_LOCKED_MSG)) return Promise.resolve(null);
+    var locked = !isNew && isLocked(course);
+    var ro = locked ? ' readonly aria-readonly="true" title="' + esc(LOCKED_MSG) + '"' : '';
     var no = s ? s.no : model.nextStudentNo(course);
     var curTeam = s ? teamOf(course, s) : null;
     var options = '<option value="">(no team)</option>' + course.teams.map(function (t) {
       return '<option value="' + esc(t.id) + '"' + (curTeam && curTeam.id === t.id ? ' selected' : '') + '>' + esc(t.name) + '</option>';
     }).join('') + '<option value="' + NEW_TEAM + '">New team…</option>';
     var html =
+      (locked ? '<div class="callout callout-warn st-lock-note">' + icon('lock') + '<span><strong>Scores are finalized.</strong> ' +
+        'No, name and team are locked; the notes stay editable. Unlock the scores (Grades tab or Settings › Grading status) to change them.</span></div>' : '') +
       '<div class="sf-grid">' +
-      fieldHtml('sf-no', 'No', '<input id="sf-no" type="text" inputmode="numeric" autocomplete="off" value="' + esc(no === null || no === undefined ? '' : no) + '">', 'sf-no-field') +
-      fieldHtml('sf-last', 'Last name', '<input id="sf-last" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.lastName : '') + '">') +
-      fieldHtml('sf-first', 'First name', '<input id="sf-first" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.firstName : '') + '">') +
+      fieldHtml('sf-no', 'No', '<input id="sf-no" type="text" inputmode="numeric" autocomplete="off" value="' + esc(no === null || no === undefined ? '' : no) + '"' + ro + '>', 'sf-no-field') +
+      fieldHtml('sf-last', 'Last name', '<input id="sf-last" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.lastName : '') + '"' + ro + '>') +
+      fieldHtml('sf-first', 'First name', '<input id="sf-first" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.firstName : '') + '"' + ro + '>') +
       '</div>' +
-      fieldHtml('sf-team', 'Team', '<select id="sf-team">' + options + '</select>' +
-        (s && teamGraded(course).length ? '<div class="help">Changing the team asks whether to keep this student’s current team-graded scores.</div>' : '')) +
+      fieldHtml('sf-team', 'Team', '<select id="sf-team"' + (locked ? ' disabled title="' + esc(LOCKED_MSG) + '"' : '') + '>' + options + '</select>' +
+        (s && !locked && teamGraded(course).length ? '<div class="help">Changing the team asks whether to keep this student’s current team-graded scores.</div>' : '')) +
       '<div class="field" id="sf-newteam-field" hidden><label for="sf-newteam">New team name</label>' +
       '<input id="sf-newteam" type="text" autocomplete="off" value="' + esc(suggestTeamName(course)) + '"></div>' +
       fieldHtml('sf-notes', 'Notes', '<textarea id="sf-notes" class="pii" rows="3" spellcheck="true">' + esc(s ? s.notes : '') + '</textarea>' +
@@ -366,8 +435,10 @@
       buttons: [
         { text: 'Cancel', value: null },
         {
-          text: isNew ? 'Add student' : 'Save', primary: true,
+          text: isNew ? 'Add student' : locked ? 'Save notes' : 'Save', primary: true,
           validate: function (dlg) {
+            // Locked: only the notes are read (No, names and team are read-only and never saved).
+            if (locked) { result = { notesOnly: true, notes: dlg.querySelector('#sf-notes').value }; return null; }
             var r = readStudentForm(dlg, studentId);
             if (r.error) return r.error;
             result = r;
@@ -376,7 +447,7 @@
           value: function () { return result; }
         }
       ],
-      initialFocus: '#sf-last',
+      initialFocus: locked ? '#sf-notes' : '#sf-last',
       onMount: function (dlg) {
         var sel = dlg.querySelector('#sf-team');
         var nf = dlg.querySelector('#sf-newteam-field');
@@ -394,6 +465,7 @@
   function applyStudentForm(courseId, studentId, v) {
     var course = model.findCourse(GT.store.state, courseId);
     if (!course) return Promise.resolve(null);
+    if (v.notesOnly || isLocked(course)) return applyNotesOnly(course, studentId, v);
     if (!studentId) {
       var newId = GT.store.transact('Add student', function (c) {
         var tid = v.teamId && model.findTeam(c, v.teamId) ? v.teamId : null;
@@ -430,6 +502,20 @@
       }, { courseId: courseId });
       return studentId;
     });
+  }
+
+  /** Finalized scores (or a form opened read-only): saves the notes only. No, names and team are never
+   * saved while the scores are finalized. */
+  function applyNotesOnly(course, studentId, v) {
+    var s = studentId ? model.findStudent(course, studentId) : null;
+    if (!s) { lockedToast(ADD_LOCKED_MSG); return Promise.resolve(null); }
+    if (!v.notesOnly) lockedToast(); // an editable form reached a locked course: its No, names and team are not saved
+    if (sameNotes(s.notes, v.notes)) return Promise.resolve(studentId);
+    GT.store.transact('Edit notes', function (c) {
+      var x = model.findStudent(c, studentId);
+      if (x) x.notes = v.notes;
+    }, { courseId: course.id });
+    return Promise.resolve(studentId);
   }
 
   // ------------------------------------------------------------------ withdraw, reinstate, delete, renumber
@@ -476,6 +562,8 @@
     var course = GT.store.course();
     var s = course && model.findStudent(course, studentId);
     if (!s) return Promise.resolve(false);
+    // Deleting removes finalized scores: refused while locked (withdrawing stays possible).
+    if (refuseLocked(course, 'Scores are finalized. Unlock them to delete a student, or withdraw the student instead.')) return Promise.resolve(false);
     var courseId = course.id;
     var req = typeof s.no === 'number' ? String(s.no) : 'DELETE';
     var scoreCount = util.hasOwn(course.scores, s.id) ? Object.keys(course.scores[s.id]).length : 0;
@@ -514,6 +602,7 @@
   function renumberFlow() {
     var course = GT.store.course();
     if (!course || !course.students.length) return Promise.resolve(false);
+    if (refuseLocked(course)) return Promise.resolve(false);
     var n = course.students.length;
     var courseId = course.id;
     return ui.dialog.confirm({
@@ -523,6 +612,8 @@
       confirmText: 'Renumber'
     }).then(function (ok) {
       if (!ok) return false;
+      var now = model.findCourse(GT.store.state, courseId);
+      if (!now || refuseLocked(now)) return false;
       GT.store.transact('Renumber by name', function (c) { model.renumberByName(c); }, { courseId: courseId });
       ui.toast('Renumbered ' + plural(n, 'student') + ' in name order.', { type: 'success', action: undoAction(courseId, 'Renumber by name') });
       return true;
@@ -617,6 +708,11 @@
     if (!t) return;
     var courseId = course.id;
     var members = model.teamMembers(course, teamId);
+    // Finalized: a team with members or team scores is locked (its members' team and scores would change).
+    if (isLocked(course) && (members.length || hasTeamEntries(course, teamId))) {
+      lockedToast('Scores are finalized. Unlock them to delete a team that has members or team scores.');
+      return;
+    }
     var scored = teamGraded(course).map(function (a) {
       return { a: a, e: model.getEntry(course.teamScores, teamId, a.id) };
     }).filter(function (x) { return model.hasScore(x.e); });
@@ -656,6 +752,7 @@
     var course = GT.store.course();
     var t = course && model.findTeam(course, teamId);
     if (!t) return;
+    if (refuseLocked(course)) return;
     var candidates = calc.sortStudents(course, null, 'name', 'asc').filter(function (s) { return s.teamId !== teamId; });
     if (!candidates.length) { ui.toast(course.students.length ? 'Every student is already in ' + t.name + '.' : 'Add students first.'); return; }
     var items = candidates.map(function (s) {
@@ -710,6 +807,7 @@
     var course = GT.store.course();
     var s = course && model.findStudent(course, studentId);
     if (!s) return;
+    if (refuseLocked(course)) return;
     var cur = teamOf(course, s);
     var items = [{ heading: 'Move ' + studentRef(s) + ' to' }];
     if (!course.teams.length) items.push({ label: 'No teams yet', disabled: true });
@@ -731,27 +829,93 @@
     var s = course && model.findStudent(course, studentId);
     if (!s) return;
     var w = isWithdrawn(s);
+    var locked = isLocked(course);
+    // Finalized: the locked items stay in the menu (marked "locked"); choosing one says why, with Unlock.
     ui.menu(anchor, [
       { heading: studentRef(s) },
       { label: 'Details', icon: 'user', onSelect: function () { ui.openStudent(studentId); } },
-      { label: 'Edit…', icon: 'edit', onSelect: function () { openStudentForm(studentId); } },
-      { label: 'Move to team…', icon: 'users', onSelect: function () { moveMenu(anchor, studentId); } },
+      { label: locked ? 'Edit notes…' : 'Edit…', icon: 'edit', onSelect: function () { openStudentForm(studentId); } },
+      { label: 'Move to team…', icon: 'users', hint: locked ? 'locked' : '', onSelect: function () { moveMenu(anchor, studentId); } },
       { label: w ? 'Reinstate…' : 'Withdraw…', icon: w ? 'undo' : 'flag', onSelect: function () { toggleStatus(studentId); } },
       { separator: true },
-      { label: 'Delete permanently…', icon: 'trash', danger: true, onSelect: function () { deleteFlow(studentId); } }
+      { label: 'Delete permanently…', icon: 'trash', danger: true, hint: locked ? 'locked' : '', onSelect: function () { deleteFlow(studentId); } }
     ], { alignRight: true });
   }
 
   // ------------------------------------------------------------------ team scores
 
+  // A team score is a text field, or a <select> for an item with a drop-down list (DECISIONS 8). A pick
+  // from the opened list (mouse, or Enter in the list) saves at once. Browsing a closed list with the
+  // keyboard (arrows, Home/End, PageUp/PageDown, typing) only shows the value ("pending") until Enter or
+  // leaving the list, so one choice is one History entry and one undo step, as in the student details
+  // dialog. Esc shows the saved value again.
+  var TS_BROWSE_KEYS = { ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, Home: 1, End: 1, PageUp: 1, PageDown: 1 };
+  var tsKbdSel = null; // the team-score drop-down whose last value change came from keyboard browsing
+
+  function isTeamControl(t) {
+    return !!t && !!t.classList && (t.classList.contains('ts-input') || t.classList.contains('ts-select'));
+  }
+
+  function isTeamSelect(t) {
+    return !!t && t.tagName === 'SELECT' && !!t.classList && t.classList.contains('ts-select');
+  }
+
+  /** The saved value of a team-score control: the rendered text, or the rendered choice of a drop-down. */
+  function savedTeamValue(ctrl) {
+    if (ctrl.tagName !== 'SELECT') return ctrl.defaultValue;
+    for (var i = 0; i < ctrl.options.length; i++) if (ctrl.options[i].defaultSelected) return ctrl.options[i].value;
+    return ctrl.options.length ? ctrl.options[0].value : '';
+  }
+
+  function setTeamPending(sel, on) {
+    var cell = sel.parentNode;
+    var hint = cell && cell.querySelector ? cell.querySelector('.ts-pending-hint') : null;
+    if (on) {
+      sel.setAttribute('data-ts-pending', '1');
+      sel.classList.add('is-pending');
+      if (!hint && cell) {
+        hint = document.createElement('div');
+        hint.className = 'ts-pending-hint no-print';
+        hint.setAttribute('role', 'status');
+        hint.textContent = 'Enter to save · Esc to cancel';
+        cell.appendChild(hint);
+      }
+    } else {
+      sel.removeAttribute('data-ts-pending');
+      sel.classList.remove('is-pending');
+      if (hint && hint.parentNode) hint.parentNode.removeChild(hint);
+    }
+  }
+
+  /** Shows the saved value again (Esc, a refused value, or finalized scores). */
+  function resetTeamControl(ctrl) {
+    if (ctrl.tagName === 'SELECT') setTeamPending(ctrl, false);
+    ctrl.value = savedTeamValue(ctrl);
+  }
+
   function commitTeamScore(input) {
     var course = GT.store.course();
     if (!course) return;
+    if (isTeamSelect(input)) setTeamPending(input, false);
+    if (isLocked(course)) {
+      if (input.value !== savedTeamValue(input)) { resetTeamControl(input); lockedToast(); }
+      return;
+    }
+    if (input.value === savedTeamValue(input)) return; // unchanged (also "93.3 (not on the list)": kept as it is)
     var tid = input.getAttribute('data-tid'), aid = input.getAttribute('data-aid');
     var t = model.findTeam(course, tid), a = model.findAssessment(course, aid);
     if (!t || !a) return;
+    if (input.value === KEEP_CURRENT) return;
+    // DECISIONS 8: an item with a drop-down list takes only its values. Anything else (a value forced
+    // into the list, or text typed before the list was turned on) is refused and never stored as text.
+    var pc = choiceValues(a).length && typeof model.parseChoiceInput === 'function' ? model.parseChoiceInput(a, input.value) : null;
+    if (pc && pc.kind === 'invalid') {
+      resetTeamControl(input);
+      ui.toast((pc.message || 'Choose a value from the list.') + ' Nothing was saved.', { type: 'warn', timeout: 6000 });
+      return;
+    }
     var prev = model.getEntry(course.teamScores, tid, aid);
-    var next = model.entryFromInput(input.value, prev, a.maxScore);
+    var next = model.entryFromInput(pc && pc.kind === 'number' ? String(pc.value) : input.value, prev, a.maxScore);
     var same = model.isBlankEntry(prev) ? model.isBlankEntry(next)
       : (model.entryKey(prev) === model.entryKey(next) && entryText(prev) === entryText(next) && !model.isBlankEntry(next));
     if (same) return;
@@ -769,11 +933,66 @@
     ui.toast(msg, { type: p.state === 'invalid' ? 'warn' : 'success', action: undoAction(course.id, 'Edit team score') });
   }
 
+  var lockedToastAt = 0;
+  /** "Scores are finalized. Unlock them to edit." (or msg) with an Unlock action, at most once a second
+   * (key repeats). */
+  function lockedToast(msg) {
+    var now = Date.now();
+    if (now - lockedToastAt < 1000) return;
+    lockedToastAt = now;
+    ui.toast(msg || LOCKED_MSG, { type: 'info', timeout: 6000, action: { label: 'Unlock…', fn: unlockScores } });
+  }
+
+  /** True, after the locked toast, when the course's scores are finalized: every flow that changes the
+   * roster (No, names, teams, adding or deleting students) calls it before doing anything. */
+  function refuseLocked(course, msg) {
+    if (!isLocked(course)) return false;
+    lockedToast(msg);
+    return true;
+  }
+
+  /** aria-disabled + tooltip for a control whose flow is refused while the scores are finalized. It stays
+   * clickable, so the click explains why (with the Unlock action), as in the Grades tab. */
+  function lockAttr(locked, msg) {
+    return locked ? ' aria-disabled="true" title="' + esc(msg || LOCKED_MSG) + '"' : '';
+  }
+
+  /** True when a team has any stored team-score entry (a score, or late-work details). */
+  function hasTeamEntries(course, teamId) {
+    var ts = course.teamScores;
+    return !!(ts && util.hasOwn(ts, teamId) && ts[teamId] && Object.keys(ts[teamId]).length);
+  }
+
+  /** "Unlock scores?" (as in the Grades tab and Settings): logged in History, final letters unchanged. */
+  function unlockScores() {
+    var course = GT.store.course();
+    if (!course || !isLocked(course)) return;
+    var courseId = course.id;
+    var at = course.finalized && course.finalized.at;
+    ui.dialog.confirm({
+      title: 'Unlock scores?',
+      messageHtml: '<p>' + (at ? 'Scores were finalized on <strong>' + esc(ui.dateTime(at)) + '</strong>. ' : '') +
+        'Unlocking makes scores, numbers, names and teams editable again. Final letters are not changed.</p>' +
+        '<p class="muted small">The unlock is logged in the change history (“Scores finalized: yes → no”). You can finalize again from the Grades tab at any time.</p>',
+      confirmText: 'Unlock scores'
+    }).then(function (ok) {
+      if (!ok) return;
+      var now = GT.store.course();
+      if (!now || now.id !== courseId || !isLocked(now)) return;
+      GT.store.transact('Unlock scores', function (c) {
+        if (typeof model.unfinalize === 'function') model.unfinalize(c);
+        else c.finalized = null;
+      }, { courseId: courseId });
+      ui.toast('Scores unlocked: they can be edited again. The unlock is logged in History.', { type: 'success', timeout: 6000 });
+    });
+  }
+
   function removeOverride(studentId, aid) {
     var course = GT.store.course();
     var s = course && model.findStudent(course, studentId);
     var a = course && model.findAssessment(course, aid);
     if (!s || !a) return;
+    if (isLocked(course)) { lockedToast(); return; }
     GT.store.transact('Remove override', function (c) { model.clearOverride(c, studentId, aid); }, { courseId: course.id });
     var t = teamOf(course, s);
     var te = t ? model.getEntry(course.teamScores, t.id, aid) : null;
@@ -826,21 +1045,35 @@
       (active ? icon(p.dir === 'desc' ? 'sort-desc' : 'sort-asc', 'icon-sm') : '') + '</button></th>';
   }
 
-  function studentRowHtml(course, s) {
+  /** Read-only Final letter cell of the students table (letters are assigned in the Grades tab or the details). */
+  function finalCellHtml(course, s, r) {
+    var f = finalInfo(course, s, r);
+    if (f.letter === null) return '<td class="st-final"><span class="faint" title="No final letter yet">—</span></td>';
+    var title = !f.valid ? 'Not a letter of the current scale: choose another letter'
+      : f.differs ? 'Differs from the cutoff suggestion (' + f.suggested + ')' : 'Same as the cutoff suggestion';
+    return '<td class="st-final"><span class="st-letter' + (f.valid ? '' : ' is-invalid') + '" title="' + esc(title) + '">' + esc(f.letter) +
+      (f.valid && f.differs ? '<span class="st-letter-dot" aria-hidden="true"></span>' : '') + '</span>' +
+      (!f.valid || f.differs ? '<span class="sr-only"> (' + esc(title) + ')</span>' : '') + '</td>';
+  }
+
+  function studentRowHtml(course, s, results, locked) {
     var w = isWithdrawn(s);
     var t = teamOf(course, s);
     var ref = esc(studentRef(s));
     var id = esc(s.id);
+    var r = results && results.byId ? results.byId[s.id] : null;
     return '<tr data-sid="' + id + '"' + (w ? ' class="row-withdrawn"' : '') + '>' +
       '<td class="num st-no">' + (typeof s.no === 'number' ? s.no : '<span class="faint">–</span>') + '</td>' +
       '<td class="pii st-last">' + esc(s.lastName) + '</td>' +
       '<td class="pii st-first">' + esc(s.firstName) + '</td>' +
       '<td class="st-team">' + (t ? esc(t.name) : '<span class="faint">No team</span>') + '</td>' +
       '<td class="st-status">' + (w ? '<span class="badge">Withdrawn</span>' : '<span class="muted">Active</span>') + '</td>' +
+      finalCellHtml(course, s, r) +
       '<td class="st-notes">' + (s.notes ? '<span class="pii st-notes-text">' + esc(truncate(s.notes, 90)) + '</span>' : '') + '</td>' +
       '<td class="st-actions">' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="details" data-id="' + id + '" data-fk="details:' + id + '" aria-label="Details for ' + ref + '" title="Details">' + icon('user') + '</button>' +
-      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="edit" data-id="' + id + '" data-fk="edit:' + id + '" aria-label="Edit ' + ref + '" title="Edit">' + icon('edit') + '</button>' +
+      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="edit" data-id="' + id + '" data-fk="edit:' + id + '" aria-label="' + (locked ? 'Edit notes of ' : 'Edit ') + ref + '" title="' +
+        (locked ? 'Edit notes (No, name and team are locked: scores are finalized)' : 'Edit') + '">' + icon('edit') + '</button>' +
       '<button type="button" class="btn btn-sm st-status-btn" data-act="status" data-id="' + id + '" data-fk="status:' + id + '" aria-label="' + (w ? 'Reinstate ' : 'Withdraw ') + ref + '">' + (w ? 'Reinstate' : 'Withdraw') + '</button>' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="row-menu" data-id="' + id + '" data-fk="menu:' + id + '" aria-haspopup="menu" aria-expanded="false" aria-label="More actions for ' + ref + '" title="More actions">' + icon('dots') + '</button>' +
       '</td></tr>';
@@ -857,20 +1090,28 @@
     var q = searchText.trim().toLowerCase();
     if (q) list = list.filter(function (s) { return matches(course, s, q); });
 
+    var locked = isLocked(course);
     var h = '<section class="card st-card" aria-labelledby="st-students-h">' +
       '<div class="card-header"><h2 id="st-students-h">Students <span class="badge">' + all.length + '</span></h2>' +
       '<div class="toolbar">' +
-      '<button type="button" class="btn btn-primary btn-sm" data-act="add" data-fk="add">' + icon('plus') + 'Add student</button>' +
-      '<button type="button" class="btn btn-sm" data-act="paste" data-fk="paste">' + icon('copy') + 'Paste roster</button>' +
-      '<button type="button" class="btn btn-sm" data-act="renumber" data-fk="renumber"' + (all.length ? '' : ' disabled') + ' title="Assign No 1..N in name order">' + icon('sort-asc') + 'Renumber by name</button>' +
+      '<button type="button" class="btn btn-primary btn-sm" data-act="add" data-fk="add"' + lockAttr(locked, ADD_LOCKED_MSG) + '>' + icon('plus') + 'Add student</button>' +
+      '<button type="button" class="btn btn-sm" data-act="paste" data-fk="paste"' + lockAttr(locked, ADD_LOCKED_MSG) + '>' + icon('copy') + 'Paste roster</button>' +
+      '<button type="button" class="btn btn-sm" data-act="renumber" data-fk="renumber"' + (all.length ? '' : ' disabled') +
+        (locked ? lockAttr(true) : ' title="Assign No 1..N in name order"') + '>' + icon('sort-asc') + 'Renumber by name</button>' +
       '</div></div>';
+    if (locked && all.length) {
+      h += '<div class="st-lock-bar"><div class="callout callout-warn st-lock-note">' + icon('lock') + '<span><strong>Scores are finalized' +
+        (course.finalized && course.finalized.at ? ' on ' + esc(ui.dateTime(course.finalized.at)) : '') + '.</strong> ' +
+        'No, names and teams are locked, and students cannot be added or deleted. Notes, withdrawals and final letters stay editable.</span>' +
+        '<button type="button" class="btn btn-sm" data-act="unlock" data-fk="unlock">' + icon('lock') + 'Unlock scores…</button></div></div>';
+    }
 
     if (!all.length) {
       return h + '<div class="empty-state"><h2>No students in ' + esc(course.code) + ' yet</h2>' +
         '<p>Paste the class roster from Excel, add students one by one, or load fake sample data to try the app.</p>' +
         '<div class="actions">' +
-        '<button type="button" class="btn btn-primary" data-act="paste" data-fk="empty-paste">' + icon('copy') + 'Paste roster</button>' +
-        '<button type="button" class="btn" data-act="add" data-fk="empty-add">' + icon('plus') + 'Add student</button>' +
+        '<button type="button" class="btn btn-primary" data-act="paste" data-fk="empty-paste"' + lockAttr(locked, ADD_LOCKED_MSG) + '>' + icon('copy') + 'Paste roster</button>' +
+        '<button type="button" class="btn" data-act="add" data-fk="empty-add"' + lockAttr(locked, ADD_LOCKED_MSG) + '>' + icon('plus') + 'Add student</button>' +
         (GT.app && GT.app.actions && GT.app.actions.loadSample ? '<button type="button" class="btn" data-act="load-sample" data-fk="empty-sample">' + icon('layers') + 'Load sample data</button>' : '') +
         '</div></div></section>';
     }
@@ -897,14 +1138,15 @@
 
     h += '<div class="table-wrap st-table-wrap"><table class="table st-table"><thead><tr>' +
       sortTh('no', 'No', p, 'num') + sortTh('name', 'Last name', p) + '<th scope="col">First name</th>' +
-      sortTh('team', 'Team', p) + sortTh('status', 'Status', p) + '<th scope="col">Notes</th>' +
+      sortTh('team', 'Team', p) + sortTh('status', 'Status', p) +
+      '<th scope="col" class="st-final-h" title="Assigned in the Grades tab or in the student details">Final letter</th><th scope="col">Notes</th>' +
       '<th scope="col" class="st-actions-h"><span class="sr-only">Actions</span></th></tr></thead><tbody>' +
-      list.map(function (s) { return studentRowHtml(course, s); }).join('') +
+      list.map(function (s) { return studentRowHtml(course, s, results, locked); }).join('') +
       '</tbody></table></div>';
     return h + '</section>';
   }
 
-  function memberHtml(s, team) {
+  function memberHtml(s, team, locked) {
     var w = isWithdrawn(s);
     var ref = esc(studentRef(s));
     var id = esc(s.id);
@@ -913,12 +1155,14 @@
       (w ? '<span class="badge">Withdrawn</span>' : '') +
       '<span class="member-actions">' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="details" data-id="' + id + '" data-fk="m-details:' + id + '" aria-label="Details for ' + ref + '" title="Details">' + icon('user') + '</button>' +
-      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="member-move" data-id="' + id + '" data-fk="m-move:' + id + '" aria-haspopup="menu" aria-expanded="false" aria-label="Move ' + ref + ' to another team" title="Move to team…">' + icon('chevron-right') + '</button>' +
-      (team ? '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="member-remove" data-id="' + id + '" data-fk="m-remove:' + id + '" aria-label="Remove ' + ref + ' from ' + esc(team.name) + '" title="Remove from team">' + icon('x') + '</button>' : '') +
+      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="member-move" data-id="' + id + '" data-fk="m-move:' + id + '"' +
+        (locked ? lockAttr(true) : ' aria-haspopup="menu" aria-expanded="false" title="Move to team…"') + ' aria-label="Move ' + ref + ' to another team">' + icon('chevron-right') + '</button>' +
+      (team ? '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="member-remove" data-id="' + id + '" data-fk="m-remove:' + id + '" aria-label="Remove ' + ref + ' from ' + esc(team.name) + '"' +
+        (locked ? lockAttr(true) : ' title="Remove from team"') + '>' + icon('x') + '</button>' : '') +
       '</span></li>';
   }
 
-  function teamBoxHtml(course, t, range) {
+  function teamBoxHtml(course, t, range, locked) {
     var members = model.sortedMembers(course, t.id);
     var active = members.filter(function (s) { return !isWithdrawn(s); }).length;
     var wd = members.length - active;
@@ -933,16 +1177,18 @@
       '<span class="team-count">' + plural(active, 'active member') + (wd ? ' · ' + wd + ' withdrawn' : '') + '</span></div>' +
       '<span class="team-box-actions">' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="team-rename" data-id="' + id + '" data-fk="t-rename:' + id + '" aria-label="Rename ' + esc(t.name) + '" title="Rename">' + icon('edit') + '</button>' +
-      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="team-delete" data-id="' + id + '" data-fk="t-delete:' + id + '" aria-label="Delete ' + esc(t.name) + '" title="Delete team">' + icon('trash') + '</button>' +
+      '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="team-delete" data-id="' + id + '" data-fk="t-delete:' + id + '" aria-label="Delete ' + esc(t.name) + '"' +
+        (locked && (members.length || hasTeamEntries(course, t.id)) ? lockAttr(true, 'Scores are finalized. Unlock them to delete a team that has members or team scores.') : ' title="Delete team"') + '>' + icon('trash') + '</button>' +
       '</span></div>' + hint +
-      (members.length ? '<ul class="member-list">' + members.map(function (s) { return memberHtml(s, t); }).join('') + '</ul>'
+      (members.length ? '<ul class="member-list">' + members.map(function (s) { return memberHtml(s, t, locked); }).join('') + '</ul>'
         : '<p class="team-empty muted">No members yet.</p>') +
-      '<div class="team-box-foot"><button type="button" class="btn btn-sm btn-ghost" data-act="team-add" data-id="' + id + '" data-fk="t-add:' + id + '">' + icon('plus') + 'Add members</button></div>' +
+      '<div class="team-box-foot"><button type="button" class="btn btn-sm btn-ghost" data-act="team-add" data-id="' + id + '" data-fk="t-add:' + id + '"' + lockAttr(locked) + '>' + icon('plus') + 'Add members</button></div>' +
       '</div>';
   }
 
   function teamsCardHtml(course) {
     var range = sizeRange(course);
+    var locked = isLocked(course);
     var noTeam = calc.sortStudents(course, null, 'name', 'asc').filter(function (s) { return !teamOf(course, s); });
     var h = '<section class="card teams-card" aria-labelledby="st-teams-h">' +
       '<div class="card-header"><h2 id="st-teams-h">Teams <span class="badge">' + course.teams.length + '</span></h2>' +
@@ -950,6 +1196,9 @@
       '<button type="button" class="btn btn-sm" data-act="team-new" data-fk="team-new">' + icon('plus') + 'New team</button>' +
       '<button type="button" class="btn btn-sm" data-act="teams-create" data-fk="teams-create">' + icon('users') + 'Create teams…</button>' +
       '</div></div><div class="card-body">';
+    if (locked && course.teams.length) {
+      h += '<p class="muted small teams-note">' + icon('lock', 'icon-sm') + ' Scores are finalized: team members are locked. Team names can still be changed.</p>';
+    }
     if (range) {
       h += '<p class="muted small teams-note">' + icon('info', 'icon-sm') + ' Teams in ' + esc(course.code) + ' usually have ' + esc(range.label) +
         ' members. Sizes outside that range get a note; it is informational only.</p>';
@@ -958,14 +1207,37 @@
       h += '<p class="muted">No teams yet. Create them one at a time with <strong>New team</strong>, or several at once with <strong>Create teams…</strong>. ' +
         'Team-graded assessments (' + esc(teamGraded(course).map(function (a) { return a.name; }).join(', ') || 'none') + ') use one score per team.</p>';
     }
-    h += '<div class="team-grid">' + course.teams.map(function (t) { return teamBoxHtml(course, t, range); }).join('');
+    h += '<div class="team-grid">' + course.teams.map(function (t) { return teamBoxHtml(course, t, range, locked); }).join('');
     if (course.students.length) {
       h += '<div class="team-box no-team"><div class="team-box-head"><div class="team-box-title"><h3>No team</h3>' +
         '<span class="team-count">' + plural(noTeam.length, 'student') + '</span></div></div>' +
-        (noTeam.length ? '<ul class="member-list">' + noTeam.map(function (s) { return memberHtml(s, null); }).join('') + '</ul>'
+        (noTeam.length ? '<ul class="member-list">' + noTeam.map(function (s) { return memberHtml(s, null, locked); }).join('') + '</ul>'
           : '<p class="team-empty muted">Every student is in a team.</p>') + '</div>';
     }
     return h + '</div></div></section>';
+  }
+
+  /** Team score of an item with a drop-down list (DECISIONS 8): a <select> of "(empty)" and the list values,
+   * so no typo can be stored. A stored value that is not on the list (imported, or entered before the list
+   * was turned on) stays selected as "93.3 (not on the list)" (or "abc (not a number)") and is kept until
+   * another value is chosen. */
+  function teamChoiceHtml(t, a, e, p, values, locked) {
+    var raw = entryText(e);
+    var cur = p.state === 'number' ? util.fix(p.value) : null;
+    var onList = cur !== null && values.indexOf(cur) !== -1;
+    var offList = p.state === 'number' && !onList;
+    var title = p.state === 'invalid' ? 'Not a number: counted as 0' : offList ? 'Not one of the list values' : '';
+    if (locked) title = (title ? title + '. ' : '') + LOCKED_MSG;
+    var opts = '<option value=""' + (p.state === 'empty' ? ' selected' : '') + '>(empty)</option>' +
+      (offList ? '<option value="' + KEEP_CURRENT + '" selected>' + esc(raw) + ' (not on the list)</option>' : '') +
+      (p.state === 'invalid' ? '<option value="' + KEEP_CURRENT + '" selected>' + esc(raw) + ' (not a number)</option>' : '') +
+      values.map(function (v) {
+        return '<option value="' + esc(String(v)) + '"' + (onList && v === cur ? ' selected' : '') + '>' + esc(choiceText(v)) + '</option>';
+      }).join('');
+    return '<select class="ts-select' + (p.state === 'invalid' ? ' is-invalid' : offList ? ' is-range' : '') + '"' +
+      ' data-tid="' + esc(t.id) + '" data-aid="' + esc(a.id) + '" data-fk="ts:' + esc(t.id) + ':' + esc(a.id) + '"' +
+      ' aria-label="' + esc(a.name + ' team score for ' + t.name + ', out of ' + choiceText(a.maxScore)) + '"' +
+      (title ? ' title="' + esc(title) + '"' : '') + (locked ? ' disabled' : '') + '>' + opts + '</select>';
   }
 
   function teamScoresCardHtml(course) {
@@ -978,6 +1250,8 @@
     if (!course.teams.length) {
       return h + '<div class="card-body muted">No teams yet. Create teams above, then enter each team’s score here.</div></section>';
     }
+    var locked = isLocked(course);
+    var hasList = tg.some(function (a) { return choiceValues(a).length > 0; });
     var cols = 3 + tg.length;
     var head = '<tr><th scope="col">Team</th><th scope="col" class="num">Members</th>' + tg.map(function (a) {
       return '<th scope="col" class="ts-h ' + groupClass(course, a) + '">' + esc(a.name) + ' ' + ui.placeholderBadge(course, 'maxScores', { compact: true }) +
@@ -1000,11 +1274,15 @@
         var invalid = p.state === 'invalid';
         var range = p.state === 'number' && (p.value < 0 || p.value > a.maxScore);
         var title = invalid ? 'Not a number: counted as 0' : range ? 'Outside 0–' + a.maxScore : '';
+        if (locked) title = (title ? title + '. ' : '') + LOCKED_MSG;
         var nOv = overrides.filter(function (o) { return o.a.id === a.id; }).length;
-        return '<td class="ts-cell ' + groupClass(course, a) + '"><input type="text" inputmode="decimal" class="ts-input' +
+        var values = choiceValues(a);
+        var ctrl = values.length ? teamChoiceHtml(t, a, e, p, values, locked)
+          : '<input type="text" inputmode="decimal" class="ts-input' +
           (invalid ? ' is-invalid' : range ? ' is-range' : '') + '" data-tid="' + tid + '" data-aid="' + esc(a.id) + '" data-fk="ts:' + tid + ':' + esc(a.id) + '"' +
           ' value="' + esc(entryText(e)) + '" aria-label="' + esc(a.name + ' team score for ' + t.name) + '"' + (title ? ' title="' + esc(title) + '"' : '') +
-          ' autocomplete="off" spellcheck="false">' +
+          (locked ? ' readonly aria-readonly="true"' : '') + ' autocomplete="off" spellcheck="false">';
+        return '<td class="ts-cell ' + groupClass(course, a) + '">' + ctrl +
           (e && e.weeksLate > 0 ? ' <span class="badge badge-info" title="Late work">' + e.weeksLate + ' wk late' + (e.waived ? ', waived' : '') + '</span>' : '') +
           (nOv ? ' <span class="ts-ov-mark" title="' + plural(nOv, 'member has', 'members have') + ' a per-member override">◆' + nOv + '</span>' : '') +
           '</td>';
@@ -1028,8 +1306,14 @@
       }
       return row;
     }).join('');
-    return h + '<div class="card-body ts-body"><div class="table-wrap"><table class="table ts-table"><thead>' + head + '</thead><tbody>' + body +
-      '</tbody></table></div><p class="muted small ts-legend">Type a score and press Enter (or leave the field) to save. Red = not a number (counted as 0), yellow = outside 0 to max. ' +
+    var lockNote = locked
+      ? '<div class="callout callout-warn st-lock-note">' + icon('lock') + '<span><strong>Scores are finalized.</strong> Team scores and per-member overrides are locked; ' +
+        'unlock them in Settings (Grading status) or in the Grades tab to change them.</span></div>'
+      : '';
+    return h + '<div class="card-body ts-body">' + lockNote + '<div class="table-wrap"><table class="table ts-table' + (locked ? ' is-locked' : '') + '"><thead>' + head + '</thead><tbody>' + body +
+      '</tbody></table></div><p class="muted small ts-legend">' + (locked ? 'Locked while the scores are finalized. ' : 'Type a score and press Enter (or leave the field) to save. ' +
+        (hasList ? 'Items with a drop-down list take only its values: pick one from the list (after browsing with the arrow keys, Enter saves and Esc cancels). ' : '')) +
+      'Red = not a number (counted as 0), yellow = outside 0 to max' + (hasList ? ' or not on the list' : '') + '. ' +
       'Each change is logged in History for every member it reaches.</p></div></section>';
   }
 
@@ -1064,6 +1348,7 @@
       case 'add': openStudentForm(null); break;
       case 'paste': ui.openRosterPaste(); break;
       case 'renumber': renumberFlow(); break;
+      case 'unlock': unlockScores(); break;
       case 'load-sample': if (GT.app && GT.app.actions && GT.app.actions.loadSample) GT.app.actions.loadSample(); break;
       case 'filter': setPrefs({ filter: b.getAttribute('data-filter') }); break;
       case 'sort': {
@@ -1105,20 +1390,49 @@
 
   function onChange(e) {
     var t = e.target;
-    if (t.classList && t.classList.contains('ts-input')) commitTeamScore(t);
+    if (isTeamSelect(t)) {
+      setTeamPending(t, true);
+      if (tsKbdSel !== t) commitTeamScore(t);
+    } else if (t.classList && t.classList.contains('ts-input')) commitTeamScore(t);
   }
 
   function moveTeamScoreFocus(input, delta) {
-    var aid = input.getAttribute('data-aid');
-    var all = ui.$$('.ts-input[data-aid="' + cssKey(aid) + '"]', boundEl);
+    var aid = cssKey(input.getAttribute('data-aid'));
+    var all = ui.$$('.ts-input[data-aid="' + aid + '"], .ts-select[data-aid="' + aid + '"]', boundEl);
     var i = all.indexOf(input);
-    var next = all[i + delta];
-    if (next) { next.focus(); next.select(); }
+    var next = i === -1 ? null : all[i + delta];
+    if (next) {
+      next.focus();
+      if (next.tagName === 'INPUT') next.select();
+    }
+  }
+
+  function onTeamSelectKeydown(e) {
+    var t = e.target;
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitTeamScore(t);
+      moveTeamScoreFocus(t, e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (e.key === 'Escape') {
+      if (t.hasAttribute('data-ts-pending')) { e.preventDefault(); e.stopPropagation(); resetTeamControl(t); }
+      return;
+    }
+    if (e.key === 'Tab' || e.ctrlKey || e.metaKey) return;
+    // Alt+Up/Down, F4 and Space open the list: a pick there saves at once, like a mouse pick.
+    var browse = !e.altKey && (TS_BROWSE_KEYS[e.key] === 1 || (e.key.length === 1 && e.key !== ' '));
+    tsKbdSel = browse ? t : null;
   }
 
   function onKeydown(e) {
     var t = e.target;
+    if (isTeamSelect(t)) { onTeamSelectKeydown(e); return; }
     if (t.classList && t.classList.contains('ts-input')) {
+      if (t.readOnly && !e.ctrlKey && !e.metaKey && !e.altKey && (e.key.length === 1 || e.key === 'Delete' || e.key === 'Backspace')) {
+        lockedToast();
+        return;
+      }
       if (e.key === 'Enter') {
         e.preventDefault();
         commitTeamScore(t);
@@ -1156,6 +1470,20 @@
     el.addEventListener('change', onChange);
     el.addEventListener('keydown', onKeydown);
     el.addEventListener('contextmenu', onContextMenu);
+    el.addEventListener('paste', function (e) {
+      var t = e.target;
+      if (t && t.classList && t.classList.contains('ts-input') && t.readOnly) lockedToast();
+    });
+    // A team-score drop-down browsed to with the keyboard is saved when the focus leaves it.
+    el.addEventListener('focusout', function (e) {
+      var t = e.target;
+      if (!isTeamSelect(t)) return;
+      if (tsKbdSel === t) tsKbdSel = null;
+      if (t.hasAttribute('data-ts-pending') && document.body.contains(t)) commitTeamScore(t);
+    });
+    el.addEventListener('mousedown', function (e) {
+      if (isTeamSelect(e.target)) tsKbdSel = null;
+    }, true);
   }
 
   // Document-level listeners, added once; they act only while this view is on screen.
@@ -1177,7 +1505,18 @@
     id: 'students',
     title: 'Students & Teams',
     render: render,
-    destroy: function () { if (ui.closeMenu) ui.closeMenu(); }
+    destroy: function () {
+      if (ui.closeMenu) ui.closeMenu();
+      // Leaving the view (e.g. Alt+2) removes it before a focusout or change can save: save a team score
+      // that was typed, or browsed to in a drop-down, now, like leaving the field does.
+      if (boundEl && document.body.contains(boundEl)) {
+        ui.$$('.ts-input, .ts-select[data-ts-pending]', boundEl).forEach(function (c) {
+          if (c.value === savedTeamValue(c)) return;
+          try { commitTeamScore(c); } catch (e) { if (root.console) console.error(e); }
+        });
+      }
+      tsKbdSel = null;
+    }
   };
 
   // ------------------------------------------------------------------ roster paste (S3)
@@ -1403,10 +1742,11 @@
   }
 
   /** Quick roster paste (S3): a dialog with a textarea, live preview and column mapping.
-   * Resolves with the number of students added (0 when cancelled). */
+   * Resolves with the number of students added (0 when cancelled, or refused while the scores are finalized). */
   ui.openRosterPaste = function (opts) {
     var course = GT.store && GT.store.course();
     if (!course) { ui.toast('Add a course first.', { type: 'warn' }); return Promise.resolve(0); }
+    if (refuseLocked(course, ADD_LOCKED_MSG)) return Promise.resolve(0);
     var courseId = course.id;
     var state = { rows: [], ncols: 0, mapping: ['full'], mappingAuto: true, headerIdx: -1, headerAuto: true, headerOn: false };
     var body = ui.el('<div class="rp">' +
@@ -1496,7 +1836,7 @@
     }).then(function (v) {
       if (v !== 'add') return 0;
       var c0 = model.findCourse(GT.store.state, courseId);
-      if (!c0) return 0;
+      if (!c0 || refuseLocked(c0, ADD_LOCKED_MSG)) return 0;
       var counts = GT.store.transact('Paste roster', function (c) {
         var plan = planRoster(c, state.rows, state.mapping, state.headerIdx);
         var teamIds = Object.create(null);
@@ -1550,10 +1890,37 @@
       '<dt>Longest absence streak</dt><dd class="num">' + n(a.longestStreak) + '</dd></dl>' + warn + '</section>';
   }
 
+  /** True when a history entry concerns the student: its own entries, and summary entries that list the
+   * student in their details (a band of more than 10 final letters is one "Final letters: n changed"). */
+  function historyInvolves(h, sid) {
+    if (!h) return false;
+    if (GT.history && typeof GT.history.involvesStudent === 'function') {
+      try { return !!GT.history.involvesStudent(h, sid); } catch (e) { /* fall back */ }
+    }
+    return h.studentId === sid;
+  }
+
+  /** The entry as this student's row: a summary entry becomes the student's own change, taken from its
+   * details (field "Final letter", old → new), with the note 'Part of "Final letters: 12 changed"'. */
+  function historyRowFor(h, sid) {
+    if (h.studentId === sid || !GT.history || typeof GT.history.detailFor !== 'function') return h;
+    var d = null;
+    try { d = GT.history.detailFor(h, sid); } catch (e) { d = null; }
+    if (!d) return h;
+    var summary = (h.field || 'Change') + (h.newValue ? ': ' + h.newValue : '');
+    return {
+      ts: h.ts, kind: h.kind, source: h.source, userNote: h.userNote,
+      field: h.fieldKey === 'finalLetters' ? 'Final letter' : h.field,
+      fieldKey: h.fieldKey === 'finalLetters' ? 'student.finalLetter' : h.fieldKey,
+      oldValue: d.oldValue, newValue: d.newValue,
+      note: 'Part of "' + summary + '"'
+    };
+  }
+
   function historyHtml(course, sid) {
-    var list = (course.history || []).filter(function (h) { return h && h.studentId === sid; });
+    var list = (course.history || []).filter(function (h) { return historyInvolves(h, sid); });
     var total = list.length;
-    list = list.slice(-100).reverse();
+    list = list.slice(-100).reverse().map(function (h) { return historyRowFor(h, sid); });
     if (!list.length) return '<section class="sd-section"><h4 class="section-label">Change history</h4><p class="muted">No changes recorded for this student yet.</p></section>';
     var labels = GT.history && GT.history.KIND_LABELS ? GT.history.KIND_LABELS : {};
     var piiKeys = { 'student.lastName': true, 'student.firstName': true, 'student.notes': true };
@@ -1578,6 +1945,48 @@
       '<th scope="col">Kind</th><th scope="col">Source</th><th scope="col">Note</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>';
   }
 
+  /** The Final letter tile of the detail dialog: a drop-down of the scale's letters plus "(none)". */
+  function finalTileHtml(course, s, f, canSet) {
+    var letters = scaleLetters(course);
+    var opts = '<option value=""' + (f.letter === null ? ' selected' : '') + '>(none)</option>' +
+      (f.letter !== null && !f.valid ? '<option value="' + KEEP_CURRENT + '" selected>' + esc(f.letter) + ' (not in the scale)</option>' : '') +
+      letters.map(function (l) {
+        return '<option value="' + esc(l) + '"' + (f.valid && l === f.letter ? ' selected' : '') + '>' + esc(l) + '</option>';
+      }).join('');
+    var sel = '<select id="sd-final" class="sd-final-select' + (f.valid ? '' : ' is-invalid') + '" data-fk="sd-final"' +
+      ' aria-label="' + esc('Final letter for ' + studentRef(s)) + '" aria-describedby="sd-final-sub"' + (canSet ? '' : ' disabled') + '>' + opts + '</select>';
+    var sub = [];
+    if (f.letter === null) sub.push('Not assigned yet' + (f.suggested ? ' · suggestion ' + esc(f.suggested) : ''));
+    else if (!f.valid) sub.push('<span class="sd-final-bad">' + icon('alert', 'icon-sm') + ' Not a letter of the current scale: choose another letter</span>');
+    else if (f.differs) sub.push('<span class="sd-differs"><span class="sd-dot" aria-hidden="true"></span>Differs from the cutoff suggestion (' + esc(f.suggested) + ')</span>');
+    else sub.push('Same as the cutoff suggestion');
+    if (f.orderIssue) sub.push('<span class="sd-order">' + icon('alert', 'icon-sm') + ' Higher letter than a student with a higher total</span>');
+    if (isWithdrawn(s)) sub.push('withdrawn: not counted in statistics');
+    return '<div class="sd-tile sd-final-tile"><div class="sd-tile-label"><label for="sd-final">Final letter</label></div>' +
+      '<div class="sd-tile-value">' + sel + '</div><div class="sd-tile-sub" id="sd-final-sub">' + sub.join('<br>') + '</div></div>';
+  }
+
+  /** Raw-score cell of the detail dialog. An individually entered score with a drop-down list is a <select>
+   * ("(empty)" plus the list values; a stored value that is not on the list stays selected and flagged). */
+  function rawCellHtml(course, s, a, d, res, locked) {
+    var raw = entryText(res.entry);
+    var values = res.source === 'individual' ? choiceValues(a) : [];
+    var cls = 'num sd-raw' + (d.state === 'invalid' ? ' is-invalid' : (d.outOfRange || d.notOnList) ? ' is-range' : '');
+    if (!values.length) return '<td class="' + cls + '">' + (raw === '' ? '<span class="faint">–</span>' : esc(raw)) + '</td>';
+    var cur = d.state === 'number' ? util.fix(d.raw) : null;
+    var onList = cur !== null && values.indexOf(cur) !== -1;
+    var opts = '<option value=""' + (d.state === 'empty' ? ' selected' : '') + '>(empty)</option>' +
+      (d.state === 'number' && !onList ? '<option value="' + KEEP_CURRENT + '" selected>' + esc(raw) + ' (not on the list)</option>' : '') +
+      (d.state === 'invalid' ? '<option value="' + KEEP_CURRENT + '" selected>' + esc(raw) + ' (not a number)</option>' : '') +
+      values.map(function (v) {
+        return '<option value="' + esc(String(v)) + '"' + (onList && v === cur ? ' selected' : '') + '>' + esc(choiceText(v)) + '</option>';
+      }).join('');
+    return '<td class="' + cls + ' sd-raw-choice"><select class="sd-choice' + (d.state === 'invalid' ? ' is-invalid' : (d.notOnList || d.outOfRange) ? ' is-range' : '') + '"' +
+      ' data-sd-choice="' + esc(a.id) + '" data-fk="sd-choice:' + esc(a.id) + '"' +
+      ' aria-label="' + esc(a.name + ' score for ' + studentRef(s) + ', out of ' + choiceText(a.maxScore)) + '"' +
+      (locked ? ' disabled title="' + esc(LOCKED_MSG) + '"' : '') + '>' + opts + '</select></td>';
+  }
+
   function studentDetailHtml(course, results, sid) {
     var s = model.findStudent(course, sid);
     if (!s) {
@@ -1588,6 +1997,7 @@
     var w = isWithdrawn(s);
     var name = model.studentName(s);
     var ranked = results ? results.activeIds.length : 0;
+    var locked = isLocked(course);
 
     var h = '<div class="sd-head"><div class="sd-id">' +
       '<h3 class="sd-name pii">' + (name ? esc(name) : '(no name)') + '</h3>' +
@@ -1596,21 +2006,28 @@
       (w ? '<span class="badge">Withdrawn</span>' : '<span class="muted sd-status">Active</span>') +
       '<span class="badge">' + esc(model.courseLabel(course)) + '</span></div></div>' +
       '<div class="sd-actions no-print">' +
-      '<button type="button" class="btn btn-sm" data-sd="edit" data-fk="sd-edit">' + icon('edit') + 'Edit</button>' +
+      '<button type="button" class="btn btn-sm" data-sd="edit" data-fk="sd-edit"' +
+        (locked ? ' title="Scores are finalized: No, name and team are locked. Notes stay editable."' : '') + '>' + icon('edit') + (locked ? 'Edit notes' : 'Edit') + '</button>' +
       '<button type="button" class="btn btn-sm" data-sd="status" data-fk="sd-status">' + icon(w ? 'undo' : 'flag') + (w ? 'Reinstate…' : 'Withdraw…') + '</button>' +
       '<button type="button" class="btn btn-sm" data-sd="print" data-fk="sd-print">' + icon('print') + 'Print</button>' +
       '</div></div>';
     if (w) {
       h += '<div class="callout sd-wd">Withdrawn: kept in history and exports, excluded from statistics, rank, percentile and the class average.</div>';
     }
+    if (locked) {
+      h += '<div class="callout callout-warn sd-lock">' + icon('lock') + '<span><strong>Scores finalized' +
+        (course.finalized.at ? ' on ' + esc(ui.dateTime(course.finalized.at)) : '') + '.</strong> Scores, No, name and team are locked; the final letter and the notes stay editable.</span></div>';
+    }
+    var fi = finalInfo(course, s, r);
 
     var incompleteSub = r.incomplete
       ? '<span class="sd-incomplete">' + icon('info', 'icon-sm') + ' ' + plural(r.missingCount, 'weighted score') + ' empty or not a number (counted as 0)</span>'
       : (r.curve ? 'includes curve ' + esc(signed(r.curve)) : 'all weighted scores entered');
     h += '<div class="sd-summary">' +
       tile('Total', '<span data-sd-total>' + esc(fmt(r.total)) + '</span>', incompleteSub) +
-      tile('Letter', '<span data-sd-letter>' + esc(r.letter || '—') + '</span> ' + ui.placeholderBadge(course, 'letterScale', { compact: true }),
-        w ? 'shown for reference' : '') +
+      tile('Suggested letter', '<span data-sd-letter>' + esc(r.letter || '—') + '</span> ' + ui.placeholderBadge(course, 'letterScale', { compact: true }),
+        'from the cutoffs' + (w ? ' · shown for reference' : '')) +
+      finalTileHtml(course, s, fi, typeof model.setFinalLetter === 'function') +
       tile('Rank', '<span data-sd-rank>' + (r.rank ? r.rank + ' of ' + ranked : '—') + '</span>', w ? 'withdrawn: not ranked' : 'among active students') +
       tile('Percentile', '<span data-sd-percentile>' + (r.percentile !== null && r.percentile !== undefined ? ordinal(r.percentile) : '—') + '</span>', w ? 'withdrawn: excluded' : '') +
       tile('vs class average', '<span data-sd-diff>' + esc(signed(r.diffFromAverage)) + '</span>',
@@ -1620,7 +2037,6 @@
     var rowsHtml = course.assessments.map(function (a) {
       var d = r.items[a.id] || calc.scoreDetail(course, s, a);
       var res = calc.resolveEntry(course, s, a);
-      var raw = entryText(res.entry);
       var source;
       if (d.source === 'team') source = icon('users', 'icon-sm') + ' Team <span class="muted">(' + esc(t ? t.name : '') + ')</span>';
       else if (d.source === 'override') {
@@ -1630,11 +2046,15 @@
       var flags = [];
       if (d.state === 'invalid') flags.push('<span class="badge badge-danger">Not a number · counted as 0</span>');
       if (d.outOfRange) flags.push('<span class="badge badge-warn">Outside 0–' + esc(a.maxScore) + '</span>');
+      if (d.notOnList && !d.outOfRange) flags.push('<span class="badge badge-warn">Not one of the list values</span>');
+      if (choiceValues(a).length && res.source !== 'individual') {
+        flags.push('<span class="badge">Drop-down list: edit in Grades' + (res.source === 'team' ? ' or Team scores' : '') + '</span>');
+      }
       if (d.state === 'empty') flags.push('<span class="badge">Empty' + ((a.weight || 0) > 0 ? ' · counted as 0' : '') + '</span>');
       if (d.weeksLate > 0) flags.push('<span class="badge badge-info">' + d.weeksLate + ' wk late' + (d.waived ? ', waived' : (d.penalty ? ' · −' + esc(fmt(d.penalty)) : '')) + '</span>');
       return '<tr><th scope="row"><span class="sd-swatch ' + groupClass(course, a) + '" aria-hidden="true"></span>' + esc(a.name) + '</th>' +
         '<td class="num">' + esc(a.maxScore) + '</td><td class="num sd-weight">' + weightBadges(course, a) + ' ' + esc(a.weight) + '%</td>' +
-        '<td class="num sd-raw' + (d.state === 'invalid' ? ' is-invalid' : d.outOfRange ? ' is-range' : '') + '">' + (raw === '' ? '<span class="faint">–</span>' : esc(raw)) + '</td>' +
+        rawCellHtml(course, s, a, d, res, locked) +
         '<td>' + source + '</td><td class="num">' + esc(fmt(d.weighted)) + '</td><td class="sd-flags">' + flags.join(' ') + '</td></tr>';
     }).join('');
     var roundingNote = course.settings.rounding === 'integer' ? 'rounded to a whole number' : course.settings.rounding === 'hundredth' ? 'rounded to 0.01' : '';
@@ -1646,7 +2066,9 @@
       (r.curve ? '<tr><th scope="row" colspan="5">Curve ' + ui.placeholderBadge(course, 'curve', { compact: true }) + '</th><td class="num">' + esc(signed(r.curve)) + '</td><td></td></tr>' : '') +
       '<tr class="sd-total-row"><th scope="row" colspan="5">Total' + (roundingNote ? ' <span class="muted small">(' + roundingNote + ')</span> ' +
         ui.placeholderBadge(course, 'rounding', { compact: true }) : '') + '</th>' +
-      '<td class="num"><strong>' + esc(fmt(r.total)) + '</strong></td><td>' + (r.letter ? '<span class="badge badge-accent">' + esc(r.letter) + '</span>' : '') + '</td></tr>' +
+      '<td class="num"><strong>' + esc(fmt(r.total)) + '</strong></td><td>' + (fi.letter !== null
+        ? '<span class="badge ' + (fi.valid ? 'badge-accent' : 'badge-danger') + '" title="Final letter (assigned by hand)">' + esc(fi.letter) + ' · final</span>'
+        : (r.letter ? '<span class="badge" title="Suggested letter from the cutoffs; no final letter yet">' + esc(r.letter) + ' · suggested</span>' : '')) + '</td></tr>' +
       '</tfoot></table></div></section>';
 
     h += attendanceHtml(course, sid);
@@ -1689,6 +2111,7 @@
     var closed = false;
     var lastHtml = null;
     var closeDialog = null;
+    var repainting = false; // true while paint() replaces the content
 
     function currentCourse() { return model.findCourse(GT.store.state, courseId); }
 
@@ -1699,9 +2122,22 @@
         : '<div class="empty-state"><h2>Course not found</h2></div>';
       if (html === lastHtml) return; // unchanged (e.g. an autosave notification): keep focus and typed notes
       var focus = captureFocus(body);
-      body.innerHTML = html;
+      // Drop-downs browsed to with the keyboard and not saved yet keep their shown value across a re-render.
+      var pending = ui.$$('[data-sd-pending]', body).map(function (x) { return { fk: x.getAttribute('data-fk'), value: x.value }; });
+      repainting = true; // removing a focused drop-down can fire focusout: that is not "leaving the list"
+      try {
+        body.innerHTML = html;
+      } finally {
+        repainting = false;
+      }
       lastHtml = html;
       restoreFocus(body, focus);
+      pending.forEach(function (p) {
+        var x = p.fk ? body.querySelector('[data-fk="' + cssKey(p.fk) + '"]') : null;
+        if (!x || x.disabled) return;
+        x.value = p.value;
+        if (x.value === p.value) setPending(x, true);
+      });
     }
 
     function schedule() {
@@ -1735,8 +2171,134 @@
         GT.app.navigate('history', { studentId: studentId });
       }
     });
+    /** Final letter from the drop-down (letters stay editable when the scores are finalized). */
+    function saveFinalLetter(sel) {
+      var c = currentCourse();
+      var s = c && model.findStudent(c, studentId);
+      if (!s || sel.value === KEEP_CURRENT) return;
+      if (typeof model.setFinalLetter !== 'function') { ui.toast('Final letters are not available.', { type: 'warn' }); return; }
+      var next = sel.value === '' ? null : sel.value;
+      if (finalLetterOf(s) === next) return;
+      try {
+        GT.store.transact(next ? 'Set final letter' : 'Clear final letter', function (cc) {
+          model.setFinalLetter(cc, studentId, next);
+        }, { courseId: courseId });
+      } catch (err) {
+        ui.toast(err && err.message ? err.message : String(err), { type: 'error' });
+        lastHtml = null;
+        paint();
+      }
+    }
+
+    /** A score picked from an item's drop-down list (individually entered scores only; locked when finalized). */
+    function saveChoice(sel) {
+      var aid = sel.getAttribute('data-sd-choice');
+      var c = currentCourse();
+      var s = c && model.findStudent(c, studentId);
+      var a = c && model.findAssessment(c, aid);
+      if (!s || !a || sel.value === KEEP_CURRENT) return;
+      function refresh() { lastHtml = null; paint(); }
+      if (isLocked(c)) { ui.toast(LOCKED_MSG, { type: 'info' }); refresh(); return; }
+      var res = calc.resolveEntry(c, s, a);
+      if (res.source !== 'individual') { refresh(); return; }
+      var p = sel.value === '' ? { kind: 'empty' } : (typeof model.parseChoiceInput === 'function' ? model.parseChoiceInput(a, sel.value) : util.parseScoreInput(sel.value));
+      if (p.kind === 'invalid') { ui.toast(p.message || 'Choose a value from the list.', { type: 'warn' }); refresh(); return; }
+      var prev = model.getEntry(c.scores, studentId, aid);
+      var next = model.entryFromInput(p.kind === 'number' ? String(p.value) : '', prev, a.maxScore);
+      if (model.entryKey(prev) === model.entryKey(next) && entryText(prev) === entryText(next)) return;
+      try {
+        GT.store.transact('Edit ' + a.name + ' score', function (cc) {
+          model.setEntry(cc.scores, studentId, aid, model.isBlankEntry(next) ? null : next);
+        }, { courseId: courseId });
+      } catch (err) {
+        ui.toast(err && err.message ? err.message : String(err), { type: 'error' });
+        refresh();
+      }
+    }
+
+    // Drop-downs (Final letter, list scores). A pick from the opened list (mouse, or Enter in the list)
+    // saves at once. Browsing a closed list with the keyboard (arrows, Home/End, PageUp/PageDown, typing a
+    // letter) changes its value, and Chromium fires "change" on every key: those values are only shown
+    // ("Enter to save") until Enter, leaving the list (Tab, a click elsewhere) or closing the dialog, so one
+    // choice is one History entry and one undo step, as in the grid. Esc puts back the saved value.
+    var kbdSel = null; // the drop-down whose last value change came from keyboard browsing
+
+    function isDetailSelect(t) {
+      return !!t && t.tagName === 'SELECT' && (t.id === 'sd-final' || t.hasAttribute('data-sd-choice'));
+    }
+
+    function pendingHint(sel, on) {
+      var hint = body.querySelector('.sd-pending-hint');
+      if (!on) { if (hint && hint.parentNode) hint.parentNode.removeChild(hint); return; }
+      if (!hint) {
+        hint = document.createElement('div');
+        hint.className = 'sd-pending-hint no-print';
+        hint.setAttribute('role', 'status');
+        hint.textContent = 'Enter to save · Esc to cancel';
+      }
+      if (sel.nextElementSibling !== hint) sel.insertAdjacentElement('afterend', hint);
+    }
+
+    function setPending(sel, on) {
+      if (on) {
+        sel.setAttribute('data-sd-pending', '1');
+        sel.classList.add('is-pending');
+      } else {
+        sel.removeAttribute('data-sd-pending');
+        sel.classList.remove('is-pending');
+      }
+      pendingHint(sel, on);
+    }
+
+    /** Saves a drop-down's shown value if it has not been saved yet (one transaction). */
+    function commitSelect(sel) {
+      if (!sel || !sel.hasAttribute('data-sd-pending')) return;
+      setPending(sel, false);
+      if (sel.id === 'sd-final') saveFinalLetter(sel); else saveChoice(sel);
+    }
+
+    /** Esc on a drop-down with an unsaved value: show the saved value again. */
+    function revertSelect(sel) {
+      setPending(sel, false);
+      lastHtml = null;
+      paint();
+    }
+
+    var BROWSE_KEYS = { ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, Home: 1, End: 1, PageUp: 1, PageDown: 1 };
+    body.addEventListener('keydown', function (e) {
+      var t = e.target;
+      if (!isDetailSelect(t)) return;
+      var pending = t.hasAttribute('data-sd-pending');
+      if (e.key === 'Enter') {
+        if (pending) { e.preventDefault(); commitSelect(t); }
+        return;
+      }
+      if (e.key === 'Escape') {
+        if (pending) { e.preventDefault(); e.stopPropagation(); revertSelect(t); }
+        return;
+      }
+      if (e.key === 'Tab' || e.ctrlKey || e.metaKey) return;
+      // Alt+Up/Down, F4 and Space open the list: a pick there saves at once, like a mouse pick.
+      var browse = !e.altKey && (BROWSE_KEYS[e.key] === 1 || (e.key.length === 1 && e.key !== ' '));
+      kbdSel = browse ? t : null;
+    });
+    body.addEventListener('mousedown', function (e) {
+      if (isDetailSelect(e.target)) kbdSel = null;
+    }, true);
+    body.addEventListener('focusout', function (e) {
+      if (repainting || !isDetailSelect(e.target)) return;
+      commitSelect(e.target);
+      if (kbdSel === e.target) kbdSel = null;
+    });
+
     body.addEventListener('change', function (e) {
-      if (e.target && e.target.id === 'sd-notes') saveNotes(e.target.value);
+      var t = e.target;
+      if (!t) return;
+      if (t.id === 'sd-notes') saveNotes(t.value);
+      else if (isDetailSelect(t)) {
+        setPending(t, true);
+        if (kbdSel !== t) commitSelect(t);
+      }
     });
 
     paint();
@@ -1750,6 +2312,7 @@
       onMount: function (dlg, close) { dlg.classList.add('student-dlg'); closeDialog = close; }
     }).then(function () {
       var notes = body.querySelector('#sd-notes');
+      ui.$$('[data-sd-pending]', body).forEach(commitSelect); // a letter or score browsed to but not saved yet
       closed = true;
       unsub();
       document.body.classList.remove('print-student');

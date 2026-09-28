@@ -520,10 +520,12 @@
       ['PageUp / PageDown', 'Move 10 rows'],
       ['Ctrl+Arrow', 'Jump to the edge of the grid'],
       ['Delete / Backspace', 'Clear the selected cells'],
+      ['Alt+↓', 'Open a drop-down list (Final letter, participation, Team)'],
+      ['Shift+Arrow, then Enter', 'Give every selected row the same final letter or list value'],
       ['Esc', 'Cancel editing'],
       ['Ctrl+C / Ctrl+V', 'Copy / paste a block (works with Excel)'],
       ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
-      ['Shift+F10 or menu key', 'Cell actions (override, late work)'],
+      ['Shift+F10 or menu key', 'Cell and column actions (override, fill or clear a column, final letters)'],
       ['/', 'Search students'],
       ['Alt+1 … Alt+8', 'Switch tabs'],
       ['?', 'Show this list']

@@ -86,14 +86,17 @@ Course = {
   settings: Settings,
   placeholders: { [key]: { confirmed: boolean, confirmedAt: iso|null } },
   exportPresets: ExportPreset[],      // user presets (built-in default preset is generated, stage 4)
+  finalized: null | { at: iso, note: string },   // STAGE2B: scores locked in the grid (letters stay editable)
   history: HistoryEntry[]             // append-only change log (G5)
 }
 
 Assessment = { id: 'a_…', name: 'Project I', maxScore: 100, weight: 10, teamGraded: true,
-               category: 'project'|'test'|'participation'|'paper'|'other' }   // maxScore > 0, weight >= 0
+               category: 'project'|'test'|'participation'|'paper'|'other',   // maxScore > 0, weight >= 0
+               choices: null | { step: number } }   // DECISIONS 8: drop-down list max, max − step, …, 0
 Team       = { id: 't_…', name: 'Team 1' }
 Student    = { id: 's_…', no: 1, lastName: 'Student 01', firstName: 'Alpha',
-               teamId: 't_…'|null, status: 'active'|'withdrawn', notes: '' }
+               teamId: 't_…'|null, status: 'active'|'withdrawn', notes: '',
+               finalLetter: string|null }   // STAGE2B: the letter assigned by hand (null = none yet)
 
 ScoreEntry = {
   value: number|null,      // numeric score as entered (null = empty or invalid)
@@ -132,12 +135,18 @@ Attendance = {                        // stage 3 fills in behavior; shape exists
 |---|---|---|---|
 | code / title | SE 4351 / Requirements Engineering | SE 6362 / Software Architectural Design | New Course / Untitled course |
 | level | undergraduate | graduate | undergraduate |
-| assessments | Project I 10 (team), Project II 20 (team), Test 1 25, Test 2 40, Class/Project Participation 5 | same + Term Paper 0 (category 'paper') | same as SE4351 |
+| assessments | Project I 10 (team), Project II 20 (team), Test 1 25, Test 2 40, Class/Project Participation 5 (max **5**, drop-down step 0.5) | same + Term Paper 0 (category 'paper') | same as SE4351 |
 | letter scale | A+ 97, A 93, A- 90, B+ 87, B 83, B- 80, C+ 77, C 73, C- 70, D+ 67, D 63, D- 60, F 0 | A 93, A- 90, B+ 87, B 83, B- 80, C+ 77, C 70, F 0 | undergraduate |
 | passingLetter | D- | C | D- |
 | attendance.mode | per-session, 26 TR sessions 2026-09-03 → 2026-12-08 minus 11-24, 11-26 | off, same session list prefilled | off, no sessions |
 
 Assessment ids are stable per template: `a_p1, a_p2, a_t1, a_t2, a_part, a_paper` (new ones use `util.uid('a')`).
+
+Max scores (DECISIONS 1, 8): every template assessment is out of 100 with free entry (`choices: null`), except
+Class/Project Participation (`a_part`, category `'participation'`): `maxScore: 5`, `weight: 5`,
+`choices: { step: 0.5 }`, in all three templates. That is the previous TA's sheet (5 = full marks): with
+weight 5 the raw score equals the weighted points, and the grid offers 5, 4.5, …, 0.5, 0 plus "(empty)".
+Courses saved before this change keep what they have (no migration: grades are never changed silently).
 
 Default state (`model.createDefaultState()`): both template courses with **no students**, SE4351 active.
 
@@ -156,14 +165,17 @@ courses get generic notes.
 `model.isConfirmed(course, key)`.
 `model.unconfirmedPlaceholders(course)` returns `[{ key, label, note, … }]` still unconfirmed.
 Editing a value never auto-confirms; the user clicks "Mark confirmed" (and can undo that).
+The `maxScores` note says every item defaults to max 100 except Class/Project Participation, which is out of
+5 like the previous TA's sheet (5 = full marks), picked from a drop-down list in steps of 0.5.
 
 ### 2.3 Helpers
 
 Factories and constants:
 
-- `model.createDefaultState()`, `model.createCourse(template, overrides?)` (unknown template → `'custom'`),
-  `model.createStudent(fields)`, `model.createTeam(name, id?)`, `model.createAssessment(fields)`
-  (maxScore must be > 0, else 100; weight must be >= 0, else 0).
+- `model.createDefaultState()`, `model.createCourse(template, overrides?)` (unknown template → `'custom'`;
+  `finalized: null`), `model.createStudent(fields)` (`finalLetter` null unless a string with visible text is
+  given), `model.createTeam(name, id?)`, `model.createAssessment(fields)` (maxScore must be > 0, else 100;
+  weight must be >= 0, else 0; `choices` through `normalizeChoices`, default null).
 - `model.TEMPLATES`, `model.FALL_2026_TR`, `model.generateSessions({ start, end, weekdays, exclude })`
   (ids `ses_YYYYMMDD`), `model.defaultSettings(level)`, `model.defaultAttendance(mode, sessions)`,
   `model.defaultLetterScale(level)`, `model.defaultPassingLetter(level)`, `model.ROUNDING_MODES`,
@@ -185,7 +197,11 @@ A stored score above that limit becomes invalid text (shown and highlighted, cou
 - `model.normalizeState(raw)` → fills defaults, repairs shapes, throws `Error` with a readable message
   for data that is not a Grade Tracker state; `raw.app` must be `'grade-tracker'`. `model.normalizeCourse(course)`
   likewise (assessment weights < 0 → 0, maxScore <= 0 → 100, latePointsPerWeek < 0 → 0, letter scale via
-  `normalizeLetterScale`, duplicate ids made unique, including export preset ids).
+  `normalizeLetterScale`, duplicate ids made unique, including export preset ids). STAGE2B fields:
+  `Student.finalLetter` is kept as any string with visible text, **even when it is not a letter of the
+  scale** (calc reports `finalLetterValid: false` and the UI warns; it is never dropped), else null;
+  `Course.finalized` is kept only as `{ at: non-empty string, note: string }` (a missing note becomes `''`,
+  extra keys are dropped), else null; `Assessment.choices` only when `normalizeChoices` accepts it.
 - `model.wrapBackup(state, isoNow)` → `{ app:'grade-tracker', kind:'backup', schemaVersion, exportedAt, state }`
 - `model.readBackup(obj)` → `{ state, summary: { exportedAt, courses: [{code, title, students}] } }` or throws.
   Accepts the wrapped format (inner state may omit `app`) or a bare state that has `app: 'grade-tracker'`.
@@ -262,6 +278,58 @@ shown with a marker (written agreement needed), so the model never creates an **
 - `model.removeAssessment(course, assessmentId)` → deletes the item and every score for it (individual
   entries, overrides, team scores); returns false when it did not exist. Export presets are left alone:
   the exporter skips columns that reference a missing assessment.
+- `splitAssessment` gives the new parts the original's `choices` too.
+
+### 2.4 Drop-down lists (DECISIONS 8)
+
+`Assessment.choices` is `null` (free numeric entry, the default) or `{ step }`. The list is
+`max, max − step, …` while above 0, then `0` (each value through `util.fix`). Examples: max 5 step 0.5 → 11
+values `5, 4.5, …, 0.5, 0`; max 5 step 2 → `5, 3, 1, 0`; max 5 step 0.1 → 51 values.
+
+- `model.MAX_CHOICE_STEPS` = 200. `model.normalizeChoices(choices, maxScore)` → `{ step }` when `step` is a
+  sane number > 0 and `fix(maxScore / step) <= 200` (max 100 step 0.5 is allowed: 201 values), else null.
+  Changing an item's max score can make its stored `choices` invalid; the helpers below then treat the item
+  as free entry, and `normalizeCourse` drops the list.
+- `model.choiceValues(assessment)` → number[] highest first (`[]` without a valid list; a new array on every
+  call); `model.hasChoices(assessment)`; `model.describeChoices(assessment)` → `'0–5 in steps of 0.5'` (`''`
+  without a list). The list is built once per assessment object and remembered (a `WeakMap` keyed by the
+  assessment, rebuilt when its `maxScore` or `choices.step` changed), so `calc` checking every score against
+  a 201-value list costs one lookup per score, not a rebuild.
+- `model.isChoiceValue(assessment, value)` → true when `util.fix(value)` is one of the values (so
+  4.500000000000001 matches 4.5); false for non-numbers and for items without a list.
+- `model.parseChoiceInput(assessment, input)` → strict entry for a drop-down cell (typing, paste, import):
+  `{ kind: 'empty' }` for blank text; `{ kind: 'number', value }` when the text is a list value (`'4.50'` and
+  `'90%'` of 5 give 4.5); otherwise `{ kind: 'invalid', text, message: 'Choose a value from the list (0–5 in
+  steps of 0.5).' }`, which the UI shows and **does not store**. Without a list it is `util.parseScoreInput`.
+- Values not on the list (restored, imported) are kept; calc flags them with `notOnList` (section 3).
+
+### 2.5 Final letters and finalizing (STAGE2B, DECISIONS 2)
+
+The letter from the cutoffs is only a **suggestion**; the instructor assigns every final letter by hand,
+usually in bands after sorting by total. Once final letters are assigned, **they are the grades**:
+statistics, the pass rate, the letter distribution, the export column "Letter Grade" and the summary view
+use `effectiveLetter` (section 3).
+
+- `model.finalLetterOf(student)` → the stored letter or null (blank strings count as none).
+- `model.scaleLetters(course)` → the scale's letters, highest cutoff first, each once (the drop-down order);
+  `model.isScaleLetter(course, letter)` (exact match).
+- `model.matchLetter(course, text)` → the scale letter that typed or pasted text means, or null: exact match
+  first, else case-insensitive, ignoring spaces, with dash variants read as `-` (`'b+'` → `'B+'`, `'A−'` → `'A-'`).
+- `model.setFinalLetter(course, studentId, letter|null)` → true when the stored letter changed. `null`,
+  `undefined` or blank text clears it. A letter not in the scale (after `matchLetter`) **throws** an `Error`
+  with a readable message listing the scale; the student is unchanged. Unknown student → false.
+- `model.setFinalLetters(course, [{ studentId, letter }])` (band assignment, paste) → `{ changed, skipped,
+  skippedItems: [{ studentId, letter, reason: 'letter'|'student' }] }`; invalid letters and unknown students
+  are skipped, never thrown. Use it inside one `GT.store.transact` for ONE undo step.
+- `model.copySuggestedToFinal(course, results, { onlyEmpty = true, activeOnly = true })` → number of letters
+  that changed. Copies `results.byId[id].letter` (from `calc.computeCourse`); with `onlyEmpty` a letter already
+  set stays (an invalid one included); with `activeOnly` withdrawn students are skipped; suggestions that are
+  not scale letters and students without a result are skipped.
+- `model.finalize(course, isoNow, note)` → sets and returns `course.finalized = { at, note }` (`at` defaults
+  to now; finalizing again replaces both). `model.unfinalize(course)` → `finalized = null`, true when it was
+  finalized. `model.isFinalized(course)`; `model.normalizeFinalized(x)`.
+- Sample data (`GT.sample.loadInto`) has no final letters, sets `finalized = null`, and gives participation
+  list values (3 … 5 in steps of 0.5; other values are unchanged, each assessment keeps its own PRNG stream).
 
 ## 3. Calculations (`GT.calc`) — K1–K8
 
@@ -285,10 +353,12 @@ numbers >= 0 only (no fractions, no `%`). `roundTo(x, d)` is Excel `ROUND` (half
 - `calc.latePenalty(entry, assessment, settings)` → `waived || !weeksLate ? 0 : weeksLate * latePointsPerWeek * maxScore / 100`,
   and 0 when `latePointsPerWeek` or `maxScore` is not positive (never negative).
 - `calc.scoreDetail(course, student, assessment)` →
-  `{ assessmentId, state, raw, text, source, teamId, override, missing, outOfRange, weeksLate, waived,
-     penalty, adjusted, weighted, weightedUnrounded }` where
+  `{ assessmentId, state, raw, text, source, teamId, override, missing, outOfRange, notOnList, weeksLate,
+     waived, penalty, adjusted, weighted, weightedUnrounded }` where
   - `missing = state !== 'number'` (empty and invalid count as 0; invalid is also flagged),
   - `outOfRange = state === 'number' && (raw < 0 || raw > maxScore)` (value is still used as entered),
+  - `notOnList = state === 'number'` and the item has a drop-down list and `!model.isChoiceValue(raw)`:
+    the value is kept, highlighted ("Not one of the list values") and still counted. Always a boolean.
   - `adjusted = max(0, raw - penalty)` when a late penalty applies, else `raw`; `null` when missing,
   - `weightedUnrounded = missing || maxScore <= 0 ? 0 : adjusted * weight / maxScore` (used for the sum),
   - `weighted = fix(weightedUnrounded)` (display value).
@@ -296,13 +366,22 @@ numbers >= 0 only (no fractions, no `%`). `roundTo(x, d)` is Excel `ROUND` (half
   (half away from zero, same as Excel `ROUND`).
 - `calc.letterFor(total, scale)` → first entry (scale sorted by `min` descending) with `total >= min`,
   compared after `fix`; below every cutoff → the last letter (F).
+- `calc.letterIndex(scale, letter)` → position in the scale sorted by `min` descending (0 = best letter),
+  −1 when the letter is not in the scale. Use it to compare letters (order issues, pass rate).
 - `calc.studentResult(course, student)` →
   `{ studentId, active, items: {aid: detail}, weightedSum, curve, totalUnrounded, total, letter,
-     incomplete, missingCount, invalidCount, outOfRangeCount, overrideCount, lateCount }`
+     finalLetter, finalLetterValid, effectiveLetter, letterSource, letterDiffers, orderIssue,
+     incomplete, missingCount, invalidCount, outOfRangeCount, notOnListCount, overrideCount, lateCount }`
   - `weightedSum = fix(Σ weightedUnrounded)`, `totalUnrounded = fix(weightedSum + curve)`, `total = roundTotal(totalUnrounded)`.
   - `incomplete = missingCount > 0` counting only assessments with `weight > 0`.
-- `calc.computeCourse(course)` → `{ byId: {sid: result + rank, percentile, diffFromAverage},
-   activeIds, average, weights: { sum, ok } }`
+  - `letter` is the **suggested** letter from the cutoffs (the grid's "Suggested" column).
+  - `finalLetter` = `model.finalLetterOf(student)` (null when none). `finalLetterValid` = no final letter, or
+    it is a letter of the current scale (false after a scale change removed it; the letter is kept).
+  - `effectiveLetter` = `finalLetter` when one is set (valid or not), else `letter`; `letterSource` =
+    `'manual'` | `'cutoffs'`; `letterDiffers` = a final letter is set and differs from `letter`.
+  - `orderIssue` is false here; `computeCourse` sets it for students in an `orderIssues` pair.
+- `calc.computeCourse(course)` → `{ byId: {sid: result + rank, percentile, diffFromAverage, orderIssue},
+   activeIds, average, weights: { sum, ok }, orderIssues, letterSummary }`
   - Active = `status === 'active'`. Withdrawn students get `rank = percentile = diffFromAverage = null`.
   - `average` = mean of active `total` (null when none).
   - Rank: competition ranking by `total` descending among active (1, 2, 2, 4).
@@ -310,6 +389,16 @@ numbers >= 0 only (no fractions, no `%`). `roundTo(x, d)` is Excel `ROUND` (half
   - `diffFromAverage = fix(total − average)`.
   - A non-finite total (only possible when code sets absurd weights; normalize rejects them) is left out
     of `average`, rank and percentile (those stay null for that student); `activeIds` lists every active student.
+  - `orderIssues` = `calc.findOrderIssues(course, studentResults[])`: among **active** students with a finite total
+    and a final letter **of the scale**, sorted by total descending (ties by name), every pair where the
+    student with the strictly lower total holds a strictly higher final letter (smaller `letterIndex`), as
+    `[{ higherTotalId, lowerTotalId }]` in that order. Equal totals (after `fix`) never form a pair; students
+    without a final letter, with a letter outside the scale, or withdrawn are not compared.
+  - `letterSummary` = `{ active, assigned, unassigned, manualDiffers, invalid }` over active students:
+    `assigned` has a final letter, `unassigned` has none (`assigned + unassigned = active`), `manualDiffers`
+    has `letterDiffers`, `invalid` has a final letter outside the scale.
+  - Once final letters are assigned they are the grades: statistics, pass rate, letter distribution,
+    exports ("Letter Grade") and the summary view use `effectiveLetter`.
 - `calc.weightStatus(course)` → `{ sum, ok: |sum − 100| < 1e-9 and no weight < 0 }`.
 - `calc.minTotalForLetter(letter, settings)` → smallest `totalUnrounded` (after curve, before rounding)
   that earns `letter`: the cutoff with rounding `'none'`, `ceil(cutoff) − 0.5` with `'integer'`, the cutoff
@@ -331,11 +420,13 @@ when waived or not late; empty → 0), total `=ROUND(SUM(weighted cells) + curve
 ## 4. Change history (`GT.history`) — G5
 
 `HistoryEntry = { id, ts, source, kind, studentId, studentName, teamId, teamName, field, fieldKey,
-oldValue, newValue, note }` — values are display strings (`''` = empty), names are snapshots.
+oldValue, newValue, note }` — values are display strings (`''` = empty), names are snapshots. The
+"Final letters: n changed" summary also carries `details` (see Final letters below).
 
 - `source`: `'edit'|'paste'|'undo'|'redo'|'import'|'restore'|'sample'|'roster'|'system'`.
-- `kind`: `'score'|'team-score'|'propagation'|'override'|'override-removed'|'late'|'status'|
-  'team-membership'|'student'|'settings'|'attendance'|'bulk'`.
+- `kind`: `'score'|'team-score'|'propagation'|'override'|'override-removed'|'late'|'final-letter'|'status'|
+  'team-membership'|'student'|'settings'|'attendance'|'bulk'`. `history.KIND_LABELS` names each kind
+  (`'final-letter'` → "Final letter"); `history.KIND_GROUPS` puts `'final-letter'` in the **grades** group.
 - `history.diffCourse(before, after, { ts, source })` → entries for every difference in:
   assessments (name/max/weight/team flag, added/removed), grade settings (curve, rounding, letter cutoffs,
   latePointsPerWeek, passingLetter), students (added/removed/name/no/status/team), team scores, individual
@@ -343,7 +434,36 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   student that changed without an individual entry change (kind `'propagation'`, note
   `"From <team> team score"`). Attendance changes (stage 3) are logged per student when a transaction
   changes ≤ 5 marks, otherwise as one `'attendance'` summary entry.
+  Group order: course details and settings, assessments, placeholders, teams, students, team scores,
+  individual entries, propagation, final letters, attendance.
+- Final letters (STAGE2B): for students present before and after, a changed `finalLetter` gives kind
+  `'final-letter'`, field "Final letter", fieldKey `'student.finalLetter'`, old/new letter (`''` = none), in
+  name order. More than `history.LETTER_LIMIT` (10) changes in one transaction give ONE summary entry:
+  kind `'final-letter'`, field "Final letters", fieldKey `'finalLetters'`, newValue `"<n> changed"` (shown
+  as "Final letters: n changed"), note `"Students No 1, 2, …, 10, …; A ×4, B ×3, cleared ×1"` (up to 10
+  students by No, then the count per new letter in scale order). The summary also keeps **every** change in
+  `details: [{ studentId, studentName, no, oldValue, newValue }]` (name order; `studentName` is a snapshot,
+  `no` a number or null), so a band-assigned letter stays traceable per student. Added or deleted students
+  are covered by their own entries, whose notes name the final letter (`"No 5, Team 1. Scores, overrides,
+  attendance and the final letter (A) were deleted with the student"`; an added student with a letter,
+  e.g. an undone deletion: `"No 5, Team 1, final letter A"`). A scale change never rewrites or logs final
+  letters.
+- Reading summary details: `history.entryDetails(entry)` → the well-formed `details` items (`[]` for any
+  other entry; stored data is read defensively); `history.detailFor(entry, studentId)` → that student's item
+  or null; `history.involvesStudent(entry, studentId)` → true when `entry.studentId` is the student or a
+  detail names them. The History view's student filter matches with `involvesStudent`.
+- Finalizing (STAGE2B): a change of `course.finalized` gives kind `'settings'`, field "Scores finalized",
+  fieldKey `'course.finalized'`, values `'no'` / `'yes (YYYY-MM-DD)'` (local date of `at`); the note says the
+  score cells were locked (plus the finalize note) or unlocked. Finalizing again with a new date or note is
+  logged too.
+- Drop-down lists (DECISIONS 8): a change of `Assessment.choices` gives kind `'settings'`, field
+  `"<name>: drop-down list"`, fieldKey `'assessment:<aid>.choices'`, values `'no'` / `'yes (steps of 0.5)'`.
+  Added/removed assessments with a list are described as `"… (weight 5%, max 5, drop-down list in steps of 0.5)"`.
 - `history.bulkEntry({ ts, source, field, note })` for summary-only transactions (e.g., loading sample data).
+- `history.toRows(entries, { studentId })` → `[header, ...rows]` for the CSV export (columns Timestamp,
+  Source, Kind, Student, Team, Field, Old value, New value, Note, User note, User note time). A summary with
+  `details` is followed by one row per student (Field "Final letter", Note `Part of "Final letters: 12
+  changed"`); `studentId` limits those rows to one student.
 - Entries may carry `userNote` / `userNoteAt`, a free-text note the TA adds later (e.g. "changed per
   instructor email, Oct 12") via `GT.store.annotateHistory(entryId, text)`. The log is otherwise append-only.
 
@@ -386,3 +506,46 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `navigate('history', { studentId })`, `navigate('grades', { studentId, assessmentId })`.
 - Shared widgets: `GT.ui.dialog.confirm/prompt/open`, `GT.ui.toast(message, { type })`,
   `GT.ui.download(filename, blobOrText, mime)`, `GT.ui.loadExcel()`, `GT.ui.icon(name)` (inline SVG).
+
+### 6.1 Final grades in the UI (STAGE2B, DECISIONS 2, 5–8)
+
+- **Grades grid** (`js/ui/grid.js`):
+  - Columns: "Suggested" (read-only `r.letter` from the cutoffs, with the placeholder badge) and "Final
+    letter" (drop-down of `model.scaleLetters` plus "(none)"; markers: a dot when `letterDiffers`, a warning
+    icon for a student in `orderIssues`, red when `finalLetterValid` is false).
+  - Drop-down cells: an assessment with `choices` and the Final letter open a native `<select>` on Enter, F2,
+    double-click, Alt+↓ or the ▾ button. Typing a list value (or a letter such as `b+`) stores it directly;
+    anything else is refused with a toast and never stored. Paste and Ctrl+Enter fill validate the same way.
+    Off-list values that are already stored are kept and shown yellow ("Not one of the list values").
+  - Band assignment: with several rows selected, choosing or typing a value applies it to every selected
+    active row in ONE transaction (withdrawn rows are skipped and reported); the cursor then waits on the
+    row below the band. While sorted by Total (high to low) and not grouped, `tr.band-end` draws a rule
+    between consecutive active rows whose final letters differ.
+  - Column ⋯ menu on every raw-score header (also Shift+F10 in a cell): "Fill empty cells of active
+    students with…", "Set every active student to…", "Clear column…" — each ONE transaction; team-graded
+    columns write team scores.
+  - Finalize / unlock: "Finalize scores…" shows a data check, then `model.finalize` in one transaction and a
+    fresh sort by Total, high to low. Finalized (`model.isFinalized`): score, team, override, name, No and team
+    cells (participation included) are read-only and refuse edits with the toast "Scores are finalized.
+    Unlock them to edit."; final letters stay editable. The banner's "Unlock scores…" confirms, then
+    `model.unfinalize`. Both steps are logged (section 4). `GT.gridCellMenuExtensions` ctx gets `finalized`.
+  - Stable row order (DECISIONS 7): rows are a snapshot of student ids, taken again only when the sort,
+    search, withdrawn filter, grouping, Meeting view, course or the set of students changes, or on
+    "Order changed: re-sort" (`[data-act="resort"]`, shown when the snapshot differs from a fresh sort).
+  - Meeting view (`gridPrefs.meeting`, the previous sort in `gridPrefs.meetingPrev`): No, Last, First, the
+    raw scores, Total, the absence columns, participation, Suggested, Final letter, Rank; sorted by Total,
+    high to low; larger text; participation and Final letter marked "fill in the meeting".
+  - Absence columns "Excused (allowed)", "Unexcused (not allowed)", "Total absences" (toggles
+    `gridPrefs.cols.attExcused / attUnexcused / attTotal`) appear when attendance is not off and
+    `GT.attendance.summary(course, studentId)` exists. Stage 3 must return `{ excused, unexcused,
+    totalAbsences, recorded, warning, longestStreak, overThreshold, overTotalThreshold }`.
+- **Cross-view**: `GT.ui.openFinalize()` opens the grid's Finalize dialog from any view (it switches to
+  Grades first). Settings has a "Grading status" card (`navigate('settings', { section: 'status' })`) with
+  Finalize / Unlock, the final-letter counts and "Copy suggested letters into empty final letters".
+- **Settings when finalized**: weights, max scores, rounding, curve and cutoffs show "Scores are finalized:
+  changing this changes totals." (cutoffs: "…changes the suggested letters") and confirm with the impact
+  before saving. Each assessment has a "Drop-down list" toggle and step (`max / step ≤ 200`; a max score
+  that would break the list is refused).
+- **Students**: the table has a read-only Final letter column; `GT.ui.openStudent(id)` shows the suggested
+  letter, an editable Final letter select (`#sd-final`) and a select for each individually entered item with
+  a list (disabled when finalized). Team scores are read-only when finalized.

@@ -92,8 +92,10 @@
       { id: 'a_p2', name: 'Project II', maxScore: 100, weight: 20, teamGraded: true, category: 'project' },
       { id: 'a_t1', name: 'Test 1', maxScore: 100, weight: 25, teamGraded: false, category: 'test' },
       { id: 'a_t2', name: 'Test 2', maxScore: 100, weight: 40, teamGraded: false, category: 'test' },
-      { id: 'a_part', name: 'Class/Project Participation', maxScore: 100, weight: 5, teamGraded: false, category: 'participation' }
-    ];
+      // Out of 5 like the previous TA's sheet (5 = full marks), so the raw score equals the weighted
+      // points; picked from a drop-down list 5, 4.5, ..., 0 (DECISIONS 1 and 8).
+      { id: 'a_part', name: 'Class/Project Participation', maxScore: 5, weight: 5, teamGraded: false, category: 'participation', choices: { step: 0.5 } }
+    ].map(createAssessment);
   }
 
   var TEMPLATES = {
@@ -106,7 +108,7 @@
       code: 'SE 6362', title: 'Software Architectural Design', level: 'graduate',
       assessments: function () {
         var a = baseAssessments();
-        a.push({ id: 'a_paper', name: 'Term Paper', maxScore: 100, weight: 0, teamGraded: false, category: 'paper' });
+        a.push(createAssessment({ id: 'a_paper', name: 'Term Paper', maxScore: 100, weight: 0, teamGraded: false, category: 'paper' }));
         return a;
       },
       attendanceMode: 'off', sessions: FALL_2026_TR
@@ -151,7 +153,11 @@
     },
     maxScores: {
       label: 'Max scores',
-      note: function () { return 'Every assessment defaults to a max score of 100 until the real maximums are known.'; }
+      note: function () {
+        return 'Every assessment defaults to a max score of 100 until the real maximums are known, except ' +
+          'Class/Project Participation, which is out of 5 like the previous TA\'s sheet (5 = full marks; ' +
+          'weight 5%, so the score equals the points added to the total), chosen from a drop-down list in steps of 0.5.';
+      }
     },
     projectSplit: {
       label: 'Project split',
@@ -263,6 +269,7 @@
       settings: defaultSettings(t.level),
       placeholders: {},
       exportPresets: [],
+      finalized: null,
       history: []
     };
     if (overrides) {
@@ -298,7 +305,8 @@
       firstName: f.firstName ? String(f.firstName).trim() : '',
       teamId: f.teamId || null,
       status: f.status === 'withdrawn' ? 'withdrawn' : 'active',
-      notes: f.notes ? String(f.notes) : ''
+      notes: f.notes ? String(f.notes) : '',
+      finalLetter: cleanFinalLetter(f.finalLetter)
     };
   }
 
@@ -306,17 +314,254 @@
     return { id: id || util.uid('t'), name: name || 'Team' };
   }
 
-  /** New assessment. A max score must be above 0 (else 100) and a weight at least 0 (else 0). */
+  /** New assessment. A max score must be above 0 (else 100) and a weight at least 0 (else 0).
+   * `choices` is kept only when it is a valid drop-down list for that max score (normalizeChoices). */
   function createAssessment(fields) {
     var f = fields || {};
+    var maxScore = util.isSaneNumber(f.maxScore) && f.maxScore > 0 ? f.maxScore : 100;
     return {
       id: f.id || util.uid('a'),
       name: f.name ? String(f.name) : 'New assessment',
-      maxScore: util.isSaneNumber(f.maxScore) && f.maxScore > 0 ? f.maxScore : 100,
+      maxScore: maxScore,
       weight: util.isSaneNumber(f.weight) && f.weight >= 0 ? f.weight : 0,
       teamGraded: !!f.teamGraded,
-      category: f.category || 'other'
+      category: f.category || 'other',
+      choices: normalizeChoices(f.choices, maxScore)
     };
+  }
+
+  // ---------------------------------------------------------------- drop-down lists (DECISIONS 8)
+
+  /** Longest drop-down list kept: maxScore / step may be at most this (201 values with 0). */
+  var MAX_CHOICE_STEPS = 200;
+
+  /** Cleans an assessment's `choices` for its max score: { step } when step is a sane number above 0
+   * and maxScore / step <= MAX_CHOICE_STEPS; otherwise null (free numeric entry). Returns a new object. */
+  function normalizeChoices(choices, maxScore) {
+    if (!util.isPlainObject(choices)) return null;
+    var step = choices.step;
+    if (!util.isSaneNumber(step) || !(step > 0)) return null;
+    if (!util.isSaneNumber(maxScore) || !(maxScore > 0)) return null;
+    if (util.fix(maxScore / step) > MAX_CHOICE_STEPS) return null;
+    return { step: step };
+  }
+
+  var NO_CHOICES = { values: [], set: new Set() };
+
+  /** The list for a max score and a stored `choices` value: { values (highest first), set }. */
+  function buildChoiceList(choices, maxScore) {
+    var c = normalizeChoices(choices, maxScore);
+    if (!c) return NO_CHOICES;
+    var values = [];
+    for (var k = 0; k <= MAX_CHOICE_STEPS; k++) {
+      var v = util.fix(maxScore - k * c.step);
+      if (!(v > 0)) break;
+      values.push(v);
+    }
+    values.push(0);
+    return { values: values, set: new Set(values) };
+  }
+
+  /** Lists already built, per assessment object. calc checks every score of a drop-down item against
+   * its list (students x assessments per computeCourse), so the up to 201 values are built once per
+   * assessment instead of once per score. Each memo records the maxScore and step it was built from and
+   * is rebuilt when either changed, so an assessment edited in place never reads a stale list. */
+  var choiceMemo = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  function choiceList(assessment) {
+    if (!util.isPlainObject(assessment)) return NO_CHOICES;
+    var choices = assessment.choices;
+    var step = util.isPlainObject(choices) ? choices.step : undefined;
+    var max = assessment.maxScore;
+    var m = choiceMemo ? choiceMemo.get(assessment) : null;
+    if (m && m.max === max && m.step === step) return m.list;
+    var list = buildChoiceList(choices, max);
+    if (choiceMemo) choiceMemo.set(assessment, { max: max, step: step, list: list });
+    return list;
+  }
+
+  /** The drop-down values of an assessment, highest first: max, max - step, ... while above 0, then 0
+   * (max 5, step 0.5 -> 5, 4.5, ..., 0.5, 0: 11 values; max 5, step 2 -> 5, 3, 1, 0). Values pass
+   * through util.fix, so 5 - 3 x 0.1 is 4.7. Empty when the assessment has no valid choices.
+   * Returns a new array each time (callers may change it). */
+  function choiceValues(assessment) {
+    return choiceList(assessment).values.slice();
+  }
+
+  /** True when the assessment has a (valid) drop-down list. */
+  function hasChoices(assessment) {
+    return choiceList(assessment).values.length > 0;
+  }
+
+  /** True when `value` is one of the assessment's drop-down values (compared after util.fix, so
+   * 4.5 and 4.500000000000001 match). False when the assessment has no drop-down list. */
+  function isChoiceValue(assessment, value) {
+    if (typeof value !== 'number' || !isFinite(value)) return false;
+    return choiceList(assessment).set.has(util.fix(value));
+  }
+
+  /** Human description of a drop-down list: '0–5 in steps of 0.5'; '' without a list. */
+  function describeChoices(assessment) {
+    var values = choiceValues(assessment);
+    if (!values.length) return '';
+    return '0–' + values[0] + ' in steps of ' + assessment.choices.step;
+  }
+
+  /** Reads typed or pasted text for a drop-down cell (DECISIONS 8: no invalid text is stored there):
+   * { kind: 'empty' } for blank text; { kind: 'number', value } when it is a list value (as the list
+   * spells it: "4.50" and "90%" of 5 give 4.5); otherwise { kind: 'invalid', text, message } with the
+   * message 'Choose a value from the list (0–5 in steps of 0.5).'. For an assessment without a list
+   * this is util.parseScoreInput (numbers and invalid text as usual). */
+  function parseChoiceInput(assessment, input) {
+    var max = util.isPlainObject(assessment) ? assessment.maxScore : undefined;
+    var p = util.parseScoreInput(input, max);
+    if (!hasChoices(assessment) || p.kind === 'empty') return p;
+    if (p.kind === 'number' && isChoiceValue(assessment, p.value)) return { kind: 'number', value: util.fix(p.value) };
+    return {
+      kind: 'invalid',
+      text: p.kind === 'number' ? String(p.value) : p.text,
+      message: 'Choose a value from the list (' + describeChoices(assessment) + ').'
+    };
+  }
+
+  // ---------------------------------------------------------------- final letters and finalizing (STAGE2B)
+
+  /** A stored final letter: any string with visible text (kept as is), else null. Whether it is a
+   * letter of the course's scale is reported by calc (finalLetterValid); it is never dropped here. */
+  function cleanFinalLetter(x) {
+    return typeof x === 'string' && x.trim() !== '' ? x : null;
+  }
+
+  /** The student's final letter, or null when none is set. */
+  function finalLetterOf(student) {
+    return student ? cleanFinalLetter(student.finalLetter) : null;
+  }
+
+  /** Letters of the course's scale, highest cutoff first (the order of the Final letter drop-down).
+   * Reads the scale defensively (unsorted or odd rows are fine); each letter appears once. */
+  function scaleLetters(course) {
+    var list = course && course.settings && Array.isArray(course.settings.letterScale) ? course.settings.letterScale : [];
+    var rows = [];
+    list.forEach(function (x, i) {
+      if (util.isPlainObject(x) && typeof x.letter === 'string' && x.letter !== '' && typeof x.min === 'number' && isFinite(x.min)) {
+        rows.push({ letter: x.letter, min: x.min, i: i });
+      }
+    });
+    rows.sort(function (a, b) { return (b.min - a.min) || (a.i - b.i); });
+    var out = [];
+    rows.forEach(function (x) { if (out.indexOf(x.letter) === -1) out.push(x.letter); });
+    return out;
+  }
+
+  /** True when `letter` is exactly a letter of the course's scale. */
+  function isScaleLetter(course, letter) {
+    return typeof letter === 'string' && scaleLetters(course).indexOf(letter) !== -1;
+  }
+
+  function letterKey(t) {
+    return String(t).replace(/[\u2010-\u2015\u2212]/g, '-').replace(/\s+/g, '').toUpperCase();
+  }
+
+  /** The scale letter that typed or pasted text means, or null: an exact match first, else a
+   * case-insensitive one that ignores spaces and reads dash variants as '-' ("b+" -> "B+",
+   * " a- " -> "A-", "A\u2212" -> "A-"). Null for empty text, non-strings or a letter not in the scale. */
+  function matchLetter(course, text) {
+    if (typeof text !== 'string' || text.trim() === '') return null;
+    var letters = scaleLetters(course);
+    if (letters.indexOf(text) !== -1) return text;
+    var key = letterKey(text);
+    var hits = letters.filter(function (l) { return letterKey(l) === key; });
+    return hits.length === 1 ? hits[0] : null;
+  }
+
+  /** Sets (or, with null / undefined / blank text, clears) a student's final letter. The letter must
+   * be in the course's scale (matched like matchLetter and stored as the scale spells it); anything
+   * else throws an Error with a readable message. Returns true when the stored letter changed; false
+   * when it did not, or when the student does not exist. */
+  function setFinalLetter(course, studentId, letter) {
+    var next = null;
+    if (letter !== null && letter !== undefined && !(typeof letter === 'string' && letter.trim() === '')) {
+      next = matchLetter(course, letter);
+      if (next === null) {
+        var shown = typeof letter === 'string' ? letter.trim() : String(letter);
+        throw new Error('"' + shown.slice(0, 40) + '" is not a letter of this course\'s scale (' + scaleLetters(course).join(', ') + ').');
+      }
+    }
+    var s = findStudent(course, studentId);
+    if (!s) return false;
+    var prev = finalLetterOf(s);
+    s.finalLetter = next;
+    return prev !== next;
+  }
+
+  /** Sets several final letters in one go (band assignment, paste): items = [{ studentId, letter }]
+   * (letter null clears). Invalid letters and unknown students are skipped, never thrown.
+   * Returns { changed, skipped, skippedItems: [{ studentId, letter, reason: 'letter'|'student' }] }. */
+  function setFinalLetters(course, items) {
+    var changed = 0, skippedItems = [];
+    (Array.isArray(items) ? items : []).forEach(function (it) {
+      var sid = util.isPlainObject(it) && it.studentId !== undefined ? it.studentId : null;
+      var letter = util.isPlainObject(it) && it.letter !== undefined ? it.letter : null;
+      if (!util.isPlainObject(it) || !findStudent(course, sid)) {
+        skippedItems.push({ studentId: sid, letter: letter, reason: 'student' });
+        return;
+      }
+      try {
+        if (setFinalLetter(course, sid, letter)) changed++;
+      } catch (e) {
+        skippedItems.push({ studentId: sid, letter: letter, reason: 'letter' });
+      }
+    });
+    return { changed: changed, skipped: skippedItems.length, skippedItems: skippedItems };
+  }
+
+  /** Copies each student's suggested letter (results.byId[id].letter from calc.computeCourse) into
+   * the final letter. opts: { onlyEmpty = true (letters already set stay, invalid ones included),
+   * activeOnly = true (withdrawn students are skipped) }. Suggestions that are not scale letters and
+   * students without a result are skipped. Returns the number of final letters that changed. */
+  function copySuggestedToFinal(course, results, opts) {
+    var o = opts || {};
+    var onlyEmpty = o.onlyEmpty !== false;
+    var activeOnly = o.activeOnly !== false;
+    var byId = results && util.isPlainObject(results.byId) ? results.byId : {};
+    var letters = scaleLetters(course);
+    var n = 0;
+    (course.students || []).forEach(function (s) {
+      if (activeOnly && s.status === 'withdrawn') return;
+      if (onlyEmpty && finalLetterOf(s) !== null) return;
+      var r = hasOwn(byId, s.id) ? byId[s.id] : null;
+      if (!r || typeof r.letter !== 'string' || letters.indexOf(r.letter) === -1) return;
+      if (finalLetterOf(s) !== r.letter) n++;
+      s.finalLetter = r.letter;
+    });
+    return n;
+  }
+
+  /** Marks the scores as finalized: course.finalized = { at, note }. The grid then locks score cells;
+   * final letters stay editable. Finalizing again replaces the date and note. Returns the new value. */
+  function finalize(course, isoNow, note) {
+    course.finalized = {
+      at: typeof isoNow === 'string' && isoNow !== '' ? isoNow : util.nowIso(),
+      note: typeof note === 'string' ? note : ''
+    };
+    return course.finalized;
+  }
+
+  /** Unlocks the scores (course.finalized = null). Returns true when the course was finalized. */
+  function unfinalize(course) {
+    var was = isFinalized(course);
+    course.finalized = null;
+    return was;
+  }
+
+  function isFinalized(course) {
+    return !!(course && util.isPlainObject(course.finalized) && typeof course.finalized.at === 'string' && course.finalized.at !== '');
+  }
+
+  /** A stored `finalized` value: { at, note } when `at` is a non-empty string (a missing note is ''), else null. */
+  function normalizeFinalized(x) {
+    if (!util.isPlainObject(x) || typeof x.at !== 'string' || x.at === '') return null;
+    return { at: x.at, note: typeof x.note === 'string' ? x.note : '' };
   }
 
   // ---------------------------------------------------------------- lookups
@@ -683,7 +928,7 @@
     parts.slice(1).forEach(function (p, k) {
       var a = createAssessment({
         name: p.name.trim(), weight: p.weight, maxScore: orig.maxScore,
-        teamGraded: orig.teamGraded, category: orig.category
+        teamGraded: orig.teamGraded, category: orig.category, choices: orig.choices
       });
       course.assessments.splice(i + 1 + k, 0, a);
       ids.push(a.id);
@@ -805,7 +1050,8 @@
         maxScore: num(a.maxScore, 100),
         weight: num(a.weight, 0),
         teamGraded: a.teamGraded === true,
-        category: typeof a.category === 'string' ? a.category : 'other'
+        category: typeof a.category === 'string' ? a.category : 'other',
+        choices: a.choices
       });
       seenA[out.id] = true;
       return out;
@@ -827,7 +1073,8 @@
         firstName: typeof s.firstName === 'string' ? s.firstName : '',
         teamId: typeof s.teamId === 'string' && seenT[s.teamId] ? s.teamId : null,
         status: s.status,
-        notes: typeof s.notes === 'string' ? s.notes : ''
+        notes: typeof s.notes === 'string' ? s.notes : '',
+        finalLetter: s.finalLetter
       });
       seenS[out.id] = true;
       return out;
@@ -908,6 +1155,7 @@
       };
     });
 
+    c.finalized = normalizeFinalized(raw.finalized);
     c.history = (Array.isArray(raw.history) ? raw.history : []).filter(util.isPlainObject);
     return c;
   }
@@ -1077,7 +1325,25 @@
     wrapBackup: wrapBackup,
     readBackup: readBackup,
     duplicateCourse: duplicateCourse,
-    courseLabel: courseLabel
+    courseLabel: courseLabel,
+    MAX_CHOICE_STEPS: MAX_CHOICE_STEPS,
+    normalizeChoices: normalizeChoices,
+    choiceValues: choiceValues,
+    hasChoices: hasChoices,
+    isChoiceValue: isChoiceValue,
+    describeChoices: describeChoices,
+    parseChoiceInput: parseChoiceInput,
+    finalLetterOf: finalLetterOf,
+    scaleLetters: scaleLetters,
+    isScaleLetter: isScaleLetter,
+    matchLetter: matchLetter,
+    setFinalLetter: setFinalLetter,
+    setFinalLetters: setFinalLetters,
+    copySuggestedToFinal: copySuggestedToFinal,
+    finalize: finalize,
+    unfinalize: unfinalize,
+    isFinalized: isFinalized,
+    normalizeFinalized: normalizeFinalized
   };
 
   if (isNode) module.exports = api; else (root.GT = root.GT || {}).model = api;

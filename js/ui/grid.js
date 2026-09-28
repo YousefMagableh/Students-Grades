@@ -2,7 +2,11 @@
  * Keyboard-first editing (type to replace, Enter/F2 to edit, Tab/Enter/arrows to move), range
  * selection, copy and paste of blocks from Excel, team scores with per-member overrides, sorting,
  * grouping by team, search and column toggles.
- * Browser only. See docs/DESIGN.md section 6 and the stage-2 spec, section 4. */
+ * Stage 2b: the "Suggested" (cutoff) letter and the manual "Final letter" (drop-down), drop-down
+ * score cells (assessment.choices), band assignment over a selected range, column fill menus,
+ * finalize / unlock (locked score cells), a stable row order ("Order changed: re-sort"), the
+ * Meeting view and the three absence columns.
+ * Browser only. See docs/DESIGN.md section 6, the stage-2 spec (section 4) and the stage-2b spec. */
 (function (root) {
   'use strict';
   var GT = root.GT;
@@ -25,7 +29,9 @@
     { key: 'weighted', label: 'Weighted scores' },
     { key: 'percentile', label: 'Percentile' },
     { key: 'diff', label: 'Difference from average' },
-    { key: 'attendance', label: 'Attendance' }
+    { key: 'attExcused', label: 'Excused absences (allowed)', att: true },
+    { key: 'attUnexcused', label: 'Unexcused absences (not allowed)', att: true },
+    { key: 'attTotal', label: 'Total absences', att: true }
   ];
   var SORTS = [
     { value: 'name:asc', label: 'Name A–Z' },
@@ -33,10 +39,16 @@
     { value: 'total:desc', label: 'Total high–low' },
     { value: 'total:asc', label: 'Total low–high' }
   ];
-  // Identity column widths (px). The sticky offsets in css/grid.css (.sc1 … .sc4) match these.
-  var W = { no: 52, last: 106, first: 136, team: 70, total: 74, letter: 60, rank: 54, pct: 90, diff: 62, att: 118 };
+  // Identity column widths (px). The sticky offsets in css/grid.css (.sc1 … .sc4) match these; the
+  // Meeting view (larger text, no Team column) uses WM and its own offsets (.gt-grid.meeting .sc2/.sc3).
+  var W = { no: 52, last: 106, first: 136, team: 70, total: 74, rank: 54, pct: 90, diff: 62 };
+  var WM = { no: 56, last: 128, first: 132, total: 84, rank: 60 };
   var HEAD_PAD = 17;   // header cell padding (2 × 8 px) plus slack
   var BADGE_W = 21;    // compact placeholder badge in a header (with its margin)
+  var LOCKED_MSG = 'Scores are finalized. Unlock them to edit.';
+  var NOTE_MAX = 200;        // characters of the Finalize note (the banner shows at most NOTE_SHOWN)
+  var NOTE_SHOWN = 120;
+  var LETTERS_CONFIRM = 10;  // clearing more final letters than this at once asks first
 
   // Team-score marker: one masked span (css/grid.css) instead of an inline SVG per cell, to keep the
   // 59-row table cheap to lay out.
@@ -71,10 +83,18 @@
   var colsMenu = null;
   var globalBound = false;
   var kbMenuAt = 0;
-  var listboxPointerAt = 0;
   var copyHandled = false;
   var pendingCopy = null;
   var lastRenderMs = 0;
+  var lockedToastAt = 0;
+  var ddToastAt = 0;
+  var bandToastShown = false;
+  var ddBtn = null;          // the ▾ button shown in the active drop-down cell
+  // Stable row order (DECISIONS 7): the student ids in the order of the last sort. Edits never
+  // reorder rows; the snapshot is taken again only when the sort, search, filter, grouping, Meeting
+  // view or the set of students changes, or when the user clicks "Order changed: re-sort".
+  var order = { courseId: null, sig: null, idsKey: null, ids: null };
+  var forceResort = false;
 
   // Any store change except autosave/annotation invalidates the table.
   if (GT.store && GT.store.subscribe) {
@@ -130,8 +150,12 @@
       dir: p.dir === 'desc' ? 'desc' : 'asc',
       group: p.group === true,
       showWithdrawn: p.showWithdrawn !== false,
+      meeting: p.meeting === true,
+      meetingPrev: typeof p.meetingPrev === 'string' ? p.meetingPrev : '',
       cols: {}
     };
+    // Grouping by team is off in the Meeting view (it lists everyone by total, without the Team column).
+    out.grouped = out.group && !out.meeting;
     var pc = util.isPlainObject(p.cols) ? p.cols : {};
     COL_TOGGLES.forEach(function (t) { out.cols[t.key] = pc[t.key] !== false; });
     return out;
@@ -139,6 +163,7 @@
 
   function setPrefs(patch) {
     var p = getPrefs();
+    delete p.grouped;
     Object.keys(patch).forEach(function (k) { p[k] = patch[k]; });
     GT.store.setUi({ gridPrefs: p });
   }
@@ -149,7 +174,243 @@
   }
 
   function attSummary(course, sid) {
-    try { return GT.attendance.summary(course, sid); } catch (e) { return null; }
+    try { return GT.attendance.summary(course, sid) || null; } catch (e) { return null; }
+  }
+
+  function whole(x) { return typeof x === 'number' && isFinite(x) ? x : 0; }
+
+  // ------------------------------------------------------------------ final letters, drop-down lists, lock
+  // The core helpers (model.setFinalLetter(s), copySuggestedToFinal, finalize, unfinalize, isFinalized,
+  // choiceValues, isChoiceValue; calc's finalLetter / letterDiffers / orderIssues / letterSummary /
+  // notOnList) are used when present. The small fallbacks below only keep the grid working if a core
+  // file is older than this view.
+
+  function isFinalized(course) {
+    if (!course) return false;
+    if (typeof model.isFinalized === 'function') {
+      try { return !!model.isFinalized(course); } catch (e) { /* fall back */ }
+    }
+    return !!(course.finalized && typeof course.finalized === 'object');
+  }
+
+  /** Letters of the course scale, highest first (model.scaleLetters: the Final letter drop-down order). */
+  function scaleLetters(course) {
+    if (typeof model.scaleLetters === 'function') {
+      try { return model.scaleLetters(course); } catch (e) { /* fall back */ }
+    }
+    return ((course && course.settings && course.settings.letterScale) || []).slice()
+      .sort(function (a, b) { return b.min - a.min; }).map(function (x) { return x.letter; });
+  }
+
+  function storedFinal(s) {
+    return s && typeof s.finalLetter === 'string' && s.finalLetter !== '' ? s.finalLetter : null;
+  }
+
+  /** { letter|null, valid, differs, suggested } for a student, from calc when it reports them. */
+  function finalInfo(s, rs, letterSet) {
+    var fl = rs && rs.finalLetter !== undefined ? rs.finalLetter : storedFinal(s);
+    if (fl === undefined || fl === '') fl = null;
+    var suggested = rs ? rs.letter : '';
+    var valid = rs && typeof rs.finalLetterValid === 'boolean' ? rs.finalLetterValid : (fl === null || !!letterSet[fl]);
+    var differs = rs && typeof rs.letterDiffers === 'boolean' ? rs.letterDiffers : (fl !== null && fl !== suggested);
+    return { letter: fl, valid: valid, differs: differs, suggested: suggested };
+  }
+
+  /** The drop-down values of an assessment (max, max − step, …, 0), or [] for free entry. */
+  function choiceValues(a) {
+    if (!a || !a.choices) return [];
+    if (typeof model.choiceValues === 'function') {
+      try {
+        var v = model.choiceValues(a);
+        if (Array.isArray(v)) return v;
+      } catch (e) { /* fall back */ }
+    }
+    var step = a.choices.step, max = a.maxScore, out = [];
+    if (!(step > 0) || !(max > 0) || max / step > 200) return out;
+    for (var k = 0; k <= 200; k++) {
+      var x = util.fix(max - k * step);
+      if (x < 0) break;
+      out.push(x);
+    }
+    if (out[out.length - 1] !== 0) out.push(0);
+    return out;
+  }
+
+  function isChoiceValue(a, list, v) {
+    if (typeof model.isChoiceValue === 'function') {
+      try { return !!model.isChoiceValue(a, v); } catch (e) { /* fall back */ }
+    }
+    var fv = util.fix(v);
+    return list.some(function (x) { return util.fix(x) === fv; });
+  }
+
+  /** "0–5 in steps of 0.5" */
+  function choiceRange(a, list) {
+    if (!list.length) return '';
+    var step = a.choices && a.choices.step > 0 ? a.choices.step : null;
+    return num(list[list.length - 1], 4) + '–' + num(list[0], 4) + (step ? ' in steps of ' + num(step, 4) : '');
+  }
+
+  /** Canonical letter for typed or pasted text: { empty } | { letter } | { bad }. Case-insensitive;
+   * spaces are ignored and a typographic minus or dash counts as "-". */
+  function matchLetter(course, text) {
+    var raw = String(text === null || text === undefined ? '' : text);
+    if (raw.trim() === '') return { empty: true };
+    if (typeof model.matchLetter === 'function') {
+      try {
+        var m = model.matchLetter(course, raw);
+        return m ? { letter: m } : { bad: true };
+      } catch (e) { /* fall back */ }
+    }
+    var t = raw.replace(/[‐-―−]/g, '-').replace(/\s+/g, '').toLowerCase();
+    var letters = scaleLetters(course);
+    for (var i = 0; i < letters.length; i++) {
+      if (letters[i].replace(/\s+/g, '').toLowerCase() === t) return { letter: letters[i] };
+    }
+    return { bad: true };
+  }
+
+  /** A typed or pasted value for a drop-down score cell: { empty } | { value } | { bad }. */
+  function matchChoice(a, list, text) {
+    var p = util.parseScoreInput(text, a ? a.maxScore : undefined);
+    if (p.kind === 'empty') return { empty: true };
+    if (p.kind === 'number' && isChoiceValue(a, list, p.value)) return { value: util.fix(p.value) };
+    return { bad: true };
+  }
+
+  /** Writes final letters inside a transaction. pairs: [{ studentId, letter|null }] (validated).
+   * Returns the number changed. */
+  function writeFinalLetters(c, pairs) {
+    if (typeof model.setFinalLetters === 'function') {
+      var r = model.setFinalLetters(c, pairs);
+      return typeof r === 'number' ? r : (r && typeof r.changed === 'number' ? r.changed : 0);
+    }
+    var ok = Object.create(null), n = 0;
+    scaleLetters(c).forEach(function (l) { ok[l] = true; });
+    pairs.forEach(function (p) {
+      var st = model.findStudent(c, p.studentId);
+      if (!st || (p.letter !== null && !ok[p.letter])) return;
+      if (storedFinal(st) === p.letter) return;
+      st.finalLetter = p.letter;
+      n++;
+    });
+    return n;
+  }
+
+  /** Letter-order problems (calc.orderIssues, or computed here): id -> { above: [ids], below: [ids] }.
+   * above = students with a higher total but a lower final letter; below = the reverse. */
+  function orderIssueMap(course, results) {
+    var list = Array.isArray(results.orderIssues) ? results.orderIssues : null;
+    if (!list) {
+      list = [];
+      var rank = Object.create(null);
+      scaleLetters(course).forEach(function (l, i) { rank[l] = i; });
+      var act = course.students.filter(function (s) {
+        var r = results.byId[s.id], fl = storedFinal(s);
+        return s.status !== 'withdrawn' && fl !== null && rank[fl] !== undefined && r && typeof r.total === 'number' && isFinite(r.total);
+      }).map(function (s) { return { id: s.id, t: util.fix(results.byId[s.id].total), k: rank[storedFinal(s)] }; });
+      act.sort(function (x, y) { return y.t - x.t; });
+      for (var i = 0; i < act.length; i++) {
+        for (var j = i + 1; j < act.length; j++) {
+          if (act[i].t > act[j].t && act[j].k < act[i].k) list.push({ higherTotalId: act[i].id, lowerTotalId: act[j].id });
+        }
+      }
+    }
+    var map = Object.create(null);
+    var get = function (id) { return map[id] || (map[id] = { above: [], below: [] }); };
+    list.forEach(function (p) {
+      if (!p) return;
+      get(p.lowerTotalId).above.push(p.higherTotalId);
+      get(p.higherTotalId).below.push(p.lowerTotalId);
+    });
+    return { map: map, count: list.length, first: list[0] || null };
+  }
+
+  /** { assigned, unassigned, invalid, active } over active students. invalid: final letters that are
+   * not letters of the current scale (kept, shown in red; the scale changed after they were chosen). */
+  function letterSummary(course, results) {
+    var nActive = results.activeIds.length;
+    var ls = results.letterSummary;
+    if (ls && typeof ls.unassigned === 'number') {
+      return {
+        unassigned: ls.unassigned, assigned: Math.max(0, nActive - ls.unassigned), active: nActive,
+        invalid: typeof ls.invalid === 'number' ? ls.invalid : countInvalidLetters(course)
+      };
+    }
+    var un = 0;
+    course.students.forEach(function (s) { if (s.status !== 'withdrawn' && storedFinal(s) === null) un++; });
+    return { unassigned: un, assigned: nActive - un, active: nActive, invalid: countInvalidLetters(course) };
+  }
+
+  /** True when the student's stored final letter is not a letter of the course's scale. */
+  function invalidFinal(course, s, letterSet) {
+    var fl = storedFinal(s);
+    return fl !== null && !letterSet[fl];
+  }
+
+  function letterSetOf(course) {
+    var set = Object.create(null);
+    scaleLetters(course).forEach(function (l) { set[l] = true; });
+    return set;
+  }
+
+  function countInvalidLetters(course) {
+    var set = letterSetOf(course), n = 0;
+    course.students.forEach(function (s) { if (s.status !== 'withdrawn' && invalidFinal(course, s, set)) n++; });
+    return n;
+  }
+
+  function lockedCol(course, col) {
+    return !!col && !!col.edit && col.kind !== 'final' && isFinalized(course);
+  }
+
+  function notifyLocked() {
+    if (nowMs() - lockedToastAt < 3000) return;
+    lockedToastAt = nowMs();
+    ui.toast(LOCKED_MSG, { type: 'info', timeout: 5000, action: { label: 'Unlock…', fn: unlockScores } });
+  }
+
+  // Toasts stack at the bottom right, over the Final letter column where the meeting works. The grid's
+  // step-by-step messages (finalize, band assignment) replace each other instead of piling up, and
+  // the stack moves to the bottom left while it would cover the active cell (dodgeToasts).
+  var lastGridToast = null;
+  var TOASTS_LEFT = 'gt-toasts-left';
+  var TOAST_READ_MS = 1500;  // a toast shown at least this long may give way to the cell being worked on
+
+  function gridToast(msg, opts) {
+    if (lastGridToast) lastGridToast();
+    lastGridToast = ui.toast(msg, opts) || null;
+    dodgeToasts();
+    return lastGridToast;
+  }
+
+  /** Keeps the toasts off what the user is working on: the active cell and its open list or hint.
+   * The stack moves to the other side; when both sides cover it (a phone), a plain success or info
+   * toast that has been on screen for a while is closed (warnings, and toasts with a button, stay). */
+  function dodgeToasts() {
+    var host = document.getElementById('toasts');
+    if (!host) return;
+    var a = isActiveView() && layout ? posOf(sel.active) : null;
+    var td = a ? cellAt(a.r, a.c) : null;
+    if (!td || !host.children.length) { host.classList.remove(TOASTS_LEFT); return; }
+    var work = [td];
+    if (editing && editing.td === td) work.push(editing.input, editing.hint);
+    var rects = work.filter(function (el) { return el && el.isConnected; }).map(function (el) { return el.getBoundingClientRect(); });
+    var covering = function () {
+      return Array.prototype.filter.call(host.children, function (t) {
+        var r = t.getBoundingClientRect();
+        return rects.some(function (c) { return r.left < c.right && r.right > c.left && r.top < c.bottom && r.bottom > c.top; });
+      });
+    };
+    if (!covering().length) return;
+    var left = host.classList.contains(TOASTS_LEFT);
+    host.classList.toggle(TOASTS_LEFT, !left);
+    if (!covering().length) return;
+    host.classList.toggle(TOASTS_LEFT, left); // covered on both sides: keep the usual place
+    covering().forEach(function (t) {
+      var plain = /(^|\s)(success|info)(\s|$)/.test(t.className) && !t.querySelector('button');
+      if (plain && t.__gtAt && nowMs() - t.__gtAt >= TOAST_READ_MS && t.parentNode) t.parentNode.removeChild(t);
+    });
   }
 
   function transact(label, fn, opts) {
@@ -194,25 +455,29 @@
   }
 
   function buildColumns(course, prefs) {
+    var meet = prefs.meeting;
+    var locked = isFinalized(course);
+    var w = meet ? WM : W;
     var cols = [
-      { key: 'no', kind: 'no', label: 'No', edit: 'text', sticky: 1, width: W.no, num: true },
-      { key: 'last', kind: 'last', label: 'Last Name', edit: 'text', sticky: 2, width: W.last },
-      { key: 'first', kind: 'first', label: 'First Name', edit: 'text', sticky: 3, width: W.first },
-      { key: 'team', kind: 'team', label: 'Team', edit: 'team', sticky: 4, width: W.team }
+      { key: 'no', kind: 'no', label: 'No', edit: 'text', sticky: 1, width: w.no, num: true },
+      { key: 'last', kind: 'last', label: 'Last Name', edit: 'text', sticky: 2, width: w.last },
+      { key: 'first', kind: 'first', label: 'First Name', edit: 'text', sticky: 3, width: w.first }
     ];
+    if (!meet) cols.push({ key: 'team', kind: 'team', label: 'Team', edit: 'team', sticky: 4, width: W.team });
     // Header names (bold 12px) wrap at spaces, so a column needs room for its longest word; the
     // small lines under the name (11px) do not wrap.
     var nameW = function (text) { return textWidth(text, 700, 12); };
     var subW = function (text) { return textWidth(text, 500, 11); };
     var longestWordW = function (text) {
-      return String(text).split(/\s+/).reduce(function (m, w) { return Math.max(m, nameW(w)); }, 0);
+      return String(text).split(/\s+/).reduce(function (m, x) { return Math.max(m, nameW(x)); }, 0);
     };
     var badgeW = function (key) { return key && !model.isConfirmed(course, key) ? BADGE_W : 0; };
-    var rawWidth = function (a) {
-      var maxLine = subW('max ' + num(a.maxScore, 4)) + badgeW('maxScores');
+    var rawWidth = function (a, list) {
+      var maxLine = subW('max ' + num(a.maxScore, 4) + (list.length ? ' · list' : '')) + badgeW('maxScores');
       // "10% · team" may wrap before "· team" (css/grid.css .hs-w).
       var weightLine = Math.max(subW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a)), a.teamGraded ? subW('· team') : 0);
-      return clamp(Math.max(longestWordW(a.name), maxLine, weightLine) + HEAD_PAD, 64, 150);
+      var min = meet ? 72 : 64;
+      return clamp(Math.max(longestWordW(a.name), maxLine, weightLine, meet && a.category === 'participation' ? subW('fill in the meeting') : 0) + HEAD_PAD, min, 164);
     };
     // Weighted headers read "Project I 10%": a short name stays on one line, the weight may wrap.
     var weightedWidth = function (a) {
@@ -220,23 +485,53 @@
       var weight = nameW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a));
       return clamp(Math.max(name, weight, subW('weighted')) + HEAD_PAD, 56, 150);
     };
-    course.assessments.forEach(function (a, i) {
-      cols.push({ key: 'raw:' + a.id, kind: 'raw', aid: a.id, a: a, label: a.name, edit: 'score',
-        group: Math.min(i + 1, 6), width: rawWidth(a), num: true });
-    });
-    if (prefs.cols.weighted) {
-      course.assessments.forEach(function (a, i) {
-        cols.push({ key: 'w:' + a.id, kind: 'weighted', aid: a.id, a: a, label: a.name + ' ' + num(a.weight, 4) + '%',
-          ro: true, group: Math.min(i + 1, 6), width: weightedWidth(a), num: true });
-      });
+    var rawCol = function (a, i) {
+      var list = choiceValues(a);
+      return {
+        key: 'raw:' + a.id, kind: 'raw', aid: a.id, a: a, label: a.name, edit: list.length ? 'choice' : 'score',
+        dd: list.length > 0, choices: list, group: Math.min(i + 1, 6), width: rawWidth(a, list), num: true,
+        // Participation is filled in the meeting (locked, like every score, once finalized).
+        toFill: meet && a.category === 'participation' && !locked
+      };
+    };
+    var simple = function (key, kind, label, width, extra) {
+      var c = { key: key, kind: kind, label: label, width: width };
+      Object.keys(extra || {}).forEach(function (k) { c[k] = extra[k]; });
+      return c;
+    };
+    var suggested = simple('letter', 'letter', 'Suggested', Math.max(64, nameW('Suggested') + badgeW('letterScale') + HEAD_PAD), { ro: true });
+    var finalCol = simple('final', 'final', 'Final letter', meet ? 96 : 86, { edit: 'letter', dd: true, toFill: meet });
+    var total = simple('total', 'total', 'Total', w.total, { ro: true, num: true });
+    var rank = simple('rank', 'rank', 'Rank', w.rank, { ro: true, num: true });
+    var att = [];
+    if (attendanceAvailable(course)) {
+      // Header lines: "Excused" / "(allowed)", "Unexcused" / "(not allowed)" (kept on one line), "Total" / "absences".
+      var attW = function (a1, a2) { return clamp(Math.max(nameW(a1), nameW(a2)) + HEAD_PAD, 58, 130); };
+      if (prefs.cols.attExcused) att.push(simple('att:exc', 'attExc', 'Excused (allowed)', attW('Excused', '(allowed)'), { ro: true, num: true }));
+      if (prefs.cols.attUnexcused) att.push(simple('att:unx', 'attUnx', 'Unexcused (not allowed)', attW('Unexcused', '(not allowed)'), { ro: true, num: true }));
+      if (prefs.cols.attTotal) att.push(simple('att:tot', 'attTot', 'Total absences', attW('Total', 'absences'), { ro: true, num: true }));
     }
-    cols.push({ key: 'total', kind: 'total', label: 'Total', ro: true, width: W.total, num: true });
-    cols.push({ key: 'letter', kind: 'letter', label: 'Letter', ro: true, width: W.letter });
-    cols.push({ key: 'rank', kind: 'rank', label: 'Rank', ro: true, width: W.rank, num: true });
-    if (prefs.cols.percentile) cols.push({ key: 'pct', kind: 'pct', label: 'Percentile', ro: true, width: W.pct, num: true });
-    if (prefs.cols.diff) cols.push({ key: 'diff', kind: 'diff', label: '±Avg', ro: true, width: W.diff, num: true });
-    if (prefs.cols.attendance && attendanceAvailable(course)) {
-      cols.push({ key: 'att', kind: 'att', label: 'Absences', ro: true, width: W.att, num: true });
+    var raws = course.assessments.map(rawCol);
+    if (meet) {
+      // Meeting view: scores, Total, absences, then what the instructor decides in the meeting
+      // (participation and the final letter), next to the suggestion and the rank.
+      var part = raws.filter(function (c) { return c.a.category === 'participation'; });
+      cols = cols.concat(raws.filter(function (c) { return c.a.category !== 'participation'; }));
+      cols.push(total);
+      cols = cols.concat(att, part);
+      cols.push(suggested, finalCol, rank);
+    } else {
+      cols = cols.concat(raws);
+      if (prefs.cols.weighted) {
+        course.assessments.forEach(function (a, i) {
+          cols.push({ key: 'w:' + a.id, kind: 'weighted', aid: a.id, a: a, label: a.name + ' ' + num(a.weight, 4) + '%',
+            ro: true, group: Math.min(i + 1, 6), width: weightedWidth(a), num: true });
+        });
+      }
+      cols.push(total, suggested, finalCol, rank);
+      if (prefs.cols.percentile) cols.push(simple('pct', 'pct', 'Percentile', W.pct, { ro: true, num: true }));
+      if (prefs.cols.diff) cols.push(simple('diff', 'diff', '±Avg', W.diff, { ro: true, num: true }));
+      cols = cols.concat(att);
     }
     cols.forEach(function (c, i) { c.index = i; });
     return cols;
@@ -251,20 +546,17 @@
     return !!teamName && teamName.toLowerCase().indexOf(q) !== -1;
   }
 
-  function buildLayout(course, results, prefs) {
-    var cols = buildColumns(course, prefs);
-    var teamById = Object.create(null);
-    course.teams.forEach(function (t) { teamById[t.id] = t; });
+  /** Filters and (when grouping) arranges an ordered student list into table items. */
+  function arrange(course, list, prefs, teamById) {
     var q = searchText.trim().toLowerCase();
-    var sorted = calc.sortStudents(course, results, prefs.sort, prefs.dir);
-    var visible = sorted.filter(function (s) {
+    var visible = list.filter(function (s) {
       if (!prefs.showWithdrawn && s.status === 'withdrawn') return false;
       var t = s.teamId ? teamById[s.teamId] : null;
       return matches(s, q, t ? t.name : '');
     });
     var items = [], students = [];
     var push = function (s) { items.push({ type: 'student', s: s, r: students.length }); students.push(s); };
-    if (prefs.group) {
+    if (prefs.grouped) {
       var buckets = Object.create(null);
       visible.forEach(function (s) {
         var k = s.teamId && teamById[s.teamId] ? s.teamId : '';
@@ -282,12 +574,40 @@
     } else {
       visible.forEach(push);
     }
+    return { items: items, students: students, shown: visible.length };
+  }
+
+  function orderSig(prefs) {
+    return [prefs.sort, prefs.dir, prefs.grouped, prefs.meeting, prefs.showWithdrawn, searchText.trim().toLowerCase()].join('|');
+  }
+
+  function buildLayout(course, results, prefs) {
+    var cols = buildColumns(course, prefs);
+    var teamById = Object.create(null);
+    course.teams.forEach(function (t) { teamById[t.id] = t; });
+    var fresh = calc.sortStudents(course, results, prefs.sort, prefs.dir);
+    // The row order is a snapshot (DECISIONS 7): take a new one only when the sort, search, filter,
+    // grouping or Meeting view changed, students were added or removed, or on "re-sort".
+    var sig = orderSig(prefs);
+    var idsKey = course.students.map(function (s) { return s.id; }).sort().join('\n');
+    if (forceResort || !order.ids || order.courseId !== course.id || order.sig !== sig || order.idsKey !== idsKey) {
+      order = { courseId: course.id, sig: sig, idsKey: idsKey, ids: fresh.map(function (s) { return s.id; }) };
+    }
+    forceResort = false;
+    var byId = Object.create(null);
+    course.students.forEach(function (s) { byId[s.id] = s; });
+    var snap = order.ids.map(function (id) { return byId[id]; }).filter(Boolean);
+    var got = arrange(course, snap, prefs, teamById);
+    var want = arrange(course, fresh, prefs, teamById);
+    var stale = got.students.length !== want.students.length || got.students.some(function (s, i) { return s !== want.students[i]; });
     var rowOfSid = Object.create(null), colOfKey = Object.create(null);
-    students.forEach(function (s, i) { rowOfSid[s.id] = i; });
+    got.students.forEach(function (s, i) { rowOfSid[s.id] = i; });
     cols.forEach(function (c, i) { colOfKey[c.key] = i; });
+    var nId = 0;
+    cols.forEach(function (c) { if (c.sticky) nId++; });
     return {
-      cols: cols, students: students, items: items, rowOfSid: rowOfSid, colOfKey: colOfKey,
-      teamById: teamById, shown: visible.length, total: course.students.length, prefs: prefs
+      cols: cols, students: got.students, items: got.items, rowOfSid: rowOfSid, colOfKey: colOfKey,
+      teamById: teamById, shown: got.shown, total: course.students.length, prefs: prefs, stale: stale, nId: nId
     };
   }
 
@@ -374,7 +694,7 @@
     if (painted.head) painted.head.classList.remove('hdr-active');
     if (painted.row) painted.row.classList.remove('row-active');
     painted.active = painted.head = painted.row = null;
-    if (!a) return;
+    if (!a) { placeDropButton(null, null); return; }
     var rc = rectOf();
     if (rc.r1 !== rc.r2 || rc.c1 !== rc.c2) {
       for (var r = rc.r1; r <= rc.r2; r++) {
@@ -394,10 +714,32 @@
       td.setAttribute('tabindex', '0');
       painted.active = td;
     }
+    placeDropButton(td, layout.cols[a.c]);
     var th = dom.table.tHead && dom.table.tHead.rows[0] ? dom.table.tHead.rows[0].cells[a.c] : null;
     if (th) { th.classList.add('hdr-active'); painted.head = th; }
     if (rowEls[a.r]) { rowEls[a.r].classList.add('row-active'); painted.row = rowEls[a.r]; }
     sel.lastR = a.r;
+  }
+
+  /** The ▾ button of the active drop-down cell (Final letter, participation): a click opens the list,
+   * like Alt+Down. One element, moved with the active cell. */
+  function placeDropButton(td, col) {
+    if (ddBtn && ddBtn.parentNode && ddBtn.parentNode !== td) {
+      ddBtn.parentNode.classList.remove('has-dd');
+      ddBtn.parentNode.removeChild(ddBtn);
+    }
+    if (!td || !col || !col.dd || lockedCol(cur(), col)) return;
+    if (!ddBtn) {
+      ddBtn = document.createElement('button');
+      ddBtn.type = 'button';
+      ddBtn.className = 'dd-btn';
+      ddBtn.setAttribute('data-act', 'dd-open');
+      ddBtn.setAttribute('tabindex', '-1');
+      ddBtn.setAttribute('aria-hidden', 'true');
+      ddBtn.title = 'Choose from the list (Alt+Down)';
+    }
+    if (ddBtn.parentNode !== td) td.appendChild(ddBtn);
+    td.classList.add('has-dd');
   }
 
   function focusCell(td) {
@@ -444,10 +786,15 @@
   function stickyRight() {
     var row = dom.table.tHead && dom.table.tHead.rows[0];
     if (!row) return 0;
+    // A column counts only when its body cells are pinned too (a header can be sticky on its own).
+    var body = dom.table.querySelector('tbody tr.gr');
     var right = 0;
     for (var i = 0; i < 4 && i < row.cells.length; i++) {
       var th = row.cells[i], cs = root.getComputedStyle(th);
-      if (cs.position === 'sticky' && cs.left !== 'auto') right = th.getBoundingClientRect().right;
+      if (cs.position !== 'sticky' || cs.left === 'auto') continue;
+      var td = body ? body.querySelector('td[data-c="' + th.getAttribute('data-c') + '"]') : null;
+      if (td && root.getComputedStyle(td).position !== 'sticky') continue;
+      right = th.getBoundingClientRect().right;
     }
     return right;
   }
@@ -494,6 +841,7 @@
     paintSelection();
     focusActive();
     ensureVisible(cellAt(r, c));
+    dodgeToasts();
   }
 
   function tabTarget(p, back) {
@@ -503,8 +851,27 @@
     return { r: r, c: c };
   }
 
+  /** True when the cell can be edited now (not calculated, and not a score locked by "finalize"). */
   function editableAt(p) {
-    return !!(p && layout.cols[p.c] && layout.cols[p.c].edit);
+    var col = p && layout ? layout.cols[p.c] : null;
+    return !!(col && col.edit && !lockedCol(cur(), col));
+  }
+
+  /** The selected rows a drop-down value applies to (band assignment): the active column of a range
+   * that spans several rows. Withdrawn students are left out. null for a single row. */
+  function bandRows() {
+    var rc = rectOf(), a = posOf(sel.active);
+    if (!rc || !a || rc.r1 === rc.r2) return null;
+    var col = layout.cols[a.c];
+    if (!col || !col.dd) return null;
+    var sids = [], wd = 0;
+    for (var r = rc.r1; r <= rc.r2; r++) {
+      var s = layout.students[r];
+      if (!s) continue;
+      if (s.status === 'withdrawn') { wd++; continue; }
+      sids.push(s.id);
+    }
+    return { sids: sids, withdrawn: wd, r1: rc.r1, r2: rc.r2, key: col.key };
   }
 
   // ------------------------------------------------------------------ HTML builders
@@ -523,9 +890,11 @@
     h += '</colgroup><thead><tr role="row" aria-rowindex="1">';
     ctx.cols.forEach(function (col, i) {
       var cls = 'h-' + col.kind + (col.sticky ? ' sc sc' + col.sticky : '') + (col.group ? ' g g' + col.group : '') +
-        (col.ro ? ' ro' : '') + (col.num ? ' num' : '');
+        (col.ro ? ' ro' : '') + (col.num ? ' num' : '') + (col.toFill ? ' to-fill' : '') +
+        (col.sticky && col.sticky === ctx.nId ? ' sc-last' : '');
       var inner = '', title = '', aria = '';
       var a = col.a;
+      var fillTag = col.toFill ? '<span class="h-sub h-fill">fill in the meeting</span>' : '';
       switch (col.kind) {
         case 'no': inner = 'No'; title = 'Student number'; break;
         case 'last':
@@ -549,24 +918,45 @@
         }
         case 'first': inner = 'First Name'; break;
         case 'team': inner = 'Team'; break;
-        case 'raw':
-          inner = '<span class="h-name">' + esc(a.name) + '</span><span class="h-sub"><span class="hs">max ' + num(a.maxScore, 4) +
-            ui.placeholderBadge(course, 'maxScores', { compact: true }) + '</span><span class="hs hs-w"><span class="sr-only"> · </span>' +
+        case 'raw': {
+          var range = col.dd ? choiceRange(a, col.choices) : '';
+          inner = (ctx.locked ? '<span class="h-lock" aria-hidden="true"></span>' : '') +
+            '<span class="h-name">' + esc(a.name) + '</span><span class="h-sub"><span class="hs">max ' + num(a.maxScore, 4) +
+            (col.dd ? ' · list' : '') + ui.placeholderBadge(course, 'maxScores', { compact: true }) + '</span><span class="hs hs-w"><span class="sr-only"> · </span>' +
             '<span class="nowrap">' + num(a.weight, 4) + '%' + weightBadge(course, a) + '</span>' +
-            (a.teamGraded ? ' <span class="nowrap">· team</span>' : '') + '</span></span>';
+            (a.teamGraded ? ' <span class="nowrap">· team</span>' : '') + '</span></span>' + fillTag +
+            '<button type="button" class="th-menu" data-act="col-menu" data-aid="' + esc(a.id) + '" tabindex="-1" aria-haspopup="menu" aria-label="' +
+            esc('Column actions for ' + a.name) + '" title="Column actions: fill, set or clear the whole column">' + ui.icon('dots') + '</button>';
           title = a.name + ': max ' + num(a.maxScore, 4) + ', weight ' + num(a.weight, 4) + '%' +
-            (a.teamGraded ? ', team-graded (one score per team, ◆ = per-member override)' : '');
+            (a.teamGraded ? ', team-graded (one score per team, ◆ = per-member override)' : '') +
+            (col.dd ? '. Drop-down list: ' + range + ' (Enter or Alt+Down opens it; typing a value from the list also works)' : '') +
+            (ctx.locked ? '. Locked: scores are finalized' : '');
           break;
+        }
         case 'weighted':
           inner = '<span class="h-name">' + esc(a.name) + ' <span class="nowrap">' + num(a.weight, 4) + '%' + weightBadge(course, a) +
             '</span></span><span class="h-sub">weighted</span>';
           title = 'Weighted points = raw ÷ ' + num(a.maxScore, 4) + ' × ' + num(a.weight, 4) + ' (calculated)';
           break;
-        case 'letter': inner = 'Letter' + ui.placeholderBadge(course, 'letterScale', { compact: true }); title = 'Letter grade from the total'; break;
+        case 'letter':
+          inner = '<span class="h-name">Suggested' + ui.placeholderBadge(course, 'letterScale', { compact: true }) + '</span>' +
+            '<span class="h-sub">from cutoffs</span>';
+          title = 'Letter from the cutoffs: only a suggestion. The Final letter is the grade that counts.';
+          break;
+        case 'final':
+          inner = '<span class="h-name">Final letter</span>' + (col.toFill ? fillTag : '<span class="h-sub">drop-down</span>');
+          title = 'The final letter grade, chosen by hand (Enter or Alt+Down opens the list; type a letter such as b+). ' +
+            'Select several rows first to give them all the same letter.';
+          break;
         case 'rank': inner = 'Rank'; title = 'Rank among active students'; break;
         case 'pct': inner = 'Percentile'; title = 'Percentile among active students'; break;
         case 'diff': inner = '±Avg'; title = 'Difference from the class average (active students)'; break;
-        case 'att': inner = 'Absences'; title = 'Total absences (unexcused in brackets)'; break;
+        case 'attExc': inner = 'Excused <span class="nowrap">(allowed)</span>'; title = 'Excused absences: allowed (approved by the instructor)'; break;
+        case 'attUnx':
+          inner = 'Unexcused <span class="nowrap">(not allowed)</span>';
+          title = 'Unexcused absences: not allowed. They drive the threshold highlight and the consecutive-absence warnings (warnings only)';
+          break;
+        case 'attTot': inner = 'Total absences'; title = 'Excused + unexcused absences (for information)'; break;
       }
       h += '<th role="columnheader" scope="col" data-c="' + i + '" class="' + cls + '"' + aria +
         (title ? ' title="' + esc(title) + '"' : '') + '>' + inner + '</th>';
@@ -574,16 +964,52 @@
     return h + '</tr></thead>';
   }
 
+  /** Markup of the attendance cells; the summary comes from GT.attendance (stage 3). */
+  function attCell(ctx, s, kind) {
+    var sm = ctx.att ? ctx.att(s.id) : null;
+    if (!sm) return { cls: '', body: '<span class="faint">—</span>', title: 'No attendance recorded' };
+    var rec = whole(sm.recorded);
+    var cls = '', body, title;
+    if (kind === 'attExc') {
+      body = String(whole(sm.excused));
+      title = whole(sm.excused) + ' excused (allowed) absences in ' + plural(rec, 'recorded session');
+    } else if (kind === 'attUnx') {
+      body = String(whole(sm.unexcused));
+      var tips = [whole(sm.unexcused) + ' unexcused (not allowed) absences in ' + plural(rec, 'recorded session')];
+      if (sm.warning === 'fail') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says F (warning only, the grade is not changed)');
+      else if (sm.warning === 'drop') tips.push(whole(sm.longestStreak) + ' consecutive absences: the syllabus says one letter grade drop (warning only)');
+      if (sm.overThreshold) {
+        var th = ctx.course.attendance && typeof ctx.course.attendance.unexcusedThreshold === 'number' ? ' (' + ctx.course.attendance.unexcusedThreshold + ')' : '';
+        tips.push('Above the unexcused-absence threshold' + th);
+      }
+      if (sm.warning || sm.overThreshold) {
+        cls = ' is-att-warn' + (sm.warning === 'fail' ? ' is-att-fail' : '');
+        body = '<span class="mk-att" aria-hidden="true">' + ui.icon('alert') + '</span><span class="sr-only">warning: </span>' + body;
+      }
+      title = tips.join('. ');
+    } else {
+      body = String(whole(sm.totalAbsences));
+      title = whole(sm.totalAbsences) + ' absences in total (excused + unexcused) in ' + plural(rec, 'recorded session');
+      if (sm.overTotalThreshold) {
+        cls = ' is-att-warn';
+        var tt = ctx.course.attendance && typeof ctx.course.attendance.totalAbsenceThreshold === 'number' ? ' (' + ctx.course.attendance.totalAbsenceThreshold + ')' : '';
+        title += '. Above the total-absence threshold' + tt;
+        body = '<span class="mk-att" aria-hidden="true">' + ui.icon('alert') + '</span><span class="sr-only">warning: </span>' + body;
+      }
+    }
+    return { cls: cls, body: body, title: title };
+  }
+
   function studentRowHtml(ctx, s, r, ariaRow) {
     var course = ctx.course, cols = ctx.cols, dec = ctx.dec;
     var rs = ctx.results.byId[s.id];
     var wd = s.status === 'withdrawn';
     var team = s.teamId ? ctx.teamById[s.teamId] : null;
-    var h = '<tr role="row" class="gr' + (wd ? ' row-withdrawn' : '') + '" data-r="' + r + '" data-sid="' + esc(s.id) +
-      '" aria-rowindex="' + ariaRow + '">';
+    var h = '<tr role="row" class="gr' + (wd ? ' row-withdrawn' : '') + (ctx.bandEnd[s.id] ? ' band-end' : '') + '" data-r="' + r +
+      '" data-sid="' + esc(s.id) + '" aria-rowindex="' + ariaRow + '">';
     for (var i = 0; i < cols.length; i++) {
       var col = cols[i];
-      var cls, body = '', title = '', ro = !!col.ro;
+      var cls, body = '', title = '', ro = !!col.ro || (ctx.locked && !!col.edit && col.kind !== 'final');
       switch (col.kind) {
         case 'no':
           cls = 'c-no sc sc1 num';
@@ -609,18 +1035,21 @@
           var d = rs.items[col.aid];
           var a = col.a;
           var tips = [];
-          cls = 'c-raw num g g' + col.group;
+          cls = 'c-raw num g g' + col.group + (col.dd ? ' c-dd' : '') + (col.toFill ? ' to-fill' : '');
           if (d.state === 'invalid') {
             cls += ' is-invalid';
             body = esc(d.text);
             tips.push('Not a number: counted as 0');
           } else if (d.state === 'number') {
             body = esc(String(d.raw));
-            if (d.outOfRange) { cls += ' is-range'; tips.push('Outside 0–' + num(a.maxScore, 4)); }
+            var offList = col.dd && (d.notOnList !== undefined ? !!d.notOnList : !isChoiceValue(a, col.choices, d.raw));
+            if (d.outOfRange || offList) cls += ' is-range';
+            if (d.outOfRange) tips.push('Outside 0–' + num(a.maxScore, 4));
+            if (offList) tips.push('Not one of the list values (' + choiceRange(a, col.choices) + '): kept and counted');
           } else {
             cls += ' is-empty';
             body = '–';
-            tips.push('Empty: counted as 0');
+            tips.push(col.toFill ? 'Empty: to fill in the meeting (counted as 0 until then)' : 'Empty: counted as 0');
           }
           if (d.source === 'team') {
             body = ICON_TEAM + body;
@@ -667,7 +1096,36 @@
         case 'letter':
           cls = 'c-letter ro' + (wd ? ' muted' : '');
           body = esc(rs.letter);
+          title = 'Suggested by the cutoffs';
           break;
+        case 'final': {
+          var fi = finalInfo(s, rs, ctx.letterSet);
+          var ft = [];
+          cls = 'c-final c-dd' + (col.toFill ? ' to-fill' : '') + (wd ? ' muted' : '');
+          if (fi.letter === null) {
+            cls += ' is-empty';
+            body = '–';
+            ft.push(wd ? 'No final letter (withdrawn)' : 'No final letter yet');
+          } else {
+            body = '<span class="fl">' + esc(fi.letter) + '</span>';
+            if (!fi.valid) {
+              cls += ' is-invalid';
+              ft.push('“' + fi.letter + '” is not a letter of this course\'s scale: choose again');
+            } else if (fi.differs) {
+              body += '<span class="mk-diff" aria-hidden="true"></span><span class="sr-only"> (differs from the suggestion)</span>';
+              ft.push('Differs from the cutoff suggestion (' + (fi.suggested || '—') + ')');
+            }
+            var oi = ctx.issues.map[s.id];
+            if (oi && !wd) {
+              cls += ' is-order';
+              body = '<span class="mk mk-order" aria-hidden="true"></span><span class="sr-only">letter order warning: </span>' + body;
+              if (oi.above.length) ft.push('Higher letter than a student with a higher total (' + ctx.nosOf(oi.above) + ')');
+              if (oi.below.length) ft.push('Lower letter than a student with a lower total (' + ctx.nosOf(oi.below) + ')');
+            }
+          }
+          title = ft.join('. ');
+          break;
+        }
         case 'rank':
           cls = 'c-rank num ro';
           if (wd || rs.rank === null) { body = '<span class="faint">—</span>'; title = wd ? 'Withdrawn: not ranked' : ''; }
@@ -688,26 +1146,19 @@
           }
           break;
         }
-        case 'att': {
-          cls = 'c-att num ro';
-          var sm = attSummary(course, s.id);
-          if (sm) {
-            body = esc(sm.totalAbsences + ' (' + sm.unexcused + ' unexc.)');
-            var at = [sm.totalAbsences + ' absences in ' + sm.recorded + ' recorded sessions', sm.unexcused + ' unexcused'];
-            if (sm.warning === 'fail') at.push('Consecutive absences: F may apply (warning only)');
-            else if (sm.warning === 'drop') at.push('Consecutive absences: one letter drop may apply (warning only)');
-            if (sm.overThreshold) at.push('Above the unexcused-absence threshold');
-            if (sm.warning || sm.overThreshold) {
-              cls += ' is-att-warn';
-              body = '<span class="mk-att" aria-hidden="true">' + ui.icon('alert') + '</span>' + body;
-            }
-            title = at.join('. ');
-          }
+        case 'attExc':
+        case 'attUnx':
+        case 'attTot': {
+          var ac = attCell(ctx, s, col.kind);
+          cls = 'c-att num ro' + ac.cls;
+          body = ac.body;
+          title = ac.title;
           break;
         }
         default:
           cls = '';
       }
+      if (col.sticky && col.sticky === ctx.nId) cls += ' sc-last';
       h += '<td role="gridcell" data-c="' + i + '" class="' + cls + '"' + (ro ? ' aria-readonly="true"' : '') +
         (title ? ' title="' + esc(title) + '"' : '') + '>' + body + '</td>';
     }
@@ -725,10 +1176,10 @@
       if (r && typeof r.total === 'number' && isFinite(r.total)) totals.push(r.total);
     });
     var avg = totals.length ? num(util.fix(util.sum(totals) / totals.length), ctx.dec) : '—';
-    var h = '<tr role="row" class="team-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="4" class="sc sc-span team-label">' +
+    var h = '<tr role="row" class="team-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="' + ctx.nId + '" class="sc sc-span team-label">' +
       ui.icon('users', 'icon-sm') + ' <span class="tl-name">' + esc(team ? team.name : 'No team') + '</span><span class="tl-meta"> · ' +
       plural(all.length, 'member') + (wd ? ' (' + wd + ' withdrawn)' : '') + ' · team average ' + avg + '</span></th>';
-    for (var i = 4; i < cols.length; i++) {
+    for (var i = ctx.nId; i < cols.length; i++) {
       var col = cols[i], inner = '', cls = 'tr-cell' + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '');
       if (team && col.kind === 'raw' && col.a.teamGraded) {
         var e = model.getEntry(course.teamScores, team.id, col.aid);
@@ -748,9 +1199,9 @@
   function footHtml(ctx, ariaRow) {
     var course = ctx.course, cols = ctx.cols, dec = ctx.dec, results = ctx.results;
     var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; });
-    var h = '<tfoot><tr role="row" class="avg-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="4" class="sc sc-span avg-label">' +
+    var h = '<tfoot><tr role="row" class="avg-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="' + ctx.nId + '" class="sc sc-span avg-label">' +
       'Class average <span class="muted">(active)</span></th>';
-    for (var i = 4; i < cols.length; i++) {
+    for (var i = ctx.nId; i < cols.length; i++) {
       var col = cols[i], v = '', title = '';
       var cls = 'f-' + col.kind + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '');
       if (col.kind === 'raw' || col.kind === 'weighted') {
@@ -767,7 +1218,10 @@
         title = 'Class average of ' + plural(results.activeIds.length, 'active student');
       } else if (col.kind === 'letter' && results.average !== null) {
         v = esc(calc.letterFor(results.average, course.settings.letterScale));
-        title = 'Letter for the class average';
+        title = 'Suggested letter for the class average';
+      } else if (col.kind === 'final') {
+        v = ctx.summary.assigned + '/' + ctx.summary.active;
+        title = 'Final letters assigned (active students)';
       }
       h += '<td role="gridcell" aria-readonly="true" class="' + cls + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + v + '</td>';
     }
@@ -782,6 +1236,9 @@
       '<input type="search" class="grid-search" placeholder="Search name, No or team" title="Search (press / to jump here)" autocomplete="off" spellcheck="false"></label>' +
       '<label class="grid-sort"><span class="grid-sort-label">Sort</span><select class="grid-sort-select" aria-label="Sort rows">' +
       SORTS.map(function (o) { return '<option value="' + o.value + '">' + esc(o.label) + '</option>'; }).join('') + '</select></label>' +
+      '<button type="button" class="btn btn-sm btn-primary grid-resort" data-act="resort" hidden ' +
+      'title="Rows keep their place while you edit. Click to sort them again with the new values.">' + ui.icon('sort-desc') +
+      '<span>Order changed: re-sort</span></button>' +
       // On phones the button labels (.bl) are visually hidden and the legend folds behind "Legend".
       '<button type="button" class="btn btn-sm" data-act="group" aria-pressed="false" title="Group rows by team">' + ui.icon('layers') + '<span class="bl">Group by team</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="withdrawn" aria-pressed="true">' + ui.icon('user') + '<span class="bl">Show withdrawn</span></button>' +
@@ -796,16 +1253,36 @@
       '</div>';
   }
 
+  /** The "Final grades" bar: Meeting view, the letter summary, copy suggested letters, finalize. */
+  function gradesBarHtml() {
+    return '<div class="toolbar grid-grades-bar" role="group" aria-label="Final grades">' +
+      '<span class="section-label">Final grades</span>' +
+      '<button type="button" class="btn btn-sm" data-act="meeting" aria-pressed="false" ' +
+      'title="Meeting view: scores, total, absences, participation and the final letter, in larger text, sorted by total">' +
+      ui.icon('users') + '<span>Meeting view</span></button>' +
+      '<button type="button" class="chip grid-letters-chip" data-act="letters-chip"></button>' +
+      '<button type="button" class="chip warn grid-order-chip" data-act="order-chip" hidden></button>' +
+      '<button type="button" class="btn btn-sm" data-act="copy-suggested" title="Fill the empty final letters of active students with the suggested (cutoff) letters">' +
+      ui.icon('copy') + '<span>Copy suggested → final</span></button>' +
+      '<span class="spacer"></span>' +
+      '<button type="button" class="btn btn-sm" data-act="finalize" title="Check the data, then lock the score cells (final letters stay editable)">' +
+      ui.icon('lock') + '<span>Finalize scores…</span></button>' +
+      '</div>';
+  }
+
   function legendHtml() {
     return '<div class="grid-legend" id="grid-legend" aria-label="Legend">' +
       '<span><span class="lg-sw lg-empty">–</span>empty: counted as 0</span>' +
-      '<span><span class="lg-sw lg-invalid"></span>red: not a number</span>' +
-      '<span><span class="lg-sw lg-range"></span>yellow: outside 0 to max</span>' +
+      '<span><span class="lg-sw lg-invalid"></span>red: not a number (or not a letter of the scale)</span>' +
+      '<span><span class="lg-sw lg-range"></span>yellow: outside 0 to max, or not a list value</span>' +
       '<span><span class="lg-mk mk-ovr">◆</span>per-member override</span>' +
       '<span><span class="lg-mk mk-team"></span>team score</span>' +
       '<span><span class="lg-mk inc">' + ICON_INCOMPLETE + '</span>incomplete total</span>' +
       '<span><span class="lg-sw lg-late"></span>late work (penalty in the tooltip)</span>' +
-      '<span class="lg-hint">Type to replace · Enter or F2 to edit · Ctrl+C / Ctrl+V with Excel · right-click or Shift+F10 for cell actions · Esc, then Tab leaves the grid</span>' +
+      '<span><span class="lg-mk"><span class="mk-diff"></span></span>final letter differs from the suggestion</span>' +
+      '<span><span class="lg-mk mk-order"></span>letter out of order with the totals</span>' +
+      '<span class="lg-hint">Type to replace · Enter or F2 to edit · Alt+↓ opens a drop-down list · select several rows, then choose a letter to give them all the same one · ' +
+      'Ctrl+C / Ctrl+V with Excel · right-click or Shift+F10 for cell actions · Esc, then Tab leaves the grid</span>' +
       '</div>';
   }
 
@@ -825,18 +1302,36 @@
       dom = { head: head, empty: box };
       return;
     }
+    var lockBanner = ui.el('<div class="callout grid-lock-banner" role="status" hidden></div>');
     var tb = ui.el(toolbarHtml());
+    var bar = ui.el(gradesBarHtml());
     var legend = ui.el(legendHtml());
     var wrap = ui.el('<div class="table-wrap grid-wrap"><table class="gt-grid" role="grid"></table></div>');
+    el.appendChild(lockBanner);
     el.appendChild(tb);
+    el.appendChild(bar);
     el.appendChild(legend);
     el.appendChild(wrap);
+    // An open list lifts its cell above the sticky header (has-popup). Once the grid scrolls the cell
+    // up under the header, drop that lift so the list slides under the header instead of covering it.
+    wrap.addEventListener('scroll', function () {
+      if (!editing || !editing.td || !editing.td.isConnected) return;
+      var thead = dom.table && dom.table.tHead;
+      if (!thead) return;
+      var under = editing.td.getBoundingClientRect().top < thead.getBoundingClientRect().bottom;
+      var hasPopup = !!(editing.hint || editing.list);
+      editing.td.classList.toggle('has-popup', hasPopup && !under);
+    }, { passive: true });
     dom = {
-      head: head, toolbar: tb, legend: legend, wrap: wrap, table: wrap.querySelector('table'),
+      head: head, toolbar: tb, bar: bar, lockBanner: lockBanner, legend: legend, wrap: wrap, table: wrap.querySelector('table'),
       search: tb.querySelector('.grid-search'), sort: tb.querySelector('.grid-sort-select'),
       group: tb.querySelector('[data-act="group"]'), withdrawn: tb.querySelector('[data-act="withdrawn"]'),
       columns: tb.querySelector('[data-act="columns"]'), roster: tb.querySelector('[data-act="paste-roster"]'),
-      count: tb.querySelector('.grid-count')
+      add: tb.querySelector('[data-act="add-student"]'), resort: tb.querySelector('[data-act="resort"]'),
+      count: tb.querySelector('.grid-count'),
+      meeting: bar.querySelector('[data-act="meeting"]'), lettersChip: bar.querySelector('[data-act="letters-chip"]'),
+      orderChip: bar.querySelector('[data-act="order-chip"]'), copySuggested: bar.querySelector('[data-act="copy-suggested"]'),
+      finalize: bar.querySelector('[data-act="finalize"]')
     };
     dom.search.value = searchText;
     dom.search.addEventListener('input', function () {
@@ -886,27 +1381,99 @@
     var canRoster = typeof GT.ui.openRosterPaste === 'function';
     var canImport = !!GT.views.exchange;
     var canSample = !!(GT.sample && GT.app && GT.app.actions && GT.app.actions.loadSample);
-    dom.empty.innerHTML = '<div class="empty-state">' + ui.icon('users', 'empty-ico') +
+    // Finalized with no students (older data, or every student deleted): Add student and Paste roster
+    // are refused, so the banner with its Unlock button is shown here too.
+    var banner = isFinalized(course) ? '<div class="callout grid-lock-banner grid-empty-lock" role="status">' + lockBannerHtml(course, null) + '</div>' : '';
+    var lockAttr = banner ? ' aria-disabled="true" title="Scores are finalized. Unlock them to add students."' : '';
+    dom.empty.innerHTML = banner + '<div class="empty-state">' + ui.icon('users', 'empty-ico') +
       '<h2>No students in ' + esc(course.code) + ' yet</h2>' +
       '<p>Add students one by one, paste a roster copied from Excel, or load fake sample data to try the app. ' +
       'Everything stays in this browser.</p><div class="actions">' +
       (canSample ? '<button type="button" class="btn btn-primary" data-act="load-sample">' + ui.icon('layers') + 'Load sample data</button>' : '') +
-      (canRoster ? '<button type="button" class="btn" data-act="paste-roster">' + ui.icon('copy') + 'Paste roster</button>' : '') +
-      '<button type="button" class="btn" data-act="add-student">' + ui.icon('plus') + 'Add student</button>' +
+      (canRoster ? '<button type="button" class="btn" data-act="paste-roster"' + lockAttr + '>' + ui.icon('copy') + 'Paste roster</button>' : '') +
+      '<button type="button" class="btn" data-act="add-student"' + lockAttr + '>' + ui.icon('plus') + 'Add student</button>' +
       (canImport ? '<button type="button" class="btn" data-act="import">' + ui.icon('upload') + 'Import from Excel/CSV</button>' : '') +
       '</div></div>';
   }
 
-  function renderToolbar() {
+  /** Sets innerHTML only when it changed (keeps focus on a button that stays the same). */
+  function setHtml(el, html) {
+    if (el.__html === html) return;
+    var had = el.contains(document.activeElement) ? document.activeElement.getAttribute('data-act') : null;
+    el.innerHTML = html;
+    el.__html = html;
+    if (had) {
+      var again = el.querySelector('[data-act="' + had + '"]');
+      if (again) again.focus();
+    }
+  }
+
+  function renderToolbar(course, results) {
     var p = getPrefs();
     var v = p.sort + ':' + p.dir;
     if (dom.sort.value !== v) dom.sort.value = v;
-    dom.group.setAttribute('aria-pressed', p.group ? 'true' : 'false');
+    var locked = isFinalized(course);
+    dom.group.setAttribute('aria-pressed', p.grouped ? 'true' : 'false');
+    dom.group.disabled = p.meeting;
+    dom.group.title = p.meeting ? 'Grouping by team is off in the Meeting view' : 'Group rows by team';
     dom.withdrawn.setAttribute('aria-pressed', p.showWithdrawn ? 'true' : 'false');
     dom.withdrawn.title = p.showWithdrawn ? 'Withdrawn students are shown greyed out. Click to hide them.' : 'Withdrawn students are hidden. Click to show them.';
     dom.roster.hidden = typeof GT.ui.openRosterPaste !== 'function';
+    // Finalized: no new students (their names and scores could not be typed in).
+    [dom.add, dom.roster].forEach(function (b) {
+      if (locked) b.setAttribute('aria-disabled', 'true'); else b.removeAttribute('aria-disabled');
+    });
+    dom.add.title = locked ? 'Scores are finalized. Unlock them to add students.' : 'Add a student';
     if (dom.search.value !== searchText && document.activeElement !== dom.search) dom.search.value = searchText;
+    dom.meeting.setAttribute('aria-pressed', p.meeting ? 'true' : 'false');
+    // Meeting view: the legend folds behind its button, so more rows fit on the screen.
+    if (dom.legend.classList.contains('meeting-mode') !== p.meeting) {
+      dom.legend.classList.toggle('meeting-mode', p.meeting);
+      dom.toolbar.classList.toggle('meeting-mode', p.meeting);
+      queueWrapTop();
+    }
+    dom.finalize.hidden = locked;
+    setHtml(dom.lockBanner, lockBannerHtml(course, results));
+    dom.lockBanner.hidden = !locked;
+    if (results) {
+      var sm = letterSummary(course, results);
+      var all = sm.active > 0 && sm.unassigned === 0 && !sm.invalid;
+      dom.lettersChip.className = 'chip grid-letters-chip' + (all ? ' ok' : ' warn');
+      setHtml(dom.lettersChip, (all ? ui.icon('check', 'icon-sm') : '') + 'Final letters: ' + sm.assigned + ' of ' + sm.active + ' assigned' +
+        (sm.invalid ? ' · ' + sm.invalid + ' not in the scale' : ''));
+      var tips = [];
+      if (sm.unassigned) tips.push(sm.unassigned + ' active student' + (sm.unassigned === 1 ? ' has' : 's have') + ' no final letter yet.');
+      if (sm.invalid) {
+        tips.push(plural(sm.invalid, 'final letter') + (sm.invalid === 1 ? ' is not a letter' : ' are not letters') + ' of the current scale (shown in red): choose another letter.');
+      }
+      dom.lettersChip.title = all ? 'Every active student has a final letter.' : tips.join(' ') + ' Click to go to the first one.';
+      // Counted like the Settings "Grading status" card: pairs of students (the tooltip names the students).
+      var oi = orderIssueMap(course, results);
+      dom.orderChip.hidden = !oi.count;
+      if (oi.count) {
+        var n = Object.keys(oi.map).length;
+        setHtml(dom.orderChip, ui.icon('alert', 'icon-sm') + plural(oi.count, 'order issue'));
+        dom.orderChip.title = plural(oi.count, 'order issue') + ': a student with a lower total has a higher final letter than a student with a higher total (' +
+          plural(n, 'student') + ' involved, marked ⚠ in Final letter). Click to go to the first one.';
+      }
+    }
     syncColumnsMenu();
+  }
+
+  /** The "Scores finalized" banner (grid and empty course). The date is in the computer's time zone;
+   * a long note is shortened (the whole note is in the tooltip and in History). */
+  function lockBannerHtml(course, results) {
+    if (!isFinalized(course)) return '';
+    var fz = course.finalized || {};
+    var note = typeof fz.note === 'string' ? fz.note.trim() : '';
+    var shortNote = note.length > NOTE_SHOWN ? note.slice(0, NOTE_SHOWN - 1).trim() + '…' : note;
+    var nPart = results ? emptyMeetingCells(course, results) : 0;
+    return ui.icon('lock') + '<span class="glb-text"><strong>Scores finalized' +
+      (fz.at ? ' on ' + esc(ui.dateTime(fz.at)) : '') + '.</strong> Score cells are locked; final letters stay editable.' +
+      (note ? ' <span class="muted glb-note"' + (shortNote !== note ? ' title="' + esc(note) + '"' : '') + '>Note: ' + esc(shortNote) + '</span>' : '') +
+      (nPart ? '<span class="glb-part">' + ui.icon('alert', 'icon-sm') + 'Participation is empty for ' + esc(plural(nPart, 'active student')) +
+        ' and is locked too. To set it in the meeting, unlock the scores first.</span>' : '') +
+      '</span><button type="button" class="btn btn-sm" data-act="unlock">' + ui.icon('lock') + 'Unlock scores…</button>';
   }
 
   function renderTable() {
@@ -926,8 +1493,36 @@
     if (prevRange && rangeSignature() !== prevRange) sel.end = sel.active;
     var ctx = {
       course: course, results: results, cols: layout.cols, dec: decimalsOf(course), teamById: layout.teamById,
-      nActive: results.activeIds.length, openStudent: typeof GT.ui.openStudent === 'function'
+      nActive: results.activeIds.length, openStudent: typeof GT.ui.openStudent === 'function',
+      nId: layout.nId, locked: isFinalized(course), letterSet: Object.create(null),
+      issues: orderIssueMap(course, results), summary: letterSummary(course, results), bandEnd: Object.create(null), att: null
     };
+    scaleLetters(course).forEach(function (l) { ctx.letterSet[l] = true; });
+    var noById = Object.create(null);
+    course.students.forEach(function (s) { noById[s.id] = s.no; });
+    ctx.nosOf = function (ids) {
+      var nos = ids.slice(0, 4).map(function (id) { return 'No ' + (typeof noById[id] === 'number' ? noById[id] : '?'); });
+      return nos.join(', ') + (ids.length > 4 ? ' and ' + (ids.length - 4) + ' more' : '');
+    };
+    if (layout.cols.some(function (c) { return c.kind === 'attExc' || c.kind === 'attUnx' || c.kind === 'attTot'; })) {
+      var attCache = Object.create(null);
+      ctx.att = function (sid) {
+        if (!(sid in attCache)) attCache[sid] = attSummary(course, sid);
+        return attCache[sid];
+      };
+    }
+    // Band boundaries: sorted by Total, high to low, a rule sits above the first row of each new final
+    // letter (active students only), so the bands read like the old sheet.
+    if (layout.prefs.sort === 'total' && layout.prefs.dir === 'desc' && !layout.prefs.grouped) {
+      var prev = null, prevRow = null;
+      layout.students.forEach(function (st, idx) {
+        if (st.status === 'withdrawn') return;
+        var fl = storedFinal(st) || '';
+        if (prevRow !== null && fl !== prev) ctx.bandEnd[layout.students[idx - 1].id] = true;
+        prev = fl;
+        prevRow = idx;
+      });
+    }
     var parts = [headHtml(ctx), '<tbody>'];
     var ariaRow = 2;
     for (var i = 0; i < layout.items.length; i++) {
@@ -950,7 +1545,13 @@
     table.setAttribute('aria-rowcount', String(ariaRow));
     table.setAttribute('aria-colcount', String(layout.cols.length));
     table.setAttribute('aria-label', 'Grades for ' + course.code);
-    table.classList.toggle('grouped', layout.prefs.group);
+    table.classList.toggle('grouped', layout.prefs.grouped);
+    table.classList.toggle('meeting', layout.prefs.meeting);
+    table.classList.toggle('locked', ctx.locked);
+    if (dom.resort && dom.resort.hidden !== !layout.stale) {
+      dom.resort.hidden = !layout.stale;
+      queueWrapTop();
+    }
     rowEls = [];
     var trs = table.tBodies[0].rows;
     for (var k = 0; k < trs.length; k++) {
@@ -982,6 +1583,7 @@
       }
     }
     lastRenderMs = root.performance ? root.performance.now() - t0 : 0;
+    dodgeToasts();
   }
 
   function render(el, ctx) {
@@ -1028,7 +1630,7 @@
     }
     renderHead(course, ctx.results);
     if (mode === 'empty') { renderEmpty(course); return; }
-    renderToolbar();
+    renderToolbar(course, ctx.results);
     queueWrapTop();
     if (editing) { tableDirty = true; return; }
     if (!rebuilt && !dataDirty && !switchedCourse && !ctx.switched && layout) return;
@@ -1040,11 +1642,13 @@
     // Leaving the view (e.g. Alt+2) removes the container before the editor's focusout can commit:
     // save the typed value now, like a click elsewhere does.
     if (editing) {
-      try { commitEdit(null, { soft: true }); } catch (e) { if (root.console) console.error(e); }
+      try { leaveEditor(); } catch (e) { if (root.console) console.error(e); }
     }
     editing = null;
     drag = null;
     tabExit = false;
+    var host = document.getElementById('toasts');
+    if (host) host.classList.remove(TOASTS_LEFT);
   }
 
   // ------------------------------------------------------------------ editing
@@ -1057,9 +1661,42 @@
       var a = model.findAssessment(course, col.aid);
       return a ? detailText(calc.scoreDetail(course, s, a)) : '';
     }
+    if (col.kind === 'final') return storedFinal(s) || '';
     return '';
   }
 
+  /** The hint under a drop-down cell's text box: what may be typed, and how many rows it applies to. */
+  function ddHintText(course, col, band) {
+    var what = col.kind === 'final' ? 'Type a letter: ' + scaleLetters(course).join(' ') : 'Type a value from the list: ' + choiceRange(col.a, col.choices);
+    return (band ? 'Applies to ' + plural(band.sids.length, 'selected student') + '. ' : '') + what + ' · Alt+↓ shows the list';
+  }
+
+  /** Keeps a popup that hangs off a cell (list, hint) inside the grid's scroll box: it opens upwards
+   * when there is no room below, and grows to the left when there is no room on the right. While it
+   * is open the cell sits over the sticky header and footer (css: has-popup), which it may cover. */
+  function fitPopup(el, td) {
+    td.classList.add('has-popup');
+    var wr = dom.wrap.getBoundingClientRect(), tr = td.getBoundingClientRect();
+    var h = el.offsetHeight, w = el.offsetWidth;
+    var below = el.classList.contains('dd-hint') ? tr.bottom + h : tr.top + h;
+    var above = el.classList.contains('dd-hint') ? tr.top - h : tr.bottom - h;
+    if (below > wr.bottom - 4 && above > wr.top) el.classList.add('drop-up');
+    if (tr.left + w > wr.left + dom.wrap.clientWidth - 4 && tr.right - w > wr.left) el.classList.add('grow-left');
+  }
+
+  function addHint(td, text, id) {
+    var h = document.createElement('div');
+    h.className = 'dd-hint';
+    h.id = id;
+    h.textContent = text;
+    td.appendChild(h);
+    fitPopup(h, td);
+    return h;
+  }
+
+  /** Opens an editor on the active cell. how: 'enter' (typing replaces the value), 'edit' (Enter, F2,
+   * double-click: keeps the value) or 'list' (Alt+Down). A drop-down cell (Final letter, a score with a
+   * list) opens its list for 'edit' and 'list'; typing gives a text box whose value must be on the list. */
   function startEdit(how, initial) {
     if (editing || !layout) return;
     var p = posOf(sel.active);
@@ -1067,40 +1704,51 @@
     var col = layout.cols[p.c];
     if (!col.edit) return;
     var course = cur();
+    if (lockedCol(course, col)) { notifyLocked(); return; }
     var s = model.findStudent(course, layout.students[p.r].id);
     var td = cellAt(p.r, p.c);
     if (!s || !td) return;
     var who = studentLabel(s);
     ensureVisible(td);
-    if (col.edit === 'team') { openTeamEditor(td, s, course, who); return; }
+    if (col.edit === 'team') { openTeamEditor(td, s, course, who, col); return; }
+    var band = col.dd ? bandRows() : null;
+    if (col.dd && how !== 'enter') { openListEditor(td, s, course, col, band, null); return; }
     var a = col.aid ? model.findAssessment(course, col.aid) : null;
     var current = editText(course, s, col);
     var input = document.createElement('input');
     input.type = 'text';
+    var numeric = col.kind === 'raw' || col.kind === 'no';
     input.className = 'cell-editor' + (col.kind === 'last' || col.kind === 'first' ? ' pii' : '') +
-      (col.kind === 'raw' || col.kind === 'no' ? ' is-num' : '');
+      (numeric ? ' is-num' : '') + (col.kind === 'final' ? ' is-letter' : '');
     input.setAttribute('autocomplete', 'off');
     input.setAttribute('spellcheck', 'false');
     if (col.kind === 'raw') input.setAttribute('inputmode', 'decimal');
     if (col.kind === 'no') input.setAttribute('inputmode', 'numeric');
-    input.setAttribute('aria-label', (col.kind === 'raw' ? (a ? a.name : col.label) : col.label) + ' for ' + who);
+    if (col.kind === 'final') input.setAttribute('autocapitalize', 'characters');
+    input.setAttribute('aria-label', (col.kind === 'raw' ? (a ? a.name : col.label) : col.label) + ' for ' + who +
+      (band ? ' and ' + plural(band.sids.length - (band.sids.indexOf(s.id) === -1 ? 0 : 1), 'other selected student') : ''));
     input.value = how === 'enter' ? (initial || '') : current;
     td.classList.add('is-editing');
     td.appendChild(input);
     editing = {
-      sid: s.id, key: col.key, kind: col.edit, aid: col.aid || null, mode: how, input: input, td: td,
-      original: current, max: a ? a.maxScore : null
+      sid: s.id, key: col.key, kind: col.edit, list: false, aid: col.aid || null, mode: how, input: input, td: td,
+      original: current, max: a ? a.maxScore : null, col: col, band: band, hint: null
     };
+    if (col.dd) {
+      editing.hint = addHint(td, ddHintText(course, col, band), 'dd-hint-live');
+      input.setAttribute('aria-describedby', 'dd-hint-live');
+    }
     input.classList.toggle('mode-edit', how === 'edit');
     try { input.focus({ preventScroll: true }); } catch (e) { input.focus(); }
     var len = input.value.length;
     try { input.setSelectionRange(len, len); } catch (e2) { /* ignore */ }
     validateEditor();
+    if (editing && editing.hint) dodgeToasts();
   }
 
-  function openTeamEditor(td, s, course, who) {
+  function openTeamEditor(td, s, course, who, col) {
     var box = document.createElement('select');
-    box.className = 'cell-editor team-editor';
+    box.className = 'cell-editor list-editor team-editor';
     var current = s.teamId && model.findTeam(course, s.teamId) ? s.teamId : '';
     box.innerHTML = '<option value="">(no team)</option>' + course.teams.map(function (t) {
       return '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>';
@@ -1110,15 +1758,128 @@
     box.setAttribute('aria-label', 'Team for ' + who + ' (Enter to choose, Esc to cancel)');
     td.classList.add('is-editing');
     td.appendChild(box);
-    var wr = dom.wrap.getBoundingClientRect(), tr = td.getBoundingClientRect();
-    if (tr.top + box.offsetHeight > wr.bottom - 4 && tr.bottom - box.offsetHeight > wr.top) box.classList.add('drop-up');
-    editing = { sid: s.id, key: 'team', kind: 'team', aid: null, mode: 'edit', input: box, td: td, original: current, max: null };
+    fitPopup(box, td);
+    editing = { sid: s.id, key: 'team', kind: 'team', list: true, aid: null, mode: 'edit', input: box, td: td, original: current, max: null, col: col, band: null, hint: null, pointerAt: 0 };
     try { box.focus({ preventScroll: true }); } catch (e) { box.focus(); }
+  }
+
+  /** Index of the value that typed text means: an exact match first (letters ignore case and spaces;
+   * numbers compare by value), else the first value that starts with it; -1 when none. Empty values
+   * ("(none)", "(empty)") are never matched. */
+  function findOption(values, kind, text) {
+    var norm = function (x) { return String(x).replace(/[‐-―−]/g, '-').replace(/\s+/g, '').toLowerCase(); };
+    var t = norm(text);
+    if (t === '') return -1;
+    var n = kind === 'choice' && /^[-+]?(\d+\.?\d*|\.\d+)$/.test(t) ? Number(t) : null;
+    var prefix = -1;
+    for (var i = 0; i < values.length; i++) {
+      var v = values[i];
+      if (v === '') continue;
+      if (norm(v) === t || (n !== null && util.fix(Number(v)) === util.fix(n))) return i;
+      if (prefix === -1 && norm(v).indexOf(t) === 0) prefix = i;
+    }
+    return prefix;
+  }
+
+  /** The drop-down list (a native <select> shown as a list box) of a Final letter or list-score cell.
+   * With a band (several selected rows), the chosen value applies to all of them. */
+  function openListEditor(td, s, course, col, band, typed) {
+    var box = document.createElement('select');
+    box.className = 'cell-editor list-editor dd-editor';
+    var opts;
+    if (col.kind === 'final') {
+      opts = [{ value: '', label: '(none)' }].concat(scaleLetters(course).map(function (l) { return { value: l, label: l }; }));
+    } else {
+      opts = [{ value: '', label: '(empty)' }].concat(col.choices.map(function (v) { return { value: String(v), label: String(v) }; }));
+    }
+    var optHtml = opts.map(function (o) { return '<option value="' + esc(o.value) + '">' + esc(o.label) + '</option>'; }).join('');
+    // Band: the list says how many students the choice applies to (a group label inside the list).
+    box.innerHTML = band ? '<optgroup label="' + esc('For ' + plural(band.sids.length, 'student')) + '">' + optHtml + '</optgroup>' : optHtml;
+    box.size = Math.max(3, Math.min(band ? 15 : 14, opts.length + (band ? 1 : 0)));
+    var current = listValueOf(course, s, col);
+    // A band opens with nothing highlighted unless every selected row already has the same value, so
+    // Enter or Tab without a choice never copies the active row's value to the whole band.
+    var bandSame = true;
+    if (band && band.sids.length) {
+      var first = listValueOf(course, model.findStudent(course, band.sids[0]), col);
+      bandSame = band.sids.every(function (id) { return listValueOf(course, model.findStudent(course, id), col) === first; });
+      if (bandSame) current = first;
+    }
+    box.value = current;
+    if (!bandSame || box.value !== current) box.selectedIndex = -1; // mixed band, or a value not on the list
+    if (typed) box.selectedIndex = findOption(opts.map(function (x) { return x.value; }), col.edit, typed);
+    var who = studentLabel(s);
+    var others = band ? band.sids.filter(function (id) { return id !== s.id; }).length : 0;
+    box.setAttribute('aria-label', (col.kind === 'final' ? 'Final letter' : col.a.name) + ' for ' + who +
+      (others ? ' and ' + plural(others, 'other selected student') : '') + ' (Enter to choose, Esc to cancel)');
+    td.classList.add('is-editing');
+    td.appendChild(box);
+    fitPopup(box, td);
+    editing = {
+      sid: s.id, key: col.key, kind: col.edit, list: true, aid: col.aid || null, mode: 'edit', input: box, td: td,
+      original: current, max: col.a ? col.a.maxScore : null, col: col, band: band, bandSame: !!band && bandSame, hint: null, taBuf: '', taAt: 0,
+      pointerAt: 0 // time of the last mouse press in this list (0 = none since it opened, or a key since)
+    };
+    try { box.focus({ preventScroll: true }); } catch (e) { box.focus(); }
+    dodgeToasts();
+  }
+
+  /** A student's value as the drop-down list spells it: the letter or list value, '' when empty, and
+   * '\u0000' for a value the list does not hold (invalid text). */
+  function listValueOf(course, s, col) {
+    if (!s) return '';
+    if (col.kind === 'final') return storedFinal(s) || '';
+    var d = calc.scoreDetail(course, s, col.a);
+    return d.state === 'number' ? String(util.fix(d.raw)) : (d.state === 'invalid' ? '\u0000' : '');
+  }
+
+  /** Type-ahead in a drop-down list: "4" picks 4 (not 4.5), "b+" picks B+. */
+  function listTypeAhead(k) {
+    var ed = editing;
+    var t = nowMs();
+    if (t - ed.taAt > 1000) ed.taBuf = '';
+    ed.taAt = t;
+    ed.taBuf += k;
+    var values = Array.prototype.map.call(ed.input.options, function (x) { return x.value; });
+    var idx = findOption(values, ed.kind, ed.taBuf);
+    if (idx === -1 && ed.taBuf.length > 1) {
+      ed.taBuf = k;
+      idx = findOption(values, ed.kind, k);
+    }
+    if (idx >= 0) ed.input.selectedIndex = idx;
+    else ddBadToast(ed, ed.taBuf, false);
+  }
+
+  /** Alt+Down in a drop-down cell's text box: show the list instead, with the typed value picked. */
+  function switchToList() {
+    var ed = editing;
+    if (!ed) return;
+    var typed = ed.input.value;
+    closeEditor(false);
+    var p = posOf({ sid: ed.sid, key: ed.key });
+    var course = cur();
+    var s = model.findStudent(course, ed.sid);
+    var td = p ? cellAt(p.r, p.c) : null;
+    if (!s || !td) return;
+    openListEditor(td, s, course, ed.col, ed.band, typed);
+  }
+
+  function ddBadMsg(ed, text) {
+    if (ed.kind === 'letter') {
+      return '“' + String(text).trim().slice(0, 20) + '” is not a letter of this course. Choose one of: ' + scaleLetters(cur()).join(', ') + '.';
+    }
+    return 'Choose a value from the list (' + choiceRange(ed.col.a, ed.col.choices) + ').';
+  }
+
+  function ddBadToast(ed, text, force) {
+    if (!force && nowMs() - ddToastAt < 2500) return;
+    ddToastAt = nowMs();
+    ui.toast(ddBadMsg(ed, text), { type: 'warn', timeout: 5000 });
   }
 
   function validateEditor() {
     var ed = editing;
-    if (!ed || ed.kind === 'team') return;
+    if (!ed || ed.list) return;
     var v = ed.input.value, bad = false, warn = false;
     if (ed.key === 'no') {
       var t = v.trim();
@@ -1127,6 +1888,13 @@
       var p = util.parseScoreInput(v, ed.max);
       bad = p.kind === 'invalid';
       warn = p.kind === 'number' && (p.value < 0 || (ed.max !== null && p.value > ed.max));
+    } else if (ed.kind === 'letter' || ed.kind === 'choice') {
+      // Red as soon as the text can no longer become a value of the list, and never for text that
+      // Enter would accept (a list value typed as a percentage of the max, "90%" = 4.5 of 5).
+      if (v.trim() !== '') {
+        bad = findOption(ed.kind === 'letter' ? scaleLetters(cur()) : ed.col.choices.map(String), ed.kind, v) === -1 &&
+          !!(ed.kind === 'letter' ? matchLetter(cur(), v) : matchChoice(ed.col.a, ed.col.choices, v)).bad;
+      }
     }
     ed.input.classList.toggle('is-bad', bad);
     ed.input.classList.toggle('is-warn', warn);
@@ -1138,7 +1906,8 @@
     if (!ed) return;
     editing = null;
     if (ed.input.parentNode) ed.input.parentNode.removeChild(ed.input);
-    ed.td.classList.remove('is-editing');
+    if (ed.hint && ed.hint.parentNode) ed.hint.parentNode.removeChild(ed.hint);
+    ed.td.classList.remove('is-editing', 'has-popup');
     if (refocus && ed.td.isConnected) focusCell(ed.td);
     if (tableDirty) { tableDirty = false; renderTable(); }
   }
@@ -1147,13 +1916,51 @@
     closeEditor(true);
   }
 
+  /** Focus or a click moved elsewhere: text is saved (like Excel); an open drop-down list closes
+   * without choosing anything, like a native drop-down. */
+  function leaveEditor() {
+    if (!editing) return;
+    if (editing.list && editing.kind !== 'team') closeEditor(false);
+    else commitEdit(null, { soft: true });
+  }
+
   /** Commits the open editor. move: null | 'enter' | 'up' | 'down' | 'left' | 'right' | 'tab' | 'shift-tab'.
    * opts.soft: focus has moved elsewhere (blur or a click), so do not take it back. */
   function commitEdit(move, opts) {
     var ed = editing;
     if (!ed) return true;
     var o = opts || {};
+    if (ed.list && ed.kind !== 'team') {
+      // Drop-down list: the highlighted option (nothing highlighted = nothing chosen).
+      var chosen = ed.input.selectedIndex < 0 ? null : ed.input.value;
+      closeEditor(!o.soft);
+      if (chosen === null) {
+        // Nothing chosen: nothing changes. Tab still moves on (it leaves the list).
+        if (!o.soft && (move === 'tab' || move === 'shift-tab')) moveAfterCommit(ed, move, false);
+        return true;
+      }
+      applyDropValue(ed, chosen === '' ? { empty: true } : (ed.kind === 'letter' ? { letter: chosen } : { value: Number(chosen) }), move, o,
+        ed.bandSame && chosen === ed.original);
+      return true;
+    }
     var value = ed.input.value;
+    if (ed.kind === 'letter' || ed.kind === 'choice') {
+      // Typed into a drop-down cell: it must be a value of the list; nothing else is ever stored.
+      var m = ed.kind === 'letter' ? matchLetter(cur(), value) : matchChoice(ed.col.a, ed.col.choices, value);
+      if (m.bad) {
+        if (o.soft) {
+          closeEditor(false);
+          ui.toast(ddBadMsg(ed, value) + ' Nothing was saved.', { type: 'warn', timeout: 6000 });
+          return false;
+        }
+        ddBadToast(ed, value, true);
+        ed.input.select();
+        return false;
+      }
+      closeEditor(!o.soft);
+      applyDropValue(ed, m, move, o);
+      return true;
+    }
     if (ed.key === 'no') {
       var t = value.trim();
       if (t !== '' && !(/^\d+$/.test(t) && parseInt(t, 10) >= 1)) {
@@ -1172,6 +1979,70 @@
     if (value !== ed.original) applyEdit(ed, value);
     if (move) moveAfterCommit(ed, move, wasNew);
     return true;
+  }
+
+  /** Stores a value chosen (or typed) in a drop-down cell: for the one student, or for every student of
+   * the band. m: { empty } | { letter } | { value }. Then moves like a score edit; after a band, the
+   * cursor waits on the row below it, ready for the next band. unchanged: the band's list opened on
+   * the value every row already has, and it was chosen again (nothing to write). */
+  function applyDropValue(ed, m, move, o, unchanged) {
+    var course = cur();
+    var s = model.findStudent(course, ed.sid);
+    if (!s) return;
+    var band = ed.band && ed.band.sids.length ? ed.band : null;
+    if (ed.band && !band) {
+      ui.toast('Only withdrawn students are selected: nothing was changed.', { type: 'info' });
+      return;
+    }
+    if (band && unchanged) {
+      // Nothing to write; the cursor still moves below the band, ready for the next one.
+    } else if (ed.kind === 'letter') {
+      var letter = m.empty ? null : m.letter;
+      if (band) {
+        var n = 0;
+        focusUntil = nowMs() + 1500;
+        transact((letter ? 'Final letter ' + letter : 'Clear final letter') + ' for ' + plural(band.sids.length, 'student'), function (c) {
+          n = writeFinalLetters(c, band.sids.map(function (id) { return { studentId: id, letter: letter }; }));
+        });
+        var msg = (letter ? 'Final letter ' + letter + ' set for ' : 'Final letter cleared for ') + plural(band.sids.length, 'student') + '.' +
+          (n < band.sids.length ? ' (' + (band.sids.length - n) + ' already had it.)' : '') +
+          (ed.band.withdrawn ? ' ' + plural(ed.band.withdrawn, 'withdrawn student') + ' skipped.' : '');
+        if (!bandToastShown && letter) {
+          bandToastShown = true;
+          msg += ' Next: select the next group of rows (Shift+↓ or Shift+click) and choose its letter.';
+        }
+        gridToast(msg, { type: 'success', timeout: 6000 });
+      } else if (storedFinal(s) !== letter) {
+        transact('Edit final letter', function (c) {
+          writeFinalLetters(c, [{ studentId: ed.sid, letter: letter }]);
+        });
+      }
+    } else {
+      var text = m.empty ? '' : String(m.value);
+      if (band) {
+        runBlock({
+          ops: band.sids.map(function (id) { return { sid: id, kind: 'raw', aid: ed.aid, text: text }; }),
+          skipped: [], fill: true, source: 'edit', droppedRows: 0, droppedCols: 0, selA: null, selE: null,
+          label: (text === '' ? 'Clear ' + ed.col.a.name : ed.col.a.name + ' ' + text) + ' for ' + plural(band.sids.length, 'student'),
+          doneMsg: (text === '' ? ed.col.a.name + ' cleared for ' : ed.col.a.name + ' ' + text + ' set for ') + plural(band.sids.length, 'student') + '.' +
+            (ed.band.withdrawn ? ' ' + plural(ed.band.withdrawn, 'withdrawn student') + ' skipped.' : '')
+        }, null);
+      } else if (text !== ed.original) {
+        applyEdit(ed, text);
+      }
+    }
+    if (o && o.soft) return;
+    if (band) {
+      var p = posOf({ sid: ed.sid, key: ed.key });
+      var nR = layout.students.length;
+      if (!p) return;
+      tabStartKey = null;
+      if (!move || move === 'enter' || move === 'down') moveTo(Math.min(ed.band.r2 + 1, nR - 1), p.c, false);
+      else if (move === 'up') moveTo(Math.max(ed.band.r1 - 1, 0), p.c, false);
+      else moveAfterCommit(ed, move, false);
+    } else if (move) {
+      moveAfterCommit(ed, move, false);
+    }
   }
 
   function moveAfterCommit(ed, move, wasNew) {
@@ -1245,7 +2116,7 @@
       });
     } else if (ed.key === 'team') {
       changeTeam(ed.sid, value);
-    } else if (ed.kind === 'score') {
+    } else if (ed.kind === 'score' || ed.kind === 'choice') {
       var a = model.findAssessment(course, ed.aid);
       if (!a) return;
       var info = null;
@@ -1355,20 +2226,73 @@
       var own = model.getEntry(course.scores, m.id, aid);
       return own && own.override === true;
     }).length;
+    var help = 'Applies to all ' + plural(members.length, 'member') + (overrides ? ' except ' + overrides + ' with a per-member override (◆)' : '');
+    var entry = model.getEntry(course.teamScores, teamId, aid);
+    var save = function (text) {
+      refocusGrid();
+      transact('Edit team score (' + a.name + ')', function (c) {
+        model.setTeamScore(c, teamId, aid, model.entryFromInput(text, model.getEntry(c.teamScores, teamId, aid), a.maxScore));
+      });
+    };
+    var list = choiceValues(a);
+    if (list.length) {
+      // A drop-down item (DECISIONS 8): the team score is chosen from the list, never typed. A stored
+      // value that is not on the list (imported) can be kept as it is, but no new one can be entered.
+      var fld = listField(a, list, entry, 'Team score: choose from the list (' + choiceRange(a, list) + ')', 'keep');
+      fld.field.help = help + '. Choose (empty) to clear it.';
+      ui.dialog.form({
+        title: a.name + ': ' + team.name + ' team score',
+        fields: [fld.field],
+        confirmText: 'Save team score',
+        validate: function (v) { return fld.check(v.value); }
+      }).then(function (v) {
+        if (!v || v.value === LIST_KEEP) { refocusGrid(); return; }
+        save(v.value);
+      });
+      return;
+    }
     ui.dialog.prompt({
       title: a.name + ': ' + team.name + ' team score',
       label: 'Team score (max ' + num(a.maxScore, 4) + ')',
-      value: entryText(model.getEntry(course.teamScores, teamId, aid)),
-      help: 'Applies to all ' + plural(members.length, 'member') + (overrides ? ' except ' + overrides + ' with a per-member override (◆)' : '') +
-        '. Leave empty to clear it.',
+      value: entryText(entry),
+      help: help + '. Leave empty to clear it.',
       confirmText: 'Save team score'
     }).then(function (v) {
       if (v === null) { refocusGrid(); return; }
-      refocusGrid();
-      transact('Edit team score (' + a.name + ')', function (c) {
-        model.setTeamScore(c, teamId, aid, model.entryFromInput(v, model.getEntry(c.teamScores, teamId, aid), a.maxScore));
-      });
+      save(v);
     });
+  }
+
+  var LIST_KEEP = '__keep__';
+  var LIST_CHOOSE = '__choose__';
+
+  /** A select field of a drop-down item's values plus "(empty)", for the team-score and override
+   * dialogs. entry: the value shown first. When it is not a list value (imported data, invalid text),
+   * the first option either keeps it unchanged (ifOff 'keep': value LIST_KEEP) or asks for a choice
+   * (ifOff 'choose': LIST_CHOOSE, refused by check). Returns { field, check(value) -> error | null }. */
+  function listField(a, list, entry, label, ifOff) {
+    var opts = [{ value: '', label: '(empty)' }].concat(list.map(function (v) { return { value: String(v), label: String(v) }; }));
+    var shown = entryText(entry);
+    var value = '';
+    if (model.hasScore(entry) && typeof entry.value === 'number' && isChoiceValue(a, list, entry.value)) {
+      value = String(util.fix(entry.value));
+    } else if (shown !== '') {
+      if (ifOff === 'keep') {
+        opts.unshift({ value: LIST_KEEP, label: 'Keep ' + shown.slice(0, 30) + ' (not on the list)' });
+        value = LIST_KEEP;
+      } else {
+        opts.unshift({ value: LIST_CHOOSE, label: 'Choose a value… (' + shown.slice(0, 30) + ' is not on the list)' });
+        value = LIST_CHOOSE;
+      }
+    }
+    return {
+      field: { name: 'value', label: label, type: 'select', value: value, options: opts },
+      check: function (v) {
+        if (v === LIST_KEEP || v === '') return null;
+        if (v === LIST_CHOOSE || matchChoice(a, list, v).value === undefined) return 'Choose a value from the list (' + choiceRange(a, list) + '), or (empty).';
+        return null;
+      }
+    };
   }
 
   function overrideDialog(sid, aid) {
@@ -1380,18 +2304,23 @@
     var teamEntry = model.getEntry(course.teamScores, team.id, aid);
     var teamText = entryText(teamEntry);
     var who = studentLabel(s);
+    // A drop-down item (DECISIONS 8): the override is chosen from the list as well.
+    var list = choiceValues(a);
+    var fld = list.length ? listField(a, list, teamEntry, a.name + ' score for ' + who + ': choose from the list (' + choiceRange(a, list) + ')', 'choose') : null;
+    var valueField = fld ? fld.field : { name: 'value', label: a.name + ' score for ' + who + ' (max ' + num(a.maxScore, 4) + ')', value: teamText };
+    valueField.help = fld ? 'Choose (empty) to give this student no score for this item.' : 'Leave empty to give this student no score for this item.';
     ui.dialog.form({
       title: 'Override ' + a.name + ' for ' + who,
       introHtml: '<div class="callout callout-warn" style="margin-bottom:12px">All members of a team get the same mark unless the team agrees ' +
         '<strong>in writing</strong> to an unequal split. The override is marked with ◆ and logged in History.</div>' +
         '<p class="muted small">' + esc(team.name) + ' team score: <strong>' + esc(teamText || 'empty') + '</strong>. Other members keep the team score.</p>',
       fields: [
-        { name: 'value', label: a.name + ' score for ' + who + ' (max ' + num(a.maxScore, 4) + ')', value: teamText,
-          help: 'Leave empty to give this student no score for this item.' },
+        valueField,
         { name: 'reason', label: 'Reason (optional, saved with the change in History)', placeholder: 'e.g. team agreement email, Oct 12' }
       ],
       confirmText: 'Save override',
       validate: function (v) {
+        if (fld) return fld.check(v.value);
         return util.parseScoreInput(v.value, a.maxScore).kind === 'invalid' ? 'Enter a number, or leave it empty.' : null;
       }
     }).then(function (v) {
@@ -1430,14 +2359,19 @@
     var rc = rectOf();
     if (!rc) return;
     var course = cur();
+    var locked = isFinalized(course);
     // No is cleared only when the selection stays inside the No column (a wider Delete is about scores).
     var noOnly = rc.c1 === rc.c2 && layout.cols[rc.c1].kind === 'no';
-    var targets = [], skipped = 0, skippedNo = 0;
+    var targets = [], skipped = 0, skippedNo = 0, skippedLocked = 0;
     var teamClears = Object.create(null), teamClearList = [];
     for (var r = rc.r1; r <= rc.r2; r++) {
       for (var c = rc.c1; c <= rc.c2; c++) {
         var col = layout.cols[c], sid = layout.students[r].id;
-        if (col.kind === 'raw') {
+        if (col.kind === 'final') {
+          targets.push({ sid: sid, final: true }); // final letters stay editable after finalizing
+        } else if (locked && col.edit) {
+          skippedLocked++;
+        } else if (col.kind === 'raw') {
           var t = { sid: sid, aid: col.aid };
           // A team-graded cell without an override clears the TEAM score (K5), for every member.
           var s = model.findStudent(course, sid), a = col.a;
@@ -1459,7 +2393,9 @@
       }
     }
     if (!targets.length) {
-      if (skipped || skippedNo) {
+      if (skippedLocked) {
+        notifyLocked();
+      } else if (skipped || skippedNo) {
         ui.toast((skippedNo ? 'No, names and teams are not cleared with Delete (select only No cells to clear them).' :
           'Names and teams are not cleared with Delete.') + ' Press F2 (or double-click) to edit the cell.', { type: 'info' });
       } else {
@@ -1470,7 +2406,33 @@
     var left = [];
     if (skippedNo) left.push('No');
     if (skipped) left.push('names', 'teams');
-    // A multi-cell Delete that would also empty the team score of members outside the selection asks first.
+    if (skippedLocked) left.push('finalized scores');
+    // Many final letters at once (Ctrl+A, then Delete) ask first: they are the grades being decided.
+    var nLetters = 0;
+    targets.forEach(function (t) { if (t.final && storedFinal(model.findStudent(course, t.sid)) !== null) nLetters++; });
+    if (nLetters > LETTERS_CONFIRM) {
+      var rest = targets.filter(function (t) { return !t.final; });
+      ui.dialog.open({
+        title: 'Clear ' + plural(nLetters, 'final letter') + '?',
+        bodyHtml: '<p>The selection includes the <strong>Final letter</strong> column: Delete clears the final letter of <strong>' +
+          esc(plural(nLetters, 'student')) + '</strong>' + (rest.length ? ', together with the other selected cells.' : '.') + '</p>' +
+          '<p class="muted small">Undo with Ctrl+Z. Every change is logged in History.</p>',
+        buttons: [{ text: 'Cancel', value: null }, { spacer: true }]
+          .concat(rest.length ? [{ text: 'Keep the final letters', value: 'rest' }] : [])
+          .concat([{ text: rest.length ? 'Clear all selected cells' : 'Clear ' + plural(nLetters, 'final letter'), value: 'all', primary: true, danger: true }])
+      }).then(function (v) {
+        refocusGrid();
+        if (!v) return;
+        if (v === 'rest') left.push('final letters');
+        clearTeamCheck(course, v === 'rest' ? rest : targets, teamClearList, left);
+      });
+      return;
+    }
+    clearTeamCheck(course, targets, teamClearList, left);
+  }
+
+  /** A multi-cell Delete that would also empty the team score of members outside the selection asks first. */
+  function clearTeamCheck(course, targets, teamClearList, left) {
     var outside = Object.create(null), outsideTeams = [], outsideAsmts = [];
     if (targets.length > 1) {
       teamClearList.forEach(function (tc) {
@@ -1513,8 +2475,13 @@
   function doClear(targets, left) {
     var teams = Object.create(null), removed = [];
     focusUntil = nowMs() + 1500;
-    transact(targets.length === 1 ? 'Clear cell' : 'Clear ' + targets.length + ' cells', function (c) {
+    var finals = targets.filter(function (t) { return t.final; });
+    var label = targets.length === 1 ? (finals.length ? 'Clear final letter' : 'Clear cell') : 'Clear ' + targets.length + ' cells';
+    var nLetters = 0;
+    transact(label, function (c) {
+      if (finals.length) nLetters = writeFinalLetters(c, finals.map(function (t) { return { studentId: t.sid, letter: null }; }));
       targets.forEach(function (t) {
+        if (t.final) return;
         if (t.no) {
           var st = model.findStudent(c, t.sid);
           if (st) st.no = null;
@@ -1527,6 +2494,8 @@
       });
     });
     var msgs = [];
+    // Say what a wide Delete did to the final letters (the rest of the message lists what it left alone).
+    if (nLetters && targets.length > 1) msgs.push(plural(nLetters, 'final letter') + ' cleared.');
     var tn = Object.keys(teams);
     if (tn.length) msgs.push('Team score cleared for ' + tn.map(function (n) { return n + ' (' + plural(teams[n], 'member') + ')'; }).join(', ') + '.');
     // Delete on a ◆ cell removes the override: the student then gets the team score, not an empty cell.
@@ -1549,7 +2518,16 @@
     if (nowMs() - readOnlyToastAt < 5000) return;
     readOnlyToastAt = nowMs();
     var p = posOf(sel.active);
-    var label = p ? layout.cols[p.c].label : 'This column';
+    var col = p ? layout.cols[p.c] : null;
+    if (col && col.kind === 'letter') {
+      ui.toast('Suggested comes from the letter cutoffs and cannot be edited. Choose the Final letter instead (next column).', { type: 'info', timeout: 4000 });
+      return;
+    }
+    if (col && (col.kind === 'attExc' || col.kind === 'attUnx' || col.kind === 'attTot')) {
+      ui.toast('Absences come from the Attendance tab.', { type: 'info', timeout: 3000 });
+      return;
+    }
+    var label = col ? col.label : 'This column';
     ui.toast(label + ' is calculated and cannot be edited. Edit the raw scores instead.', { type: 'info', timeout: 3000 });
   }
 
@@ -1566,12 +2544,16 @@
       case 'weighted': return num(rs.items[col.aid] ? rs.items[col.aid].weighted : 0, dec);
       case 'total': return num(rs.total, dec);
       case 'letter': return rs.letter || '';
+      case 'final': return storedFinal(s) || '';
       case 'rank': return wd || rs.rank === null ? '' : String(rs.rank);
       case 'pct': return wd || rs.percentile === null ? '' : num(rs.percentile, 0);
       case 'diff': return wd || rs.diffFromAverage === null ? '' : num(rs.diffFromAverage, dec);
-      case 'att': {
+      case 'attExc':
+      case 'attUnx':
+      case 'attTot': {
         var sm = attendanceAvailable(course) ? attSummary(course, s.id) : null;
-        return sm ? sm.totalAbsences + ' (' + sm.unexcused + ' unexc.)' : '';
+        if (!sm) return '';
+        return String(whole(col.kind === 'attExc' ? sm.excused : col.kind === 'attUnx' ? sm.unexcused : sm.totalAbsences));
       }
     }
     return '';
@@ -1671,6 +2653,8 @@
     var nCols = fill ? rc.c2 - rc.c1 + 1 : width;
     var nR = layout.students.length, nC = layout.cols.length;
     var ops = [], skipped = [], skippedSeen = Object.create(null);
+    var course = cur(), locked = isFinalized(course);
+    var bad = { letters: 0, list: 0, listRanges: [], locked: 0 };
     for (var i = 0; i < nRows && r0 + i < nR; i++) {
       var sid = layout.students[r0 + i].id;
       for (var j = 0; j < nCols && c0 + j < nC; j++) {
@@ -1681,11 +2665,29 @@
           if (!skippedSeen[col.key]) { skippedSeen[col.key] = true; skipped.push(col.label); }
           continue;
         }
-        ops.push({ sid: sid, kind: col.kind, aid: col.aid || null, text: String(text) });
+        if (locked && col.kind !== 'final') { bad.locked++; continue; }
+        var op = { sid: sid, kind: col.kind, aid: col.aid || null, text: String(text) };
+        // Drop-down cells take only values of their list: anything else is skipped and reported.
+        if (col.kind === 'final') {
+          var ml = matchLetter(course, op.text);
+          if (ml.bad) { bad.letters++; continue; }
+          op.letter = ml.empty ? null : ml.letter;
+        } else if (col.dd) {
+          var mc = matchChoice(col.a, col.choices, op.text);
+          if (mc.bad) {
+            bad.list++;
+            var rg = col.a.name + ': ' + choiceRange(col.a, col.choices);
+            if (bad.listRanges.indexOf(rg) === -1) bad.listRanges.push(rg);
+            continue;
+          }
+          op.text = mc.empty ? '' : String(mc.value);
+        }
+        ops.push(op);
       }
     }
+    if (!ops.length && bad.locked && !bad.letters && !bad.list) { notifyLocked(); return; }
     var job = {
-      ops: ops, skipped: skipped, fill: fill, source: o.source || 'paste',
+      ops: ops, skipped: skipped, fill: fill, source: o.source || 'paste', bad: bad,
       droppedRows: Math.max(0, r0 + nRows - nR), droppedCols: Math.max(0, c0 + nCols - nC),
       // The pasted area, as cell refs taken now (a dialog may come first).
       selA: refAt(r0, c0), selE: refAt(Math.min(r0 + nRows - 1, nR - 1), Math.min(c0 + nCols - 1, nC - 1))
@@ -1753,7 +2755,12 @@
     if (ops.length) {
       var label = (fill ? 'Fill ' : 'Paste ') + plural(ops.length, 'cell');
       focusUntil = nowMs() + 1500;
-      transact(label, function (c) {
+      transact(job.label || label, function (c) {
+        var finals = ops.filter(function (op) { return op.kind === 'final'; });
+        if (finals.length) {
+          writeFinalLetters(c, finals.map(function (op) { return { studentId: op.sid, letter: op.letter }; }));
+          sum.cells += finals.length;
+        }
         var teamByName = Object.create(null);
         c.teams.forEach(function (t) { teamByName[t.name.trim().toLowerCase()] = t.id; });
         // Identity columns first, so team moves apply before team-graded scores.
@@ -1825,16 +2832,25 @@
       }, { source: job.source });
       // Select the pasted area, like Excel. (If the re-render re-sorts the rows, renderTable
       // collapses it to the active cell.)
-      if (posOf(job.selA) && posOf(job.selE)) {
+      if (job.selA && posOf(job.selA) && posOf(job.selE)) {
         sel.active = job.selA;
         sel.end = job.selE;
         paintSelection();
         focusActive();
       }
     }
-    var msg = [];
-    if (ops.length) msg.push((fill ? 'Filled ' : 'Pasted ') + plural(sum.cells, 'cell') + '.');
+    var msg = [], jb = job.bad || { letters: 0, list: 0, listRanges: [], locked: 0 };
+    if (ops.length) msg.push(job.doneMsg || ((fill ? 'Filled ' : 'Pasted ') + plural(sum.cells, 'cell') + '.'));
     else msg.push('Nothing was pasted.');
+    if (jb.letters) {
+      msg.push(plural(jb.letters, 'value') + ' in Final letter ' + (jb.letters === 1 ? 'was not a letter' : 'were not letters') +
+        ' of this course (' + scaleLetters(cur()).join(', ') + ') and ' + (jb.letters === 1 ? 'was' : 'were') + ' skipped.');
+    }
+    if (jb.list) {
+      msg.push(plural(jb.list, 'value') + (jb.list === 1 ? ' was' : ' were') + ' not on the drop-down list (' + jb.listRanges.join('; ') +
+        ') and ' + (jb.list === 1 ? 'was' : 'were') + ' skipped.');
+    }
+    if (jb.locked) msg.push(plural(jb.locked, 'score cell') + ' not changed: scores are finalized (unlock them to edit).');
     if (sum.overrides) {
       msg.push(sum.overrides + ' team-graded value' + (sum.overrides === 1 ? '' : 's') + ' differed from ' +
         (sum.overrides === 1 ? 'its' : 'their') + ' team\'s score and ' + (sum.overrides === 1 ? 'was' : 'were') +
@@ -1855,8 +2871,8 @@
     } else if (keep === false && sum.moved) {
       msg.push('Students who changed team now use their new team\'s scores.');
     }
-    var warn = job.droppedRows || job.droppedCols || sum.badNo || !ops.length;
-    ui.toast(msg.join(' '), { type: warn ? 'warn' : 'success', timeout: warn || sum.overrides || sum.kept ? 9000 : 4000 });
+    var warn = job.droppedRows || job.droppedCols || sum.badNo || !ops.length || jb.letters || jb.list || jb.locked;
+    (job.doneMsg ? gridToast : ui.toast)(msg.join(' '), { type: warn ? 'warn' : 'success', timeout: warn || sum.overrides || sum.kept ? 9000 : 4000 });
   }
 
   // ------------------------------------------------------------------ cell menu
@@ -1873,19 +2889,46 @@
     var rs = results.byId[s.id];
     var detail = a && rs ? rs.items[a.id] : null;
     var multi = hasRange();
+    var locked = lockedCol(course, col);
+    var band = col.dd && !locked ? bandRows() : null;
     var items = [{ heading: studentLabel(s) + ' · ' + col.label }];
-    if (col.kind === 'raw' && a) {
+    if (locked) {
+      items.push({ label: 'Scores are finalized: unlock to edit…', icon: 'lock', onSelect: unlockScores });
+    } else if (col.kind === 'final') {
+      if (band) {
+        items.push({ label: 'Set final letter for ' + plural(band.sids.length, 'selected student') + ' ▸', icon: 'edit', hint: 'Enter', onSelect: function () { startEdit('list'); } });
+      } else {
+        items.push({ label: 'Choose final letter ▸', icon: 'edit', hint: 'Enter', onSelect: function () { startEdit('list'); } });
+        var fl = storedFinal(s);
+        if (rs && rs.letter && fl !== rs.letter && scaleLetters(course).indexOf(rs.letter) !== -1) {
+          items.push({
+            label: 'Use the suggested letter (' + rs.letter + ')', icon: 'check',
+            onSelect: function () {
+              refocusGrid();
+              transact('Edit final letter', function (c) { writeFinalLetters(c, [{ studentId: s.id, letter: rs.letter }]); });
+            }
+          });
+        }
+      }
+      items.push({ label: multi ? 'Clear selected cells' : 'Clear final letter', icon: 'x', hint: 'Del', onSelect: clearCells });
+    } else if (col.kind === 'raw' && a) {
       var team = a.teamGraded && s.teamId ? model.findTeam(course, s.teamId) : null;
+      if (col.dd) {
+        items.push({
+          label: band ? 'Set ' + a.name + ' for ' + plural(band.sids.length, 'selected student') + ' ▸' : 'Choose from the list ▸',
+          icon: 'edit', hint: 'Enter', onSelect: function () { startEdit('list'); }
+        });
+      }
       if (team) {
         var tv = entryText(model.getEntry(course.teamScores, team.id, a.id)) || 'empty';
         if (detail && detail.override) {
           items.push({ label: 'Remove override (use team score ' + tv + ')', icon: 'diamond', onSelect: function () { removeOverride(s.id, a.id); } });
-          items.push({ label: 'Edit override value', icon: 'edit', hint: 'F2', onSelect: function () { startEdit('edit'); } });
+          if (!col.dd) items.push({ label: 'Edit override value', icon: 'edit', hint: 'F2', onSelect: function () { startEdit('edit'); } });
         } else {
           items.push({ label: 'Override for this student only…', icon: 'diamond', onSelect: function () { overrideDialog(s.id, a.id); } });
         }
         items.push({ label: 'Edit team score…', icon: 'users', onSelect: function () { editTeamScore(team.id, a.id); } });
-      } else {
+      } else if (!col.dd) {
         items.push({ label: 'Edit score', icon: 'edit', hint: 'F2', onSelect: function () { startEdit('edit'); } });
       }
       items.push({ label: multi ? 'Clear selected cells' : 'Clear score', icon: 'x', hint: 'Del', onSelect: clearCells });
@@ -1893,6 +2936,11 @@
       items.push({ label: col.kind === 'team' ? 'Change team…' : 'Edit ' + col.label.toLowerCase(), icon: 'edit', hint: col.kind === 'team' ? '' : 'F2', onSelect: function () { startEdit('edit'); } });
     }
     items.push({ label: multi ? 'Copy selection' : 'Copy', icon: 'copy', hint: 'Ctrl+C', onSelect: copySelection });
+    if (col.kind === 'raw' && a && !locked) {
+      // The whole column (the header's ⋯ button offers the same, for the mouse).
+      items.push({ separator: true });
+      items = items.concat(columnItems(a.id));
+    }
     items.push({ separator: true });
     items.push({
       label: 'Open student details', icon: 'user', disabled: typeof GT.ui.openStudent !== 'function',
@@ -1909,6 +2957,8 @@
         rows: layout.students.slice(rc.r1, rc.r2 + 1).map(function (x) { return x.id; }),
         cols: layout.cols.slice(rc.c1, rc.c2 + 1).map(function (x) { return x.key; })
       },
+      // Scores are finalized: extensions that change scores (late work) should offer "unlock" instead.
+      finalized: isFinalized(course),
       store: GT.store, refocus: refocusGrid
     };
     var ext = [];
@@ -1926,6 +2976,391 @@
       pt = { x: r.left + 6, y: r.bottom + 2 };
     }
     ui.menu(pt || { x: 20, y: 20 }, items, { returnFocus: td });
+  }
+
+  // ------------------------------------------------------------------ column actions (fill, set, clear)
+
+  function columnItems(aid) {
+    var a = model.findAssessment(cur(), aid);
+    if (!a) return [];
+    return [
+      { heading: 'Whole column: ' + a.name },
+      { label: 'Fill empty cells of active students with…', icon: 'edit', onSelect: function () { fillColumn(aid, 'empty'); } },
+      { label: 'Set every active student to…', icon: 'users', onSelect: function () { fillColumn(aid, 'all'); } },
+      { label: 'Clear column…', icon: 'x', danger: true, onSelect: function () { fillColumn(aid, 'clear'); } }
+    ];
+  }
+
+  /** The ⋯ menu of a raw-score header (or right-click / Shift+F10 on it). */
+  function openColumnMenu(anchor, aid) {
+    var course = cur();
+    var a = model.findAssessment(course, aid);
+    if (!a) return;
+    var items;
+    if (isFinalized(course)) {
+      items = [{ heading: a.name }, { label: 'Scores are finalized: unlock to edit…', icon: 'lock', onSelect: unlockScores }];
+    } else {
+      items = columnItems(aid);
+      items[0] = { heading: a.name };
+    }
+    ui.menu(anchor, items, { returnFocus: anchor && anchor.focus ? anchor : null });
+  }
+
+  /** Column fill (ONE transaction each). mode: 'empty' (fill the empty cells of active students),
+   * 'all' (set every active student) or 'clear'. Team-graded columns write team scores; members with
+   * an override keep it for 'empty' (its value is filled when empty) and lose it for 'all'. */
+  function fillColumn(aid, mode) {
+    var course = cur();
+    var a = model.findAssessment(course, aid);
+    if (!a) return;
+    if (isFinalized(course)) { notifyLocked(); return; }
+    var results = res();
+    var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; });
+    var filled = 0;
+    active.forEach(function (s) {
+      var d = results.byId[s.id] && results.byId[s.id].items[aid];
+      if (d && d.state !== 'empty') filled++;
+    });
+    var empties = active.length - filled;
+    var list = choiceValues(a);
+    var run = function (text) {
+      var info = { n: 0, teams: 0, overrides: 0 };
+      focusUntil = nowMs() + 1500;
+      var label = mode === 'empty' ? 'Fill empty ' + a.name + ' cells' : mode === 'all' ? 'Set ' + a.name + ' for every active student' : 'Clear ' + a.name;
+      transact(label, function (c) {
+        var asmt = model.findAssessment(c, aid);
+        if (!asmt) return;
+        var teams = Object.create(null);
+        c.students.forEach(function (s) {
+          if (s.status === 'withdrawn') return;
+          var team = asmt.teamGraded && s.teamId ? model.findTeam(c, s.teamId) : null;
+          var eff = model.effectiveEntry(c, s, asmt);
+          if (mode === 'empty' && model.hasScore(eff)) return;
+          if (mode === 'clear' && !model.hasScore(eff)) return;
+          var own = team ? model.getEntry(c.scores, s.id, aid) : null;
+          if (team && own && own.override === true) {
+            if (mode === 'empty') { writeScore(c, s.id, aid, text); info.n++; return; }
+            model.clearOverride(c, s.id, aid);
+            info.overrides++;
+          }
+          if (team) { teams[team.id] = true; info.n++; return; }
+          writeScore(c, s.id, aid, mode === 'clear' ? '' : text);
+          info.n++;
+        });
+        Object.keys(teams).forEach(function (tid) {
+          var prev = model.getEntry(c.teamScores, tid, aid);
+          model.setTeamScore(c, tid, aid, model.entryFromInput(mode === 'clear' ? '' : text, prev, asmt.maxScore));
+          info.teams++;
+        });
+      });
+      var msg = mode === 'clear' ? a.name + ' cleared for ' + plural(info.n, 'active student') + '.' :
+        (mode === 'empty' ? 'Filled ' + plural(info.n, 'empty cell') : a.name + ' set to ' + text + ' for ' + plural(info.n, 'active student')) +
+        (mode === 'empty' ? ' of ' + a.name + ' with ' + text : '') + '.';
+      if (info.teams) msg += ' ' + plural(info.teams, 'team score') + ' written (they apply to every member).';
+      if (info.overrides) msg += ' ' + plural(info.overrides, 'per-member override') + ' (◆) removed.';
+      ui.toast(msg + ' Undo with Ctrl+Z.', { type: 'success', timeout: 6000 });
+    };
+    if (mode === 'clear') {
+      if (!filled) { ui.toast(a.name + ' is already empty for every active student.', { type: 'info' }); return; }
+      ui.dialog.confirm({
+        title: 'Clear ' + a.name + '?',
+        messageHtml: '<p>This clears <strong>' + esc(a.name) + '</strong> for ' + esc(plural(filled, 'active student')) + ' who have a score.' +
+          (a.teamGraded ? ' Team scores are cleared too (for every member of those teams).' : '') + '</p>' +
+          '<p class="muted small">Withdrawn students keep their scores. Late-work details stay. Undo with Ctrl+Z; every change is logged in History.</p>',
+        confirmText: 'Clear ' + plural(filled, 'score'), danger: true
+      }).then(function (ok) { refocusGrid(); if (ok) run(''); });
+      return;
+    }
+    if (mode === 'empty' && !empties) { ui.toast('Every active student already has a ' + a.name + ' score.', { type: 'info' }); return; }
+    var intro = mode === 'empty'
+      ? '<p>Fills the <strong>' + esc(plural(empties, 'empty cell')) + '</strong> of ' + esc(a.name) + ' (active students only). Scores already entered stay as they are.</p>'
+      : '<div class="callout callout-warn" style="margin-bottom:12px">This gives <strong>every active student</strong> (' + esc(String(active.length)) + ') the same ' +
+        esc(a.name) + ' score' + (filled ? ', replacing ' + esc(plural(filled, 'score')) + ' already entered' : '') + '.' +
+        (a.teamGraded ? ' Team scores are written, and per-member overrides (◆) are removed.' : '') + '</div>';
+    var field = list.length
+      ? { name: 'value', label: a.name + ' (choose from the list)', type: 'select', value: String(list[0]),
+        options: list.map(function (v) { return { value: String(v), label: String(v) }; }) }
+      : { name: 'value', label: a.name + ' (0 to ' + num(a.maxScore, 4) + ')', value: '', required: true };
+    ui.dialog.form({
+      title: mode === 'empty' ? 'Fill empty ' + a.name + ' cells' : 'Set ' + a.name + ' for every active student',
+      introHtml: intro + '<p class="muted small">Undo with Ctrl+Z. Every change is logged in History.</p>',
+      fields: [field],
+      confirmText: mode === 'empty' ? 'Fill ' + plural(empties, 'cell') : 'Set ' + plural(active.length, 'student'),
+      danger: mode === 'all' && filled > 0,
+      validate: function (v) {
+        if (list.length) return matchChoice(a, list, v.value).value !== undefined ? null : 'Choose a value from the list.';
+        var ps = util.parseScoreInput(v.value, a.maxScore);
+        if (ps.kind !== 'number') return 'Enter a number.';
+        if (ps.value < 0 || ps.value > a.maxScore) return 'Enter a number from 0 to ' + num(a.maxScore, 4) + '.';
+        return null;
+      }
+    }).then(function (v) {
+      refocusGrid();
+      if (!v) return;
+      var ps = util.parseScoreInput(v.value, a.maxScore);
+      if (ps.kind !== 'number') return;
+      run(String(ps.value));
+    });
+  }
+
+  // ------------------------------------------------------------------ final grades: finalize, unlock, copy suggested
+
+  /** Data check before finalizing (active students). Empty participation cells are counted apart
+   * (meeting: [{ name, n }]): participation is set in the grading meeting (DECISIONS 5), and
+   * finalizing locks it. */
+  function countIssues(course, results) {
+    var out = { missing: [], invalid: [], nMissing: 0, nInvalid: 0, meeting: [], nMeeting: 0 };
+    var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; });
+    course.assessments.forEach(function (a) {
+      var list = choiceValues(a);
+      var miss = 0, inv = 0;
+      active.forEach(function (s) {
+        var d = results.byId[s.id] && results.byId[s.id].items[a.id];
+        if (!d) return;
+        if (d.state === 'empty' && (a.weight || 0) > 0) miss++;
+        else if (d.state === 'invalid' || d.outOfRange ||
+          (list.length && d.state === 'number' && (d.notOnList !== undefined ? d.notOnList : !isChoiceValue(a, list, d.raw)))) inv++;
+      });
+      if (miss && a.category === 'participation') {
+        out.meeting.push({ name: a.name, n: miss });
+        out.nMeeting = Math.max(out.nMeeting, miss);
+        miss = 0;
+      }
+      if (miss) out.missing.push(a.name + ': ' + miss + ' empty');
+      if (inv) out.invalid.push(a.name + ': ' + inv);
+      out.nMissing += miss;
+      out.nInvalid += inv;
+    });
+    return out;
+  }
+
+  /** Active students with an empty participation cell (the "fill in the meeting" column). */
+  function emptyMeetingCells(course, results) {
+    var n = 0;
+    var part = course.assessments.filter(function (a) { return a.category === 'participation' && (a.weight || 0) > 0; });
+    if (!part.length) return 0;
+    course.students.forEach(function (s) {
+      if (s.status === 'withdrawn' || !results.byId[s.id]) return;
+      if (part.some(function (a) { var d = results.byId[s.id].items[a.id]; return d && d.state === 'empty'; })) n++;
+    });
+    return n;
+  }
+
+  function finalizeDialog() {
+    var course = cur(), results = res();
+    if (!course || !results || isFinalized(course)) return;
+    if (!results.activeIds.length) {
+      // Nothing to finalize: the lock would only block adding the first students.
+      ui.toast(course.students.length ? 'Every student is withdrawn: there are no scores to finalize.' :
+        'Add students first: there are no scores to finalize yet.', { type: 'info', timeout: 5000 });
+      return;
+    }
+    var iss = countIssues(course, results);
+    var ph = model.unconfirmedPlaceholders(course);
+    var w = results.weights;
+    var ls = letterSummary(course, results);
+    var row = function (state, title, detail) {
+      return '<li class="fz-' + state + '">' + ui.icon(state === 'ok' ? 'check' : state === 'warn' ? 'alert' : 'info') +
+        '<div><strong>' + esc(title) + '</strong>' + (detail ? '<div class="muted small">' + detail + '</div>' : '') + '</div></li>';
+    };
+    // Participation is set in the grading meeting (DECISIONS 5), and finalizing locks it: say so on its own.
+    var meetingRow = iss.meeting.length ? row('warn',
+      iss.meeting.map(function (m) { return m.name; }).join(', ') + (iss.meeting.length > 1 ? ' are' : ' is') + ' empty for ' + plural(iss.nMeeting, 'student'),
+      'It is usually set in the grading meeting (Meeting view). <strong>Finalizing now locks it</strong>: to set it afterwards you would ' +
+      'have to unlock the scores. To set it first, choose Cancel.') : '';
+    var html = '<p>Finalizing <strong>locks the score cells</strong> (scores, participation, team scores, overrides, late work, names, No and teams) so they cannot ' +
+      'be changed by accident. <strong>Final letters stay editable.</strong> You can unlock later; both steps are logged in History.</p>' +
+      '<p class="section-label" style="margin:12px 0 6px">Data check</p><ul class="fz-checks">' +
+      meetingRow +
+      (iss.nMissing ? row('warn', plural(iss.nMissing, 'empty score') + ' (counted as 0)', esc(iss.missing.join(' · '))) :
+        row('ok', meetingRow ? 'No other missing scores' : 'No missing scores')) +
+      (iss.nInvalid ? row('warn', plural(iss.nInvalid, 'invalid or out-of-range entry', 'invalid or out-of-range entries'), esc(iss.invalid.join(' · '))) : row('ok', 'No invalid or out-of-range entries')) +
+      (ph.length ? row('warn', plural(ph.length, 'setting') + ' still marked “needs confirmation”', esc(ph.map(function (x) { return x.label; }).join(' · '))) :
+        row('ok', 'Every placeholder setting is confirmed')) +
+      (w.ok ? row('ok', 'Weights add up to 100%') : row('warn', 'Weights add up to ' + num(w.sum, 2) + '%, not 100%')) +
+      (ls.unassigned ? row('info', 'Final letters: ' + ls.assigned + ' of ' + ls.active + ' assigned', 'You assign them after finalizing (sorted by total, high to low).') :
+        ls.invalid ? '' : row('ok', 'Every active student has a final letter')) +
+      (ls.invalid ? row('warn', plural(ls.invalid, 'final letter') + ' not in the current letter scale',
+        'Shown in red in Final letter (the scale was changed after they were chosen). Choose a letter of the scale for ' +
+        (ls.invalid === 1 ? 'that student' : 'those students') + '.') : '') +
+      '</ul>' +
+      '<label class="check" style="margin-top:12px"><input type="checkbox" id="fz-copy"> Copy the suggested letters into empty final letters</label>' +
+      '<div class="help muted small" style="margin:2px 0 10px 22px">Optional. The cutoffs are only suggestions; you can change any letter afterwards.</div>' +
+      '<div class="field"><label for="fz-note">Note (optional, shown on the banner and saved with the change)</label>' +
+      '<input id="fz-note" type="text" maxlength="' + NOTE_MAX + '" autocomplete="off" placeholder="e.g. reviewed with the instructor, Dec 10"></div>';
+    ui.dialog.open({
+      title: 'Finalize scores',
+      bodyHtml: html,
+      wide: true,
+      initialFocus: '#fz-copy',
+      buttons: [
+        { text: 'Cancel', value: null },
+        { spacer: true },
+        {
+          text: 'Finalize scores', primary: true,
+          value: function (dlg) { return { copy: dlg.querySelector('#fz-copy').checked, note: dlg.querySelector('#fz-note').value.trim().slice(0, NOTE_MAX) }; }
+        }
+      ]
+    }).then(function (v) {
+      refocusGrid();
+      if (!v) return;
+      var copied = 0;
+      var ok = transact('Finalize scores', function (c) {
+        if (typeof model.finalize === 'function') model.finalize(c, util.nowIso(), v.note);
+        else c.finalized = { at: util.nowIso(), note: v.note };
+        if (v.copy) copied = copySuggested(c);
+        return true;
+      });
+      if (!ok) return;
+      // Sort by total, high to low (a fresh order, one flat list: grouping by team is turned off, so
+      // the bands and their rules follow the class ranking), and start at the top of Final letter.
+      forceResort = true;
+      var p = getPrefs();
+      var ungrouped = p.grouped;
+      if (p.sort !== 'total' || p.dir !== 'desc' || ungrouped) {
+        var patch = { sort: 'total', dir: 'desc' };
+        if (ungrouped) patch.group = false;
+        setPrefs(patch);
+      } else {
+        dataDirty = true;
+      }
+      var first = firstFinalCell();
+      if (first) { sel.active = first; sel.end = first; revealActive = true; }
+      gridToast('Scores finalized and sorted by total, high to low' + (ungrouped ? ' (grouping by team is off)' : '') + '.' +
+        (copied ? ' ' + plural(copied, 'suggested letter') + ' copied into empty final letters.' : '') +
+        ' Assign final letters: select a group of rows in Final letter, then choose a letter (Enter).', { type: 'success', timeout: 8000 });
+    });
+  }
+
+  /** The first active student's Final letter cell in the new order (after a re-sort). */
+  function firstFinalCell() {
+    var course = cur(), results = res();
+    var p = getPrefs();
+    var list = calc.sortStudents(course, results, 'total', 'desc').filter(function (s) { return s.status !== 'withdrawn' || p.showWithdrawn; });
+    var s = list.filter(function (x) { return x.status !== 'withdrawn'; })[0] || list[0];
+    return s ? { sid: s.id, key: 'final' } : null;
+  }
+
+  /** Copies the suggested letters into the empty final letters of active students (inside a
+   * transaction). Returns the number set. */
+  function copySuggested(c) {
+    var results = calc.computeCourse(c);
+    if (typeof model.copySuggestedToFinal === 'function') {
+      return model.copySuggestedToFinal(c, results, { onlyEmpty: true, activeOnly: true }) || 0;
+    }
+    var pairs = [];
+    c.students.forEach(function (s) {
+      if (s.status === 'withdrawn' || storedFinal(s) !== null) return;
+      var r = results.byId[s.id];
+      if (r && r.letter) pairs.push({ studentId: s.id, letter: r.letter });
+    });
+    return writeFinalLetters(c, pairs);
+  }
+
+  function copySuggestedAction() {
+    var course = cur(), results = res();
+    if (!course || !results) return;
+    var ls = letterSummary(course, results);
+    if (!ls.unassigned) {
+      ui.toast('Every active student already has a final letter. Nothing to copy.' + (ls.invalid ? ' ' + plural(ls.invalid, 'of them is not a letter', 'of them are not letters') +
+        ' of the current scale (shown in red): choose another letter for ' + (ls.invalid === 1 ? 'it.' : 'them.') : ''),
+      { type: ls.invalid ? 'warn' : 'info', timeout: ls.invalid ? 6000 : 4000 });
+      return;
+    }
+    ui.dialog.confirm({
+      title: 'Copy suggested letters?',
+      messageHtml: '<p>Fills the <strong>' + esc(plural(ls.unassigned, 'empty final letter')) + '</strong> of active students with the suggested letter ' +
+        'from the cutoffs. Final letters already chosen stay as they are.</p>' +
+        (model.isConfirmed(course, 'letterScale') ? '' : '<p class="callout callout-warn">The letter cutoffs are placeholders that still need confirmation.</p>') +
+        '<p class="muted small">You can change any letter afterwards. Undo with Ctrl+Z.</p>',
+      confirmText: 'Copy ' + plural(ls.unassigned, 'letter')
+    }).then(function (ok) {
+      refocusGrid();
+      if (!ok) return;
+      var n = 0;
+      transact('Copy suggested letters', function (c) { n = copySuggested(c); });
+      ui.toast(n ? plural(n, 'suggested letter') + ' copied into empty final letters.' : 'No letter was copied.', { type: n ? 'success' : 'info' });
+    });
+  }
+
+  function unlockScores() {
+    var course = cur();
+    if (!course || !isFinalized(course)) return;
+    ui.dialog.confirm({
+      title: 'Unlock scores?',
+      messageHtml: '<p>Score cells become editable again. Final letters are not changed.</p>' +
+        '<p class="muted small">The unlock is logged in the change history (“Scores finalized: yes → no”). You can finalize again at any time.</p>',
+      confirmText: 'Unlock scores'
+    }).then(function (ok) {
+      refocusGrid();
+      if (!ok) return;
+      transact('Unlock scores', function (c) {
+        if (typeof model.unfinalize === 'function') model.unfinalize(c);
+        else c.finalized = null;
+      });
+      ui.toast('Scores unlocked. Score cells can be edited again.', { type: 'success' });
+    });
+  }
+
+  /** Selects the Final letter cell of a student (chips: first without a letter, first out of order). */
+  function gotoFinal(sid) {
+    if (!sid || !layout) return;
+    var ref = { sid: sid, key: 'final' };
+    if (!posOf(ref)) {
+      // Hidden by the search or the withdrawn filter: clear them first.
+      if (searchText) { searchText = ''; if (dom && dom.search) dom.search.value = ''; }
+      renderTable();
+      if (!posOf(ref)) return;
+    }
+    sel.active = ref;
+    sel.end = ref;
+    paintSelection();
+    focusActive();
+    var p = posOf(ref);
+    ensureVisible(cellAt(p.r, p.c));
+  }
+
+  /** The letters chip: the first active student (in row order) without a final letter, or with one
+   * that is not a letter of the current scale. */
+  function gotoFirstUnassigned() {
+    if (!layout) return;
+    var course = cur(), set = letterSetOf(course);
+    var todo = function (s) { return s.status !== 'withdrawn' && (storedFinal(s) === null || invalidFinal(course, s, set)); };
+    var hit = layout.students.filter(todo)[0] || course.students.filter(todo)[0];
+    if (hit) gotoFinal(hit.id);
+  }
+
+  function gotoFirstOrderIssue() {
+    var course = cur(), results = res();
+    var oi = orderIssueMap(course, results);
+    if (!oi.first || !layout) return;
+    var ids = Object.keys(oi.map);
+    var hit = layout.students.filter(function (s) { return ids.indexOf(s.id) !== -1; })[0];
+    gotoFinal(hit ? hit.id : oi.first.lowerTotalId);
+  }
+
+  // ------------------------------------------------------------------ meeting view and re-sort
+
+  function toggleMeeting() {
+    var p = getPrefs();
+    if (!p.meeting) {
+      setPrefs({ meeting: true, meetingPrev: p.sort + ':' + p.dir, sort: 'total', dir: 'desc' });
+      gridToast('Meeting view: sorted by total, high to low. Participation and Final letter are highlighted to fill in the meeting.', { type: 'info', timeout: 5000 });
+    } else {
+      var prev = String(p.meetingPrev || '').split(':');
+      var patch = { meeting: false, meetingPrev: '' };
+      if ((prev[0] === 'name' || prev[0] === 'total') && (prev[1] === 'asc' || prev[1] === 'desc')) { patch.sort = prev[0]; patch.dir = prev[1]; }
+      setPrefs(patch);
+    }
+    revealActive = true;
+  }
+
+  function resort() {
+    forceResort = true;
+    revealActive = true;
+    focusUntil = nowMs() + 1500;
+    renderTable();
+    focusActive();
   }
 
   // ------------------------------------------------------------------ columns menu (checkbox popover)
@@ -1964,7 +3399,10 @@
     if (colsMenu) { closeColumnsMenu(true); return; }
     ui.closeMenu();
     var course = cur();
-    var toggles = COL_TOGGLES.filter(function (t) { return t.key !== 'attendance' || attendanceAvailable(course); });
+    var meet = getPrefs().meeting;
+    var hasAtt = attendanceAvailable(course);
+    // The Meeting view has a fixed set of columns; only the absence columns can be hidden there.
+    var toggles = COL_TOGGLES.filter(function (t) { return t.att ? hasAtt : !meet; });
     var m = document.createElement('div');
     m.className = 'menu grid-cols-menu';
     m.setAttribute('role', 'menu');
@@ -1972,11 +3410,14 @@
     m.innerHTML = '<div class="menu-label">Show columns</div>' + toggles.map(function (t) {
       return '<button type="button" role="menuitemcheckbox" tabindex="-1" data-key="' + t.key + '" aria-checked="false">' +
         ui.icon('check', 'cm-check') + '<span>' + esc(t.label) + '</span></button>';
-    }).join('') + '<div class="menu-sep" role="separator"></div><div class="cm-note">Scores, Total, Letter and Rank are always shown.</div>';
+    }).join('') + '<div class="menu-sep" role="separator"></div><div class="cm-note">' +
+      (meet ? 'The Meeting view shows a fixed set of columns. ' : '') + 'Scores, Total, Suggested, Final letter and Rank are always shown.' +
+      (hasAtt ? '' : ' Absence columns appear when attendance is on.') + '</div>';
     document.body.appendChild(m);
     var items = ui.$$('[role="menuitemcheckbox"]', m);
     var toggle = function (b) {
       var p = getPrefs();
+      delete p.grouped;
       var key = b.getAttribute('data-key');
       p.cols[key] = !p.cols[key];
       b.setAttribute('aria-checked', p.cols[key] ? 'true' : 'false');
@@ -1986,8 +3427,10 @@
       var b = e.target.closest('[role="menuitemcheckbox"]');
       if (b) toggle(b);
     });
+    if (!items.length) m.setAttribute('tabindex', '-1');
     m.addEventListener('keydown', function (e) {
       var i = items.indexOf(document.activeElement);
+      if (!items.length && e.key !== 'Escape' && e.key !== 'Tab') return;
       if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
       else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
       else if (e.key === 'Home') { e.preventDefault(); items[0].focus(); }
@@ -2012,7 +3455,7 @@
         root.addEventListener('scroll', colsMenu.onScroll, true);
       }
     }, 0);
-    if (items[0]) items[0].focus();
+    if (items[0]) items[0].focus(); else m.focus();
   }
 
   // ------------------------------------------------------------------ actions
@@ -2020,6 +3463,7 @@
   function addStudent() {
     var course = cur();
     if (!course) return;
+    if (isFinalized(course)) { notifyLocked(); return; }
     var no = model.nextStudentNo(course);
     var sid = null;
     if (searchText) { searchText = ''; if (dom && dom.search) dom.search.value = ''; }
@@ -2070,16 +3514,28 @@
 
   function onMouseDown(e) {
     if (editing && editing.input.contains(e.target)) {
-      if (editing.kind === 'team') listboxPointerAt = nowMs();
+      // A press in this open list: the 'change' that follows is a pointer pick (see onChange).
+      if (editing.list) editing.pointerAt = nowMs();
       return;
     }
-    var hit = cellFromEvent(e);
+    // The typing hint hangs over the next rows but is not part of them (css: pointer-events: none).
+    // Should a click still land on it, it means the cell underneath, never the cell being edited.
+    var hit;
+    if (editing && editing.hint && editing.hint.contains(e.target)) {
+      editing.hint.style.visibility = 'hidden';
+      var under = document.elementFromPoint(e.clientX, e.clientY);
+      editing.hint.style.visibility = '';
+      hit = under ? cellFromEvent({ target: under }) : null;
+      if (!hit) { e.preventDefault(); return; }
+    } else {
+      hit = cellFromEvent(e);
+    }
     if (!hit) return;
     tabExit = false;
     if (e.target.closest('button')) return;
     if (e.button === 2) {
       if (!inRect(hit.r, hit.c)) {
-        if (editing) commitEdit(null, { soft: true });
+        if (editing) leaveEditor();
         tabStartKey = null;
         sel.active = refAt(hit.r, hit.c);
         sel.end = sel.active;
@@ -2090,7 +3546,7 @@
     }
     if (e.button !== 0) return;
     e.preventDefault();
-    if (editing) commitEdit(null, { soft: true });
+    if (editing) leaveEditor();
     tabStartKey = null;
     if (e.shiftKey && posOf(sel.active)) {
       sel.end = refAt(hit.r, hit.c);
@@ -2103,6 +3559,7 @@
     }
     paintSelection();
     focusActive();
+    dodgeToasts();
   }
 
   function onMouseOver(e) {
@@ -2122,10 +3579,22 @@
     sel.active = refAt(hit.r, hit.c);
     sel.end = sel.active;
     paintSelection();
-    if (editableAt(hit)) startEdit('edit'); else notifyReadOnly();
+    if (editableAt(hit)) startEdit('edit');
+    else if (lockedCol(cur(), layout.cols[hit.c])) notifyLocked();
+    else notifyReadOnly();
   }
 
   function onContextMenu(e) {
+    var th = e.target && e.target.closest ? e.target.closest('thead th.h-raw') : null;
+    if (th && dom && dom.table && dom.table.contains(th)) {
+      var mb = th.querySelector('[data-act="col-menu"]');
+      if (mb) {
+        e.preventDefault();
+        var fromKeyboard = e.button !== 2 || (e.clientX === 0 && e.clientY === 0);
+        openColumnMenu(fromKeyboard ? mb : { x: e.clientX, y: e.clientY }, mb.getAttribute('data-aid'));
+      }
+      return;
+    }
     var hit = cellFromEvent(e);
     if (!hit) return;
     e.preventDefault();
@@ -2143,24 +3612,42 @@
 
   function onClick(e) {
     var t = e.target;
-    if (editing && editing.kind === 'team' && t && t.tagName === 'OPTION' && editing.input.contains(t)) {
+    if (editing && editing.list && t && t.tagName === 'OPTION' && editing.input.contains(t)) {
       commitEdit(null, {});
       return;
     }
     var b = t && t.closest ? t.closest('[data-act]') : null;
     if (!b || !boundEl || !boundEl.contains(b)) return;
     var act = b.getAttribute('data-act');
-    if (act === 'group') setPrefs({ group: !getPrefs().group });
+    if (act === 'group') { if (!getPrefs().meeting) setPrefs({ group: !getPrefs().group }); }
     else if (act === 'withdrawn') setPrefs({ showWithdrawn: !getPrefs().showWithdrawn });
     else if (act === 'columns') openColumnsMenu(b);
     else if (act === 'legend') toggleLegend(b);
     else if (act === 'add-student') addStudent();
-    else if (act === 'paste-roster') { if (typeof GT.ui.openRosterPaste === 'function') GT.ui.openRosterPaste(); }
+    else if (act === 'paste-roster') {
+      if (isFinalized(cur())) notifyLocked();
+      else if (typeof GT.ui.openRosterPaste === 'function') GT.ui.openRosterPaste();
+    }
+    else if (act === 'resort') resort();
+    else if (act === 'meeting') toggleMeeting();
+    else if (act === 'finalize') finalizeDialog();
+    else if (act === 'unlock') unlockScores();
+    else if (act === 'copy-suggested') copySuggestedAction();
+    else if (act === 'letters-chip') gotoFirstUnassigned();
+    else if (act === 'order-chip') gotoFirstOrderIssue();
+    else if (act === 'col-menu') openColumnMenu(b, b.getAttribute('data-aid'));
+    else if (act === 'dd-open') {
+      var a0 = posOf(sel.active);
+      if (a0 && editableAt(a0) && !editing) startEdit('list');
+    }
     else if (act === 'load-sample') { if (GT.app && GT.app.actions && GT.app.actions.loadSample) GT.app.actions.loadSample(); }
     else if (act === 'import') { if (GT.views.exchange && GT.app) GT.app.navigate('exchange'); }
     else if (act === 'weights') { if (GT.views.settings && GT.app) GT.app.navigate('settings', { section: 'assessments' }); }
     else if (act === 'sort') toggleSort(b.getAttribute('data-sort'));
-    else if (act === 'team-score') editTeamScore(b.getAttribute('data-tid'), b.getAttribute('data-aid'));
+    else if (act === 'team-score') {
+      if (isFinalized(cur())) notifyLocked();
+      else editTeamScore(b.getAttribute('data-tid'), b.getAttribute('data-aid'));
+    }
     else if (act === 'details') {
       var tr = b.closest('tr[data-r]');
       var r = tr ? parseInt(tr.getAttribute('data-r'), 10) : NaN;
@@ -2168,8 +3655,12 @@
     }
   }
 
+  /** A pick with the mouse (or a finger) in an open list saves at once. Chromium also fires 'change'
+   * on every arrow key in a list, so only a change that follows a press in this same list counts:
+   * the press time belongs to the editor (a new list starts without one) and any key clears it. */
   function onChange(e) {
-    if (editing && editing.kind === 'team' && e.target === editing.input && nowMs() - listboxPointerAt < 1500) commitEdit(null, {});
+    var ed = editing;
+    if (ed && ed.list && e.target === ed.input && ed.pointerAt && nowMs() - ed.pointerAt < 1500) commitEdit(null, {});
   }
 
   function onInput(e) {
@@ -2177,7 +3668,8 @@
   }
 
   function onFocusOut(e) {
-    if (editing && e.target === editing.input) commitEdit(null, { soft: true });
+    if (!editing || e.target !== editing.input) return;
+    leaveEditor();
   }
 
   function onKeyDown(e) {
@@ -2190,10 +3682,14 @@
   function editorKey(e) {
     var ed = editing, k = e.key, mod = e.ctrlKey || e.metaKey;
     if (e.isComposing) return;
+    ed.pointerAt = 0; // browsing a list with the keyboard never saves until Enter or Tab (see onChange)
     var handled = true;
+    var ddText = !ed.list && ed.col && ed.col.dd;
     if (k === 'Enter' && !e.altKey) {
       e.preventDefault();
-      if (mod && ed.kind !== 'team' && hasRange()) {
+      // Ctrl+Enter fills the selected range with the typed value (a drop-down cell already applies
+      // what it gets to every selected row).
+      if (mod && !ed.list && !ddText && hasRange()) {
         var v = ed.input.value;
         closeEditor(true);
         applyBlock([[v]], { source: 'edit' });
@@ -2206,14 +3702,21 @@
     } else if (k === 'Escape') {
       e.preventDefault();
       cancelEdit();
-    } else if (ed.kind !== 'team' && k === 'F2') {
+    } else if (ddText && e.altKey && !mod && (k === 'ArrowDown' || k === 'ArrowUp')) {
+      e.preventDefault();
+      switchToList();
+    } else if (!ed.list && k === 'F2') {
       e.preventDefault();
       ed.mode = ed.mode === 'enter' ? 'edit' : 'enter';
       ed.input.classList.toggle('mode-edit', ed.mode === 'edit');
-    } else if (ed.kind !== 'team' && ed.mode === 'enter' && !mod && !e.altKey &&
+    } else if (!ed.list && ed.mode === 'enter' && !mod && !e.altKey &&
       (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight')) {
       e.preventDefault();
       commitEdit(k === 'ArrowUp' ? 'up' : k === 'ArrowDown' ? 'down' : k === 'ArrowLeft' ? 'left' : 'right', {});
+    } else if (ed.list && ed.kind !== 'team' && !mod && !e.altKey && k.length === 1 && k !== ' ') {
+      // Type-ahead in the list: "4" picks 4 (not 4.5); "b+" picks B+.
+      e.preventDefault();
+      listTypeAhead(k);
     } else {
       handled = false;
     }
@@ -2230,7 +3733,18 @@
     var end = posOf(sel.end) || a;
     var nR = layout.students.length, nC = layout.cols.length;
     if (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight') {
-      if (e.altKey) return;
+      if (e.altKey) {
+        // Alt+Down opens the drop-down list of a Final letter, list-score or Team cell.
+        if (k === 'ArrowDown' && !mod && !shift) {
+          var ac = layout.cols[a.c];
+          if (ac.dd || ac.edit === 'team') {
+            e.preventDefault();
+            if (editableAt(a)) startEdit('list');
+            else if (lockedCol(cur(), ac)) notifyLocked();
+          }
+        }
+        return;
+      }
       e.preventDefault();
       var base = shift ? end : a;
       var dr = k === 'ArrowUp' ? -1 : (k === 'ArrowDown' ? 1 : 0);
@@ -2272,13 +3786,18 @@
     }
     if (k === 'Enter' && !mod && !e.altKey) {
       e.preventDefault();
-      if (editableAt(a)) startEdit('edit');
-      else { tabStartKey = null; moveTo(a.r + (shift ? -1 : 1), a.c, false); }
+      if (editableAt(a)) { startEdit('edit'); return; }
+      // A locked score (finalized) says why it does not open, like F2 and typing; Enter still moves on.
+      if (lockedCol(cur(), layout.cols[a.c])) notifyLocked();
+      tabStartKey = null;
+      moveTo(a.r + (shift ? -1 : 1), a.c, false);
       return;
     }
     if (k === 'F2') {
       e.preventDefault();
-      if (editableAt(a)) startEdit('edit'); else notifyReadOnly();
+      if (editableAt(a)) startEdit('edit');
+      else if (lockedCol(cur(), layout.cols[a.c])) notifyLocked();
+      else notifyReadOnly();
       return;
     }
     if ((k === 'Delete' || k === 'Backspace') && !mod && !e.altKey) {
@@ -2324,7 +3843,10 @@
       if (k === '?') return; // app shortcut list
       e.preventDefault();
       e.stopPropagation();
-      if (!editableAt(a)) { notifyReadOnly(); return; }
+      if (!editableAt(a)) {
+        if (lockedCol(cur(), layout.cols[a.c])) notifyLocked(); else notifyReadOnly();
+        return;
+      }
       startEdit('enter', layout.cols[a.c].edit === 'team' ? null : k);
     }
   }
@@ -2376,6 +3898,14 @@
     root.addEventListener('resize', function () { if (isActiveView()) queueWrapTop(); });
     document.addEventListener('copy', onCopy);
     document.addEventListener('paste', onPaste);
+    // A toast from anywhere (autosave, undo, the grid) must not sit on the active cell.
+    var host = document.getElementById('toasts');
+    if (host && typeof root.MutationObserver === 'function') {
+      new root.MutationObserver(function (list) {
+        list.forEach(function (m) { Array.prototype.forEach.call(m.addedNodes, function (n) { n.__gtAt = nowMs(); }); });
+        try { dodgeToasts(); } catch (e) { /* layout not ready: the next move tries again */ }
+      }).observe(host, { childList: true });
+    }
     document.addEventListener('keydown', function (e) {
       if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
       if (!isActiveView() || ui.isTypingTarget(e.target) || document.querySelector('dialog[open]')) return;
@@ -2383,6 +3913,19 @@
       focusSearch();
     });
   }
+
+  /** Opens the "Finalize scores" dialog from another view (Settings, Grading status card). Switches to
+   * the Grades tab first, so the new Total high–low order and the Final letter column are on screen
+   * once the scores are finalized. */
+  GT.ui.openFinalize = function () {
+    if (isActiveView() || !GT.app || typeof GT.app.navigate !== 'function') { setTimeout(finalizeDialog, 0); return; }
+    GT.app.navigate('grades');
+    // The app renders on the next animation frame: open the dialog after that render.
+    var opened = false;
+    var open = function () { if (!opened) { opened = true; finalizeDialog(); } };
+    if (root.requestAnimationFrame) root.requestAnimationFrame(function () { setTimeout(open, 0); });
+    setTimeout(open, 300); // frames do not run in a hidden tab
+  };
 
   GT.views.grades = {
     id: 'grades',

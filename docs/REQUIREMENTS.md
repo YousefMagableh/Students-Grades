@@ -148,3 +148,14 @@ Per course, live, active students only.
   - SE 6362: "10 points deducted for each week passed".
 - Attendance, in both syllabi: three consecutive absences lead to one letter grade drop, and four consecutive absences lead to an F. SE 6362 adds "except for medical/family policies". Total absences should not exceed "a certain threshold", and the syllabi do not give the number.
 - Teams: all students in a team get the same mark unless they unanimously agree in writing to an unequal division. Teams are about 7 to 8 students (SE 4351) or about 3 (SE 6362).
+
+## Added during the build (decisions by the TA, 2026-09-28)
+
+- X1. Class/Project Participation is entered out of 5 (5 = full marks), as in the previous TA's sheet. Its default max is 5 and its weight 5%. Every other item defaults to a max of 100.
+- X2. Final letters are assigned manually by the instructor, usually in bands after sorting by total. The cutoff letter is shown only as a suggestion. The final letter is the grade used in exports and statistics.
+- X3. Scores can be finalized (locked) before the letters are assigned. Unlocking is possible and is logged.
+- X4. The final letter and participation are chosen from drop-down lists. Invalid typed values are refused.
+- X5. Sorting never moves rows while you edit. A "re-sort" button appears when the order is out of date.
+- X6. A meeting view shows only what the grading meeting needs.
+- X7. Attendance shows separate columns for excused absences (allowed), unexcused absences (not allowed), and total absences. Unexcused absences drive the warnings, and by default excused absences do not count toward a consecutive-absence streak.
+- X8. Real student names are never sent to the assistant or committed. They are pasted or imported locally.

@@ -17,7 +17,47 @@
 .grid-sort select { min-height: 26px; padding: 3px 8px; font-size: 12.5px; }
 .grid-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .grid-toolbar [hidden] { display: none; }
-.grid-legend-btn { display: none; } /* phones only (see the end of this file) */
+.grid-legend-btn { display: none; } /* phones and the Meeting view (see below) */
+.grid-toolbar.meeting-mode .grid-legend-btn { display: inline-flex; }
+.grid-legend.meeting-mode:not(.is-open) { display: none; }
+.grid-toolbar .grid-resort[hidden] { display: none; }
+
+/* "Final grades" bar: Meeting view, letter summary, copy suggested, finalize */
+.grid-grades-bar { row-gap: 8px; }
+.grid-grades-bar .section-label { margin-right: 2px; }
+.grid-grades-bar [hidden] { display: none; }
+.grid-grades-bar .chip { font-variant-numeric: tabular-nums; }
+.grid-grades-bar .chip .icon { width: 13px; height: 13px; }
+.grid-grades-bar button.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.grid-grades-bar .chip.ok { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: var(--success-soft); }
+
+/* finalized banner */
+.grid-lock-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border-left-color: var(--accent); background: var(--accent-soft); color: var(--text);
+}
+.grid-lock-banner[hidden] { display: none; }
+.grid-lock-banner > .icon { color: var(--accent); }
+.grid-lock-banner .glb-text { flex: 1 1 320px; }
+
+.grid-lock-banner .glb-text { overflow-wrap: anywhere; min-width: 0; }
+.grid-lock-banner .glb-part {
+  display: flex; align-items: flex-start; gap: 6px; margin-top: 4px; color: var(--warn); font-weight: 600;
+}
+.grid-lock-banner .glb-part .icon { flex: none; margin-top: 2px; }
+.grid-empty .grid-empty-lock { margin: 16px 16px 0; text-align: left; }
+
+/* toasts move to the bottom left while they would cover the active grid cell (grid.js dodgeToasts) */
+.toasts.gt-toasts-left { right: auto; left: 16px; align-items: flex-start; }
+
+/* finalize dialog: data check */
+.fz-checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.fz-checks li { display: flex; gap: 9px; align-items: flex-start; padding: 7px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-elev); }
+.fz-checks li > .icon { margin-top: 2px; }
+.fz-checks .fz-ok > .icon { color: var(--success); }
+.fz-checks .fz-warn { background: var(--warn-bg); border-color: var(--warn-border); }
+.fz-checks .fz-warn > .icon { color: var(--warn); }
+.fz-checks .fz-info > .icon { color: var(--info); }
 
 .grid-legend {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px;
@@ -38,6 +78,7 @@
 }
 .lg-mk { display: inline-flex; align-items: center; }
 .lg-mk .icon { width: 13px; height: 13px; }
+.grid-legend .mk-order { width: 13px; height: 13px; }
 
 /* ------------------------------------------------------------------ scroll area */
 
@@ -59,6 +100,9 @@
   --grid-sel: color-mix(in srgb, var(--accent) 17%, transparent);
   --grid-hover: color-mix(in srgb, var(--text) 4%, transparent);
   --grid-computed: color-mix(in srgb, var(--bg-sunken) 55%, var(--bg-elev));
+  --band-line: color-mix(in srgb, var(--text) 62%, transparent);
+  --to-fill: color-mix(in srgb, var(--accent) 11%, var(--bg-elev));
+  --to-fill-line: color-mix(in srgb, var(--accent) 55%, transparent);
   border-collapse: separate;
   border-spacing: 0;
   table-layout: fixed;
@@ -135,7 +179,8 @@
 .gt-grid .sc1, .gt-grid .sc-span { left: 0; }
 .gt-grid .sc2 { left: 52px; }
 .gt-grid .sc3 { left: 158px; }
-.gt-grid .sc4 { left: 294px; border-right: 1px solid var(--border-strong); }
+.gt-grid .sc4 { left: 294px; }
+.gt-grid .sc-last { border-right: 1px solid var(--border-strong); }
 .gt-grid .sc-span { border-right: 1px solid var(--border-strong); }
 .gt-grid thead th.sc { z-index: 4; }
 .gt-grid tbody td.sc { background-color: var(--bg-elev); }
@@ -182,6 +227,75 @@
 .gt-grid .mk-att .icon { width: 13px; height: 13px; }
 .gt-grid td.muted { color: var(--text-muted); }
 
+/* final letter (manual, drop-down) */
+.gt-grid td.c-final { text-align: center; font-weight: 700; }
+.gt-grid td.c-final.is-empty { font-weight: 400; }
+.gt-grid td.c-final.is-invalid { background-color: var(--cell-invalid-bg); color: var(--cell-invalid-text); }
+.gt-grid td.c-final .mk-diff, .grid-legend .mk-diff {
+  display: inline-block; width: 6px; height: 6px; margin-left: 4px; border-radius: 50%;
+  background: var(--accent); vertical-align: 2px;
+}
+/* "alert" icon as a mask: letter out of order with the totals */
+.mk-order {
+  display: inline-block; width: 12px; height: 18px; color: var(--warn); background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l10 18H2L12 3z'/%3E%3Cpath d='M12 10v5M12 18h.01'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l10 18H2L12 3z'/%3E%3Cpath d='M12 10v5M12 18h.01'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+}
+.gt-grid td.c-final.is-order { background-image: linear-gradient(color-mix(in srgb, var(--warn) 12%, transparent), color-mix(in srgb, var(--warn) 12%, transparent)); }
+
+/* drop-down cells: the ▾ button of the active cell (Alt+Down does the same) */
+.gt-grid td.has-dd { position: relative; }
+.gt-grid td.c-raw.has-dd { padding-right: 24px; }
+.dd-btn {
+  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; padding: 0; border: 1px solid var(--border-strong); border-radius: 4px;
+  background: var(--bg-elev); color: var(--text-muted); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.dd-btn::before {
+  content: ""; width: 12px; height: 12px; background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.dd-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+/* band boundaries (sorted by Total, high to low): a rule where the final letter changes */
+.gt-grid tbody tr.band-end td { border-bottom: 2px solid var(--band-line); }
+
+/* locked (finalized): score and identity cells are read-only */
+.gt-grid.locked tbody td.c-raw, .gt-grid.locked tbody td.c-no, .gt-grid.locked tbody td.c-last,
+.gt-grid.locked tbody td.c-first, .gt-grid.locked tbody td.c-team { cursor: default; }
+/* in the reserved top row of a raw-score header (the ⋯ button sits on the right) */
+.gt-grid thead .h-lock {
+  position: absolute; top: 5px; left: 7px; width: 12px; height: 14px; color: var(--text-muted); background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'%3E%3Crect x='4' y='11' width='16' height='10' rx='2'/%3E%3Cpath d='M8 11V7a4 4 0 0 1 8 0v4'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'%3E%3Crect x='4' y='11' width='16' height='10' rx='2'/%3E%3Cpath d='M8 11V7a4 4 0 0 1 8 0v4'/%3E%3C/svg%3E") center / 12px 12px no-repeat;
+}
+
+/* column actions (⋯) in a raw-score header: its own row at the top, so it never covers the name */
+.gt-grid thead th.h-raw { padding-top: 22px; }
+.th-menu {
+  all: unset; box-sizing: border-box; position: absolute; top: 3px; right: 3px; width: 20px; height: 18px;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: 4px; cursor: pointer;
+  color: var(--text-muted); opacity: 0.6;
+}
+.th-menu .icon { width: 16px; height: 16px; }
+.gt-grid thead th:hover .th-menu, .th-menu:focus-visible, .th-menu[aria-expanded="true"] { opacity: 1; }
+.th-menu:hover { background: color-mix(in srgb, var(--text) 10%, transparent); color: var(--text); }
+.th-menu:focus-visible { outline: 2px solid var(--focus); outline-offset: 0; }
+
+/* Meeting view: larger text; participation and Final letter are "to fill in the meeting" */
+.gt-grid.meeting { font-size: 15px; }
+.gt-grid.meeting th, .gt-grid.meeting td { height: 36px; }
+.gt-grid.meeting .sc2 { left: 56px; }   /* WM in grid.js */
+.gt-grid.meeting .sc3 { left: 184px; }
+.gt-grid.meeting td.c-total { font-size: 15.5px; }
+.gt-grid.meeting td.to-fill { background-color: var(--to-fill); }
+.gt-grid.meeting td.to-fill.is-empty { outline: 1px dashed var(--to-fill-line); outline-offset: -5px; }
+.gt-grid.meeting thead th.to-fill { background-color: color-mix(in srgb, var(--accent) 20%, var(--bg-sunken)); box-shadow: inset 0 3px 0 var(--accent); }
+.gt-grid thead .h-fill { color: var(--accent); font-weight: 650; }
+.gt-grid.meeting td.c-final { font-size: 16px; }
+
 /* withdrawn rows */
 .gt-grid tr.row-withdrawn td,
 .gt-grid tr.row-withdrawn td.ro,
@@ -223,6 +337,9 @@
 /* in-cell editor */
 .gt-grid td.is-editing { z-index: 2; overflow: visible; }
 .gt-grid td.is-editing:not(.sc) { position: relative; }
+/* an open drop-down list or typing hint goes over the sticky header and footer (and their sticky
+ * columns), never under them: a list that opens upward from a middle row reaches into the header */
+.gt-grid td.is-editing.has-popup { z-index: 5; }
 .gt-grid .cell-editor {
   position: absolute; inset: 0; width: 100%; height: 100%; margin: 0;
   min-height: 0; padding: 0 7px; border: 2px solid var(--focus); border-radius: 0;
@@ -235,12 +352,28 @@
 .gt-grid .cell-editor.mode-edit { background: color-mix(in srgb, var(--accent-soft) 45%, var(--bg-elev)); }
 .gt-grid .cell-editor.is-warn { background: var(--cell-range-bg); }
 .gt-grid .cell-editor.is-bad { border-color: var(--danger); background: var(--cell-invalid-bg); color: var(--cell-invalid-text); }
-.gt-grid select.team-editor {
-  inset: auto; left: -2px; top: -2px; width: auto; height: auto; min-width: calc(100% + 60px); max-height: 280px;
+.gt-grid select.list-editor {
+  inset: auto; left: -2px; top: -2px; width: auto; height: auto; min-width: calc(100% + 60px); max-height: 320px;
   padding: 3px; border-radius: var(--radius-sm); box-shadow: var(--shadow-lg); z-index: 5; overflow-y: auto;
 }
-.gt-grid select.team-editor.drop-up { top: auto; bottom: -2px; }
-.gt-grid select.team-editor option { padding: 4px 8px; border-radius: 4px; }
+.gt-grid select.dd-editor { min-width: calc(100% + 4px); font-weight: 600; font-variant-numeric: tabular-nums; }
+.gt-grid select.list-editor.drop-up { top: auto; bottom: -2px; }
+.gt-grid select.list-editor.grow-left { left: auto; right: -2px; }
+.gt-grid select.list-editor option { padding: 4px 8px; border-radius: 4px; }
+.gt-grid .cell-editor.is-letter { text-align: center; font-weight: 700; text-transform: none; }
+/* hint under a drop-down cell's editor: what can be typed, and how many rows it applies to.
+ * Informational only: clicks go through it to the cells it covers (the next rows). */
+.gt-grid .dd-hint {
+  position: absolute; left: -2px; top: calc(100% + 2px); z-index: 6; width: max-content; max-width: 300px;
+  pointer-events: none;
+  padding: 5px 8px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);
+  background: var(--bg-elev); color: var(--text-muted); box-shadow: var(--shadow);
+  font-size: 12px; font-weight: 500; line-height: 1.35; white-space: normal; text-align: left;
+}
+.gt-grid .dd-hint.drop-up { top: auto; bottom: calc(100% + 2px); }
+.gt-grid .dd-hint.grow-left { left: auto; right: -2px; }
+.gt-grid select.list-editor optgroup { font-weight: 700; color: var(--accent); font-style: normal; }
+.gt-grid select.list-editor optgroup option { color: var(--text); font-weight: 600; }
 
 /* team header rows (group by team) */
 .gt-grid tbody tr.team-row th, .gt-grid tbody tr.team-row td {
@@ -274,7 +407,7 @@
 .gt-grid tfoot td.g { background-color: color-mix(in srgb, var(--g) 50%, var(--bg-sunken)); }
 .gt-grid tfoot .avg-label { z-index: 4; text-align: left; color: var(--text); }
 .gt-grid tfoot td.f-total { color: var(--text); font-weight: 700; }
-.gt-grid tfoot td.f-letter { text-align: center; }
+.gt-grid tfoot td.f-letter, .gt-grid tfoot td.f-final { text-align: center; }
 
 .gt-grid .no-rows td { height: auto; cursor: default; }
 .no-rows-msg { position: sticky; left: 0; padding: 28px 16px; color: var(--text-muted); white-space: normal; }
@@ -316,6 +449,8 @@
   .gt-grid .sc3, .gt-grid .sc4 { position: static; }
   .gt-grid tbody td.sc3, .gt-grid tbody td.sc4 { position: static; }
   .gt-grid thead th.sc3, .gt-grid thead th.sc4 { position: sticky; left: auto; z-index: 3; }
+  /* the Meeting view's wider offsets (above) must not pin First Name's header again */
+  .gt-grid.meeting thead th.sc3, .gt-grid.meeting thead th.sc4 { left: auto; }
   .gt-grid .sc-span { position: static; }
   .gt-grid tfoot .sc-span { position: sticky; left: auto; }
   .gt-grid .sc2 { border-right: 1px solid var(--border-strong); }
@@ -323,7 +458,7 @@
 }
 
 @media print {
-  .grid-toolbar, .grid-legend, .row-details { display: none !important; }
+  .grid-toolbar, .grid-grades-bar, .grid-legend, .row-details, .dd-btn, .th-menu { display: none !important; }
   .grid-wrap { max-height: none; overflow: visible; border: 0; }
   .gt-grid thead th, .gt-grid tfoot td, .gt-grid tfoot th, .gt-grid .sc { position: static; }
   /* !important: the screen rules for the active cell and row are more specific. */

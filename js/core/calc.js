@@ -1,5 +1,5 @@
 /* Grade Tracker - grade calculations (weighted points, totals, rounding, curve, late penalty,
- * team propagation, letter grades, rank, percentile). See docs/DESIGN.md section 3.
+ * team propagation, letter grades, final letters, rank, percentile). See docs/DESIGN.md section 3.
  * Pure; runs in the browser (GT.calc) and in Node. */
 (function (root) {
   'use strict';
@@ -52,6 +52,9 @@
     // Rounding each item before summing would drift on max scores such as 30 (79.9999999999).
     var weightedUnrounded = (missing || !(max > 0)) ? 0 : adjusted * weight / max;
     var weighted = fix(weightedUnrounded);
+    // A number that is not one of the drop-down values (restored or imported): kept and counted,
+    // only highlighted (DECISIONS 8). The list is memoized per assessment in model (no rebuild per score).
+    var notOnList = p.state === 'number' && model.hasChoices(assessment) && !model.isChoiceValue(assessment, p.value);
     return {
       assessmentId: assessment.id,
       state: p.state,
@@ -62,6 +65,7 @@
       override: r.source === 'override',
       missing: missing,
       outOfRange: p.state === 'number' && (p.value < 0 || p.value > max),
+      notOnList: notOnList,
       weeksLate: weeksLate,
       waived: waived,
       penalty: penalty,
@@ -82,6 +86,15 @@
     return (scale || []).slice().sort(function (a, b) { return b.min - a.min; });
   }
 
+  /** Position of `letter` in the scale sorted by cutoff, highest first (0 = best letter); -1 when
+   * the letter is not in the scale. */
+  function letterIndex(scale, letter) {
+    if (typeof letter !== 'string' || letter === '' || !Array.isArray(scale)) return -1;
+    var s = sortedScale(scale.filter(function (x) { return x !== null && typeof x === 'object'; }));
+    for (var i = 0; i < s.length; i++) if (s[i].letter === letter) return i;
+    return -1;
+  }
+
   /** Letter for a total: the first cutoff (highest first) the total reaches; else the lowest letter. */
   function letterFor(total, scale) {
     var s = sortedScale(scale);
@@ -97,7 +110,7 @@
   function studentResult(course, student) {
     var items = {};
     var weighted = [];
-    var missingCount = 0, invalidCount = 0, outOfRangeCount = 0, overrideCount = 0, lateCount = 0;
+    var missingCount = 0, invalidCount = 0, outOfRangeCount = 0, notOnListCount = 0, overrideCount = 0, lateCount = 0;
     course.assessments.forEach(function (a) {
       var d = scoreDetail(course, student, a);
       items[a.id] = d;
@@ -105,6 +118,7 @@
       if (d.missing && (a.weight || 0) > 0) missingCount++;
       if (d.state === 'invalid') invalidCount++;
       if (d.outOfRange) outOfRangeCount++;
+      if (d.notOnList) notOnListCount++;
       if (d.override) overrideCount++;
       if (d.weeksLate > 0) lateCount++;
     });
@@ -112,6 +126,10 @@
     var weightedSum = util.sum(weighted); // fix applied once, to the sum of unrounded items
     var totalUnrounded = fix(weightedSum + curve);
     var total = roundTotal(totalUnrounded, course.settings.rounding);
+    var letter = letterFor(total, course.settings.letterScale);
+    // The final letter is assigned by hand (STAGE2B); the cutoff letter is only a suggestion.
+    var finalLetter = model.finalLetterOf(student);
+    var finalLetterValid = finalLetter === null || letterIndex(course.settings.letterScale, finalLetter) !== -1;
     return {
       studentId: student.id,
       active: student.status !== 'withdrawn',
@@ -120,11 +138,18 @@
       curve: curve,
       totalUnrounded: totalUnrounded,
       total: total,
-      letter: letterFor(total, course.settings.letterScale),
+      letter: letter,
+      finalLetter: finalLetter,
+      finalLetterValid: finalLetterValid,
+      effectiveLetter: finalLetter !== null ? finalLetter : letter,
+      letterSource: finalLetter !== null ? 'manual' : 'cutoffs',
+      letterDiffers: finalLetter !== null && finalLetter !== letter,
+      orderIssue: false,
       incomplete: missingCount > 0,
       missingCount: missingCount,
       invalidCount: invalidCount,
       outOfRangeCount: outOfRangeCount,
+      notOnListCount: notOnListCount,
       overrideCount: overrideCount,
       lateCount: lateCount,
       rank: null,
@@ -141,6 +166,32 @@
       return a.weight || 0;
     }));
     return { sum: s, ok: Math.abs(s - 100) < 1e-9 && !negative };
+  }
+
+  /** Final letters out of order (STAGE2B): among active students with a final letter of the scale
+   * (and a finite total), every pair where the student with the strictly lower total holds a strictly
+   * higher letter. Equal totals never form a pair. `list` holds studentResult objects; pairs are in
+   * total order (highest first, ties by name), as [{ higherTotalId, lowerTotalId }]. */
+  function findOrderIssues(course, list) {
+    var scale = course.settings.letterScale;
+    var students = Object.create(null);
+    course.students.forEach(function (s) { students[s.id] = s; });
+    var rows = list.filter(function (r) {
+      return r.active && r.finalLetter !== null && typeof r.total === 'number' && isFinite(r.total);
+    }).map(function (r) {
+      return { id: r.studentId, total: fix(r.total), idx: letterIndex(scale, r.finalLetter), s: students[r.studentId] };
+    }).filter(function (x) { return x.idx !== -1; });
+    rows.sort(function (a, b) { return (b.total - a.total) || compareByName(a.s, b.s); });
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      for (var j = i + 1; j < rows.length; j++) {
+        // rows[j] has a lower or equal total; a smaller index is a higher letter.
+        if (rows[j].total < rows[i].total && rows[j].idx < rows[i].idx) {
+          out.push({ higherTotalId: rows[i].id, lowerTotalId: rows[j].id });
+        }
+      }
+    }
+    return out;
   }
 
   /** Results for every student plus class-level figures (K7). */
@@ -168,11 +219,27 @@
       r.percentile = n <= 1 ? 100 : fix(100 * lower / (n - 1));
       r.diffFromAverage = fix(r.total - average);
     });
+    var activeIds = course.students.filter(function (s) { return byId[s.id].active; }).map(function (s) { return s.id; });
+    var orderIssues = findOrderIssues(course, active);
+    orderIssues.forEach(function (p) {
+      byId[p.higherTotalId].orderIssue = true;
+      byId[p.lowerTotalId].orderIssue = true;
+    });
+    var summary = { active: activeIds.length, assigned: 0, unassigned: 0, manualDiffers: 0, invalid: 0 };
+    activeIds.forEach(function (id) {
+      var r = byId[id];
+      if (r.finalLetter === null) { summary.unassigned++; return; }
+      summary.assigned++;
+      if (r.letterDiffers) summary.manualDiffers++;
+      if (!r.finalLetterValid) summary.invalid++;
+    });
     return {
       byId: byId,
-      activeIds: course.students.filter(function (s) { return byId[s.id].active; }).map(function (s) { return s.id; }),
+      activeIds: activeIds,
       average: average,
-      weights: weightStatus(course)
+      weights: weightStatus(course),
+      orderIssues: orderIssues,
+      letterSummary: summary
     };
   }
 
@@ -249,10 +316,12 @@
     latePenalty: latePenalty,
     scoreDetail: scoreDetail,
     roundTotal: roundTotal,
+    letterIndex: letterIndex,
     letterFor: letterFor,
     studentResult: studentResult,
     weightStatus: weightStatus,
     computeCourse: computeCourse,
+    findOrderIssues: findOrderIssues,
     minTotalForLetter: minTotalForLetter,
     neededScore: neededScore,
     compareByName: compareByName,

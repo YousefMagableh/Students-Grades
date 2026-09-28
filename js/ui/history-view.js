@@ -1,6 +1,9 @@
 /* Grade Tracker - History view (GT.views.history): the course's append-only change log (G5).
  * Newest first, filterable by kind group, source, student, free text and date range; the TA can add a
  * note to any entry (GT.store.annotateHistory) and export the filtered entries as CSV.
+ * A band of more than 10 final letters is one "Final letters: n changed" entry: its details list every
+ * student (a "Show n students" disclosure); the student filter, search and export read those details, and
+ * filtered to one student the entry shows that student's own old -> new letter.
  * Browser only. Filters persist in GT.store.state.ui.historyPrefs.
  * Privacy: student names (and name/notes values) carry class "pii"; the student filter lists only the
  * student's No while privacy mode is on, because a native dropdown cannot be blurred. */
@@ -28,7 +31,7 @@
 
   /** Used only when js/core/history.js is not loaded (it exports the same tables). */
   var FALLBACK_KIND_GROUPS = {
-    grades: ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late'],
+    grades: ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late', 'final-letter'],
     students: ['status', 'team-membership', 'student'],
     settings: ['settings'],
     attendance: ['attendance'],
@@ -36,7 +39,7 @@
   };
   var FALLBACK_KIND_LABELS = {
     'score': 'Score', 'team-score': 'Team score', 'propagation': 'Propagation', 'override': 'Override',
-    'override-removed': 'Override removed', 'late': 'Late work', 'status': 'Status',
+    'override-removed': 'Override removed', 'late': 'Late work', 'final-letter': 'Final letter', 'status': 'Status',
     'team-membership': 'Team', 'student': 'Student', 'settings': 'Settings', 'attendance': 'Attendance',
     'bulk': 'Bulk change'
   };
@@ -49,6 +52,7 @@
     'override': { cls: 'badge-accent', icon: 'diamond' },
     'override-removed': { cls: 'badge-accent hk-dashed', icon: 'diamond' },
     'late': { cls: 'hk-late', icon: 'clock' },
+    'final-letter': { cls: 'hk-final', icon: 'flag' },
     'status': { cls: 'hk-status' },
     'team-membership': { cls: 'hk-team' },
     'student': { cls: 'hk-student' },
@@ -87,6 +91,7 @@
   var lastStudentSig = null;
   var lastSourceSig = null;
   var visible = [];          // entries that match the filters (all pages), newest first
+  var activeStudent = '';    // the student filter in effect ('' when none or when the student is unknown)
   var sortCache = { key: null, hist: null, list: [] };
   var docBound = false;
   var saveSearchLater = util.debounce(function () { persist(); }, SEARCH_SAVE_MS);
@@ -205,10 +210,14 @@
       return { id: s.id, label: label };
     });
     var gone = [];
+    function addGone(id, name) {
+      if (!id || seen[id]) return;
+      seen[id] = true;
+      gone.push({ id: id, name: str(name) });
+    }
     entries.forEach(function (e) {
-      if (!e.studentId || seen[e.studentId]) return;
-      seen[e.studentId] = true;
-      gone.push({ id: e.studentId, name: str(e.studentName) });
+      addGone(e.studentId, e.studentName);
+      detailsOf(e).forEach(function (d) { addGone(d.studentId, d.studentName); });
     });
     gone.sort(function (a, b) { return util.compareText(a.name, b.name); });
     gone.forEach(function (g, i) {
@@ -228,9 +237,58 @@
     return list;
   }
 
+  // ------------------------------------------------------------------ summary entries (a band of final letters)
+  // More than 10 final letters in one step are logged as one "Final letters: n changed" entry without a
+  // studentId; its `details` keep every student's change (js/core/history.js). The student filter, the
+  // search and the export read those details, so each student's letter stays traceable.
+
+  /** Field (and field key) shown for one student's part of a summary entry, by the summary's fieldKey. */
+  var DETAIL_FIELDS = { finalLetters: { field: 'Final letter', key: 'student.finalLetter' } };
+
+  /** The per-student changes a summary entry keeps (read defensively), or [] for any other entry. */
+  function detailsOf(e) {
+    if (!e || !Array.isArray(e.details) || !GT.history || typeof GT.history.entryDetails !== 'function') return [];
+    try { return GT.history.entryDetails(e) || []; } catch (err) { return []; }
+  }
+
+  /** True when the entry concerns the student: its own entries and summaries that list the student. */
+  function involves(e, studentId) {
+    if (GT.history && typeof GT.history.involvesStudent === 'function') {
+      try { return !!GT.history.involvesStudent(e, studentId); } catch (err) { /* fall back below */ }
+    }
+    return e.studentId === studentId;
+  }
+
+  /** 'Part of "Final letters: 12 changed"' for a summary entry. */
+  function partOf(e) {
+    return 'Part of "' + (str(e.field) || 'Change') + (str(e.newValue) ? ': ' + str(e.newValue) : '') + '"';
+  }
+
+  /** A summary entry seen from one student: that student's own change (old -> new) taken from its details,
+   * or null when the entry is the student's own or does not list the student. Keeps the entry's id, so a
+   * note added on this row attaches to the summary entry. */
+  function asStudentRow(e, studentId) {
+    if (!studentId || e.studentId === studentId || !Array.isArray(e.details) ||
+      !GT.history || typeof GT.history.detailFor !== 'function') return null;
+    var d = null;
+    try { d = GT.history.detailFor(e, studentId); } catch (err) { d = null; }
+    if (!d) return null;
+    var fk = str(e.fieldKey);
+    var f = util.hasOwn(DETAIL_FIELDS, fk) ? DETAIL_FIELDS[fk] : { field: str(e.field), key: fk };
+    return {
+      id: e.id, ts: e.ts, kind: e.kind, source: e.source,
+      studentId: d.studentId, studentName: d.studentName,
+      field: f.field, fieldKey: f.key, oldValue: d.oldValue, newValue: d.newValue,
+      note: partOf(e), userNote: e.userNote, userNoteAt: e.userNoteAt
+    };
+  }
+
   function haystack(e) {
-    return [e.studentName, e.teamName, e.field, e.oldValue, e.newValue, e.note, e.userNote,
-      kindLabel(e.kind), e.kind, sourceLabel(e.source), e.source].map(str).join('\n').toLowerCase();
+    var parts = [e.studentName, e.teamName, e.field, e.oldValue, e.newValue, e.note, e.userNote,
+      kindLabel(e.kind), e.kind, sourceLabel(e.source), e.source];
+    // A band's students by name and No, so searching a name finds the band entry too.
+    detailsOf(e).forEach(function (d) { parts.push(d.studentName + (d.no !== null ? ' No ' + d.no : '')); });
+    return parts.map(str).join('\n').toLowerCase();
   }
 
   /** Every filter except the kind group (so the group buttons can show counts). */
@@ -239,7 +297,7 @@
     var from = cur.from, to = cur.to, source = cur.source;
     return function (e) {
       if (source && str(e.source) !== source) return false;
-      if (studentId && e.studentId !== studentId) return false;
+      if (studentId && !involves(e, studentId)) return false;
       if (from || to) {
         var day = localDay(e.ts);
         if (!day) return false;
@@ -247,7 +305,8 @@
         if (to && day > to) return false;
       }
       if (tokens.length) {
-        var h = haystack(e);
+        // Under a student filter a band entry shows (and is searched as) that student's own change.
+        var h = haystack((studentId && asStudentRow(e, studentId)) || e);
         for (var i = 0; i < tokens.length; i++) if (h.indexOf(tokens[i]) === -1) return false;
       }
       return true;
@@ -322,18 +381,42 @@
       'title="Record why this changed (for example: per instructor email, Oct 12)">' + icon('plus') + 'Add note</button>';
   }
 
+  /** A summary entry's students (a band of final letters) behind a disclosure in the Note cell:
+   * name (pii), No and old -> new for every student it changed. */
+  function detailsHtml(e) {
+    var list = detailsOf(e);
+    if (!list.length) return '';
+    var fk = str(e.fieldKey);
+    var field = util.hasOwn(DETAIL_FIELDS, fk) ? DETAIL_FIELDS[fk].field : str(e.field);
+    var items = list.map(function (d) {
+      return '<li><span class="hist-dl-who"><span class="pii hist-dl-name">' +
+          (d.studentName ? esc(d.studentName) : '<em class="faint">(no name)</em>') + '</span>' +
+          (d.no !== null ? ' <span class="hist-dl-no">No ' + esc(String(d.no)) + '</span>' : '') + '</span>' +
+        '<span class="hist-dl-change">' +
+          changeHtml({ kind: e.kind, studentId: d.studentId, field: field, oldValue: d.oldValue, newValue: d.newValue }) +
+        '</span></li>';
+    }).join('');
+    return '<details class="hist-details" data-id="' + esc(e.id) + '">' +
+      '<summary>' + icon('chevron-right', 'icon-sm') + 'Show ' + esc(plural(list.length, 'student')) + '</summary>' +
+      '<ul class="hist-dl">' + items + '</ul></details>';
+  }
+
   function rowHtml(e) {
-    var ts = str(e.ts);
-    var note = str(e.note);
-    return '<tr data-id="' + esc(e.id) + '">' +
+    // Filtered to one student, a band entry shows that student's own change (same id, so notes attach to it).
+    var own = activeStudent ? asStudentRow(e, activeStudent) : null;
+    var r = own || e;
+    var ts = str(r.ts);
+    var note = str(r.note);
+    return '<tr data-id="' + esc(e.id) + '"' + (own ? ' class="hist-part"' : '') + '>' +
       '<td class="hc-when"><time datetime="' + esc(ts) + '" title="' + esc(ts) + '">' + esc(ui.dateTime(ts) || ts || '—') + '</time></td>' +
-      '<td class="hc-who">' + whoHtml(e) + '</td>' +
-      '<td class="hc-field">' + (e.field ? esc(e.field) : '<span class="faint">—</span>') + '</td>' +
-      '<td class="hc-change">' + changeHtml(e) + '</td>' +
-      '<td class="hc-kind">' + kindBadge(e.kind) + '</td>' +
-      '<td class="hc-src">' + sourceBadge(e.source) + '</td>' +
-      '<td class="hc-note">' + (note ? '<span class="hist-note" title="' + esc(note) + '">' + esc(note) + '</span>' : '') + '</td>' +
-      '<td class="hc-user">' + userNoteHtml(e) + '</td>' +
+      '<td class="hc-who">' + whoHtml(r) + '</td>' +
+      '<td class="hc-field">' + (r.field ? esc(r.field) : '<span class="faint">—</span>') + '</td>' +
+      '<td class="hc-change">' + changeHtml(r) + '</td>' +
+      '<td class="hc-kind">' + kindBadge(r.kind) + '</td>' +
+      '<td class="hc-src">' + sourceBadge(r.source) + '</td>' +
+      '<td class="hc-note">' + (note ? '<span class="hist-note" title="' + esc(note) + '">' + esc(note) + '</span>' : '') +
+        (own ? '' : detailsHtml(e)) + '</td>' +
+      '<td class="hc-user">' + userNoteHtml(r) + '</td>' +
       '</tr>';
   }
 
@@ -414,6 +497,7 @@
       lastCourseId = null;
       boundEl.querySelector('.hist-filters').hidden = true;
       visible = [];
+      activeStudent = '';
       syncExport();
       return;
     }
@@ -431,6 +515,7 @@
     var studs = studentOptions(course, all);
     var studentValid = cur.student !== '' && studs.some(function (o) { return o.id === cur.student; });
     var studentValue = studentValid ? cur.student : '';
+    activeStudent = studentValue;
     var studentSel = ref('student');
     var sOpts = [{ value: '', label: 'All students' }].concat(studs.map(function (o) { return { value: o.id, label: o.label }; }));
     var sSig = sOpts.map(function (o) { return o.value + '\u0001' + o.label; }).join('\u0002');
@@ -473,13 +558,28 @@
     var tbody = ref('tbody');
     if (html !== lastBodyHtml) {
       var act = document.activeElement;
-      var keep = act && tbody.contains(act) && act.getAttribute('data-act')
-        ? { act: act.getAttribute('data-act'), id: act.getAttribute('data-id') } : null;
+      var keep = null;
+      if (act && tbody.contains(act)) {
+        if (act.getAttribute('data-act')) keep = { act: act.getAttribute('data-act'), id: act.getAttribute('data-id') };
+        else if (act.tagName === 'SUMMARY' && act.parentNode && act.parentNode.getAttribute('data-id')) {
+          keep = { summary: true, id: act.parentNode.getAttribute('data-id') };
+        }
+      }
+      // Band lists the TA opened stay open when the rows are redrawn.
+      var opened = Array.prototype.map.call(tbody.querySelectorAll('details.hist-details[open]'), function (d) {
+        return d.getAttribute('data-id');
+      });
       tbody.innerHTML = html;
       lastBodyHtml = html;
+      opened.forEach(function (id) {
+        var d = tbody.querySelector('details.hist-details[data-id="' + cssEscape(id) + '"]');
+        if (d) d.open = true;
+      });
       if (keep) {
-        var again = tbody.querySelector('[data-act="' + keep.act + '"][data-id="' + cssEscape(keep.id) + '"]') ||
-          tbody.querySelector('tr[data-id="' + cssEscape(keep.id) + '"] [data-act="note"]');
+        var again = keep.summary
+          ? tbody.querySelector('details.hist-details[data-id="' + cssEscape(keep.id) + '"] > summary')
+          : tbody.querySelector('[data-act="' + keep.act + '"][data-id="' + cssEscape(keep.id) + '"]');
+        again = again || tbody.querySelector('tr[data-id="' + cssEscape(keep.id) + '"] [data-act="note"]');
         if (again) again.focus();
       }
     }
@@ -579,7 +679,8 @@
     if (!list.length) { ui.toast('Nothing to export: no changes match the filters.', { type: 'warn' }); return; }
     var text;
     try {
-      text = GT.csv.stringify(GT.history.toRows(list), { bom: true });
+      // Filtered to one student, a band entry exports that student's own row after the summary row.
+      text = GT.csv.stringify(GT.history.toRows(list, { studentId: activeStudent }), { bom: true });
     } catch (err) {
       ui.toast('Could not create the CSV file: ' + (err && err.message ? err.message : String(err)), { type: 'error' });
       return;
@@ -608,9 +709,16 @@
     if (!e) { ui.toast('This history entry no longer exists.', { type: 'warn' }); return; }
     if (!GT.store.annotateHistory) { ui.toast('Notes are not available in this version.', { type: 'error' }); return; }
     var had = str(e.userNote) !== '';
+    // Opened from one student's row of a band entry: show that student's change and say the note is shared.
+    var own = activeStudent ? asStudentRow(e, activeStudent) : null;
+    var intro = own
+      ? noteDialogIntro(own) + '<p class="small muted hist-dlg-shared">' + icon('info', 'icon-sm') +
+        '<span>This letter was set together with other students in one step (' + esc(str(e.field) + ': ' + str(e.newValue)) +
+        '). Your note is saved with that whole step, so it shows for every student in it.</span></p>'
+      : noteDialogIntro(e);
     ui.dialog.form({
       title: had ? 'Edit your note' : 'Add a note to this change',
-      introHtml: noteDialogIntro(e),
+      introHtml: intro,
       fields: [{
         name: 'note', label: 'Your note', type: 'textarea', rows: 4, pii: true, value: str(e.userNote),
         placeholder: 'For example: Changed per instructor email, Oct 12',

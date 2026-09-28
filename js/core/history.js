@@ -3,15 +3,19 @@
  *
  * HistoryEntry = { id, ts, source, kind, studentId, studentName, teamId, teamName, field, fieldKey,
  *                  oldValue, newValue, note }, plus userNote / userNoteAt once the TA annotates it.
+ * - The "Final letters: n changed" summary also carries details: [{ studentId, studentName, no,
+ *   oldValue, newValue }], every student it changed (read them with entryDetails / involvesStudent).
  * - Values are display strings ('' = empty). Scores show as entered ("88.5"), invalid text as
  *   '"abc" (not a number)', booleans as 'yes' / 'no'.
  * - Names are snapshots ('Last, First'), so the log stays readable after renames and deletions.
  * - fieldKey is a stable machine key for the field: 'score:<aid>' (score, override, override-removed,
- *   propagation), 'teamScore:<aid>', 'late:<aid>.weeksLate', 'late:<aid>.waived', 'student.<field>',
- *   'student', 'team:<tid>', 'team:<tid>.name', 'assessment:<aid>', 'assessment:<aid>.<field>',
- *   'assessments.order', 'course.<field>', 'settings.<field>', 'settings.letterScale.<letter>',
- *   'placeholder:<key>', 'attendance.<field>', 'attendance.session:<sesId>', 'attendance.sessions',
- *   'attendance:<sesId>', 'attendance.totals.absent', 'attendance.totals.excused', 'attendance', 'bulk'.
+ *   propagation), 'teamScore:<aid>', 'late:<aid>.weeksLate', 'late:<aid>.waived', 'student.<field>'
+ *   (including 'student.finalLetter'), 'finalLetters' (summary of many final letters), 'student',
+ *   'team:<tid>', 'team:<tid>.name', 'assessment:<aid>', 'assessment:<aid>.<field>' (including
+ *   '.choices'), 'assessments.order', 'course.<field>' (including 'course.finalized'), 'settings.<field>',
+ *   'settings.letterScale.<letter>', 'placeholder:<key>', 'attendance.<field>', 'attendance.session:<sesId>',
+ *   'attendance.sessions', 'attendance:<sesId>', 'attendance.totals.absent', 'attendance.totals.excused',
+ *   'attendance', 'bulk'.
  *
  * diffCourse() never throws: input is read defensively (missing maps, odd values), and each group of
  * the diff runs on its own, so one unexpected shape cannot lose the rest of the log. */
@@ -28,25 +32,29 @@
   var SESSION_LIMIT = 10;
   /** Dates listed in an attendance summary note before "…". */
   var SUMMARY_DATES = 10;
+  /** A transaction that changes more final letters than this gets one summary entry for them. */
+  var LETTER_LIMIT = 10;
+  /** Student numbers listed in a final-letter summary note before "…". */
+  var SUMMARY_STUDENTS = 10;
   /** Longest value kept in an entry (notes, invalid text). */
   var VALUE_MAX = 200;
 
   var OVERRIDE_NOTE = "Per-member override: an unequal split needs the team's written agreement";
 
-  var KINDS = ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late', 'status',
-    'team-membership', 'student', 'settings', 'attendance', 'bulk'];
+  var KINDS = ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late', 'final-letter',
+    'status', 'team-membership', 'student', 'settings', 'attendance', 'bulk'];
   var SOURCES = ['edit', 'paste', 'undo', 'redo', 'import', 'restore', 'sample', 'roster', 'system'];
 
   var KIND_LABELS = {
     'score': 'Score', 'team-score': 'Team score', 'propagation': 'Propagation', 'override': 'Override',
-    'override-removed': 'Override removed', 'late': 'Late work', 'status': 'Status',
+    'override-removed': 'Override removed', 'late': 'Late work', 'final-letter': 'Final letter', 'status': 'Status',
     'team-membership': 'Team', 'student': 'Student', 'settings': 'Settings', 'attendance': 'Attendance',
     'bulk': 'Bulk change'
   };
 
   /** Kind groups used by the History view filter. */
   var KIND_GROUPS = {
-    grades: ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late'],
+    grades: ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late', 'final-letter'],
     students: ['status', 'team-membership', 'student'],
     settings: ['settings'],
     attendance: ['attendance'],
@@ -216,9 +224,21 @@
 
   function pct(w) { var t = prim(w); return t === '' ? '' : t + '%'; }
 
+  /** The stored drop-down step of an assessment (DECISIONS 8), or 0 when it has none. */
+  function choiceStep(a) {
+    var c = isObj(a) ? a.choices : null;
+    return isObj(c) && typeof c.step === 'number' && isFinite(c.step) && c.step > 0 ? c.step : 0;
+  }
+
+  function choicesLabel(a) {
+    var step = choiceStep(a);
+    return step ? 'yes (steps of ' + prim(step) + ')' : 'no';
+  }
+
   function describeAssessment(a) {
+    var step = choiceStep(a);
     return assessmentLabel(a) + ' (weight ' + pct(a.weight) + ', max ' + prim(a.maxScore) +
-      (a.teamGraded ? ', team-graded' : '') + ')';
+      (a.teamGraded ? ', team-graded' : '') + (step ? ', drop-down list in steps of ' + prim(step) : '') + ')';
   }
 
   function byName(x, y) {
@@ -291,12 +311,42 @@
     return { map: map, order: order };
   }
 
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  /** 'YYYY-MM-DD' of an ISO timestamp in local time (what the TA saw on screen); the text itself
+   * when it is not a date. */
+  function localDate(iso) {
+    var d = new Date(iso);
+    if (typeof iso !== 'string' || isNaN(d.getTime())) return trunc(iso, 40);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  /** course.finalized when it is well formed ({ at: non-empty string }), else null. */
+  function finalizedOf(x) {
+    return isObj(x) && typeof x.at === 'string' && x.at !== '' ? x : null;
+  }
+
+  function finalizedLabel(f) { return f ? 'yes (' + localDate(f.at) + ')' : 'no'; }
+
+  /** Finalizing and unlocking the scores (STAGE2B): kind 'settings', field "Scores finalized". */
+  function finalizedDiff(ctx) {
+    var fb = finalizedOf(ctx.B.raw.finalized), fa = finalizedOf(ctx.A.raw.finalized);
+    var o = finalizedLabel(fb), n = finalizedLabel(fa);
+    var nb = fb ? str(fb.note) : '', na = fa ? str(fa.note) : '';
+    if (o === n && nb === na && (!fb || !fa || str(fb.at) === str(fa.at))) return;
+    var note;
+    if (!fa) note = 'Score cells unlocked: scores can be edited again';
+    else note = 'Score cells locked; final letters stay editable' + (na ? '. Note: ' + trunc(na) : '');
+    add(ctx, 'settings', { field: 'Scores finalized', fieldKey: 'course.finalized', oldValue: o, newValue: n, note: trunc(note) });
+  }
+
   function settingsSection(ctx) {
     var B = ctx.B, A = ctx.A;
     COURSE_FIELDS.forEach(function (f) {
       var o = f[2](B.raw[f[0]]), n = f[2](A.raw[f[0]]);
       if (o !== n) add(ctx, 'settings', { field: f[1], fieldKey: 'course.' + f[0], oldValue: o, newValue: n });
     });
+    finalizedDiff(ctx);
     SETTING_FIELDS.forEach(function (f) {
       var o = f[2](B.settings[f[0]]), n = f[2](A.settings[f[0]]);
       if (o !== n) add(ctx, 'settings', { field: f[1], fieldKey: 'settings.' + f[0], oldValue: o, newValue: n });
@@ -350,6 +400,13 @@
       }
       if (prim(b.category) !== prim(a.category)) {
         add(ctx, 'settings', { field: label + ': category', fieldKey: key + '.category', oldValue: capitalize(prim(b.category)), newValue: capitalize(prim(a.category)) });
+      }
+      var cb = choicesLabel(b), ca = choicesLabel(a);
+      if (cb !== ca) {
+        add(ctx, 'settings', {
+          field: label + ': drop-down list', fieldKey: key + '.choices', oldValue: cb, newValue: ca,
+          note: ca === 'no' ? 'Scores are typed in freely' : 'Scores are chosen from a list (max down to 0)'
+        });
       }
     });
     B.assessments.forEach(function (b) {
@@ -453,13 +510,19 @@
     var common = A.students.filter(function (s) { return B.sById.has(s.id); }).sort(byName);
 
     added.forEach(function (s) {
-      add(ctx, 'student', { student: s, field: 'Student', fieldKey: 'student', oldValue: '', newValue: 'Added', note: describeStudent(A, s) });
+      // A student can come back with a final letter (undo of a deletion, import): say which.
+      var d = describeStudent(A, s), letter = finalLetterOf(s);
+      if (letter) d += (d ? ', ' : '') + 'final letter ' + trunc(letter, 40);
+      add(ctx, 'student', { student: s, field: 'Student', fieldKey: 'student', oldValue: '', newValue: 'Added', note: d });
     });
     removed.forEach(function (s) {
       var d = describeStudent(B, s);
+      var letter = finalLetterOf(s);
       add(ctx, 'student', {
         student: s, v: B, field: 'Student', fieldKey: 'student', oldValue: '', newValue: 'Deleted permanently',
-        note: (d ? d + '. ' : '') + 'Scores, overrides and attendance were deleted with the student'
+        note: (d ? d + '. ' : '') + (letter
+          ? 'Scores, overrides, attendance and the final letter (' + trunc(letter, 40) + ') were deleted with the student'
+          : 'Scores, overrides and attendance were deleted with the student')
       });
     });
     common.forEach(function (s) {
@@ -659,7 +722,69 @@
     });
   }
 
-  // ------------------------------------------------------------------ 9. attendance
+  // ------------------------------------------------------------------ 9. final letters (STAGE2B)
+
+  function finalLetterOf(s) {
+    return isObj(s) && typeof s.finalLetter === 'string' && s.finalLetter.trim() !== '' ? s.finalLetter : '';
+  }
+
+  /** Manually assigned final letters of students present before and after (added and deleted students
+   * are covered by their own entries). Up to LETTER_LIMIT changes: one 'final-letter' entry each, in
+   * name order. More: one summary entry "Final letters: n changed" whose note lists up to
+   * SUMMARY_STUDENTS students by No and how many got each letter, and whose `details` keep every
+   * student's change (name order), so each letter stays traceable per student (entryDetails,
+   * involvesStudent, toRows). */
+  function finalLetterSection(ctx) {
+    var B = ctx.B, A = ctx.A;
+    var changes = [];
+    A.students.filter(function (s) { return B.sById.has(s.id); }).sort(byName).forEach(function (s) {
+      var o = finalLetterOf(B.sById.get(s.id)), n = finalLetterOf(s);
+      if (o !== n) changes.push({ student: s, o: o, n: n });
+    });
+    if (!changes.length) return;
+    if (changes.length <= LETTER_LIMIT) {
+      changes.forEach(function (c) {
+        add(ctx, 'final-letter', {
+          student: c.student, field: 'Final letter', fieldKey: 'student.finalLetter',
+          oldValue: trunc(c.o, 40), newValue: trunc(c.n, 40)
+        });
+      });
+      return;
+    }
+    var nos = changes.map(function (c) { return c.student.no; })
+      .filter(function (no) { return typeof no === 'number' && isFinite(no); })
+      .sort(function (x, y) { return x - y; });
+    var listed = nos.slice(0, SUMMARY_STUDENTS);
+    var who = listed.length
+      ? 'Students No ' + listed.join(', ') + (changes.length > listed.length ? ', …' : '')
+      : plural(changes.length, 'student');
+    // How many students got each letter, in scale order; letters outside the scale next, cleared last.
+    var counts = new Map();
+    changes.forEach(function (c) { counts.set(c.n, (counts.get(c.n) || 0) + 1); });
+    var scale = arr(A.settings.letterScale);
+    var order = Array.from(counts.keys()).sort(function (x, y) {
+      var ix = x === '' ? 1e9 : calc.letterIndex(scale, x), iy = y === '' ? 1e9 : calc.letterIndex(scale, y);
+      if (ix === -1) ix = 1e8;
+      if (iy === -1) iy = 1e8;
+      return (ix - iy) || (x < y ? -1 : x > y ? 1 : 0);
+    });
+    var parts = order.map(function (l) { return (l === '' ? 'cleared' : trunc(l, 12)) + ' ×' + counts.get(l); });
+    var e = add(ctx, 'final-letter', {
+      field: 'Final letters', fieldKey: 'finalLetters', oldValue: '', newValue: changes.length + ' changed',
+      note: trunc(who + '; ' + parts.join(', '))
+    });
+    e.details = changes.map(function (c) {
+      return {
+        studentId: c.student.id,
+        studentName: model.studentName(c.student),
+        no: typeof c.student.no === 'number' && isFinite(c.student.no) ? c.student.no : null,
+        oldValue: trunc(c.o, 40),
+        newValue: trunc(c.n, 40)
+      };
+    });
+  }
+
+  // ------------------------------------------------------------------ 10. attendance
 
   var MODE_LABELS = { 'per-session': 'Per session', totals: 'Totals only', off: 'Off' };
   function modeLabel(v) { return typeof v === 'string' && own(MODE_LABELS, v) ? MODE_LABELS[v] : prim(v); }
@@ -806,13 +931,14 @@
     { label: 'team scores', fn: teamScoreSection },
     { label: 'scores', fn: entrySection },
     { label: 'team propagation', fn: propagationSection },
+    { label: 'final letters', fn: finalLetterSection },
     { label: 'attendance', fn: attendanceSection }
   ];
 
   /** Entries for every difference between two versions of a course (history itself is ignored).
-   * opts: { ts = now, source = 'edit' }. Order: course details and settings, assessments,
-   * placeholders, teams, students, team scores, individual entries, propagation, attendance;
-   * within a group, assessment order, then student name order. Never throws. */
+   * opts: { ts = now, source = 'edit' }. Order: course details and settings (finalizing included),
+   * assessments, placeholders, teams, students, team scores, individual entries, propagation, final
+   * letters, attendance; within a group, assessment order, then student name order. Never throws. */
   function diffCourse(before, after, opts) {
     var o = isObj(opts) ? opts : {};
     var ctx = {
@@ -853,10 +979,61 @@
     return e;
   }
 
+  // ------------------------------------------------------------------ summary details
+
+  /** Field shown for one student's change inside a summary entry, by the summary's fieldKey. */
+  var DETAIL_FIELDS = { finalLetters: 'Final letter' };
+
+  /** The per-student changes a summary entry keeps in `details` (today: "Final letters: n changed"),
+   * as [{ studentId, studentName, no (number|null), oldValue, newValue }] in the stored order (name
+   * order). Read defensively (the log comes from saved files): malformed items are skipped, and any
+   * entry without details gives []. */
+  function entryDetails(e) {
+    if (!isObj(e) || !Array.isArray(e.details)) return [];
+    var out = [];
+    e.details.forEach(function (d) {
+      if (!isObj(d) || typeof d.studentId !== 'string' || d.studentId === '') return;
+      out.push({
+        studentId: d.studentId,
+        studentName: str(d.studentName),
+        no: typeof d.no === 'number' && isFinite(d.no) ? d.no : null,
+        oldValue: str(d.oldValue),
+        newValue: str(d.newValue)
+      });
+    });
+    return out;
+  }
+
+  /** One student's change inside a summary entry ({ studentId, studentName, no, oldValue, newValue }),
+   * or null when the entry has no details for that student. */
+  function detailFor(e, studentId) {
+    if (typeof studentId !== 'string' || studentId === '') return null;
+    var list = entryDetails(e);
+    for (var i = 0; i < list.length; i++) if (list[i].studentId === studentId) return list[i];
+    return null;
+  }
+
+  /** True when the entry concerns the student: its own studentId, or one of its summary details (a
+   * band of final letters). This is what the History view's student filter matches. */
+  function involvesStudent(e, studentId) {
+    if (!isObj(e) || typeof studentId !== 'string' || studentId === '') return false;
+    if (e.studentId === studentId) return true;
+    if (!Array.isArray(e.details)) return false;
+    for (var i = 0; i < e.details.length; i++) {
+      var d = e.details[i];
+      if (isObj(d) && d.studentId === studentId) return true;
+    }
+    return false;
+  }
+
   var ROW_HEADER = ['Timestamp (ISO)', 'Source', 'Kind', 'Student', 'Team', 'Field', 'Old value', 'New value', 'Note', 'User note', 'User note time (ISO)'];
 
-  /** Rows for a CSV export of history entries: [header, ...rows]. */
-  function toRows(entries) {
+  /** Rows for a CSV export of history entries: [header, ...rows]. A summary entry with details (e.g.
+   * "Final letters: 12 changed") is followed by one row per student it changed, so the export is a
+   * complete per-student record. opts: { studentId } limits those detail rows to one student (the
+   * History view's student filter). */
+  function toRows(entries, opts) {
+    var only = isObj(opts) && typeof opts.studentId === 'string' && opts.studentId !== '' ? opts.studentId : null;
     var rows = [ROW_HEADER.slice()];
     arr(entries).forEach(function (e) {
       if (!isObj(e)) return;
@@ -864,6 +1041,14 @@
         str(e.ts), str(e.source), str(e.kind), str(e.studentName), str(e.teamName), str(e.field),
         str(e.oldValue), str(e.newValue), str(e.note), str(e.userNote), e.userNote ? str(e.userNoteAt) : ''
       ]);
+      var details = entryDetails(e);
+      if (!details.length) return;
+      var field = own(DETAIL_FIELDS, str(e.fieldKey)) || str(e.field);
+      var part = 'Part of "' + str(e.field) + (str(e.newValue) ? ': ' + str(e.newValue) : '') + '"';
+      details.forEach(function (d) {
+        if (only && d.studentId !== only) return;
+        rows.push([str(e.ts), str(e.source), str(e.kind), d.studentName, '', field, d.oldValue, d.newValue, part, '', '']);
+      });
     });
     return rows;
   }
@@ -873,12 +1058,16 @@
     bulkEntry: bulkEntry,
     displayValue: displayValue,
     toRows: toRows,
+    entryDetails: entryDetails,
+    detailFor: detailFor,
+    involvesStudent: involvesStudent,
     kindGroup: kindGroup,
     KINDS: KINDS,
     SOURCES: SOURCES,
     KIND_LABELS: KIND_LABELS,
     KIND_GROUPS: KIND_GROUPS,
     MARK_LIMIT: MARK_LIMIT,
+    LETTER_LIMIT: LETTER_LIMIT,
     OVERRIDE_NOTE: OVERRIDE_NOTE
   };
 

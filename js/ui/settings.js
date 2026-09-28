@@ -1,11 +1,18 @@
 /* Grade Tracker - Settings view (GT.views.settings).
- * Sections: needs confirmation (placeholders), course details, assessments and weights, grade calculation,
- * letter scale, and data & privacy. Browser only.
+ * Sections: grading status (finalized scores, final letters), needs confirmation (placeholders), course
+ * details, assessments and weights (with the per-item drop-down list), grade calculation, letter scale,
+ * and data & privacy. Browser only.
  *
  * Every course change goes through GT.store.transact (autosaved, undoable, logged in History).
  * Text inputs commit on Enter or when they lose focus; invalid input shows an inline error next to the
  * field and is not saved. A re-render replaces only the sections whose markup changed, and restores
- * focus (and any typed draft) by the field's data-field key. */
+ * focus (and any typed draft) by the field's data-field key.
+ *
+ * Finalized scores (STAGE2B): the controls that change totals (weights, max scores, rounding, curve) or
+ * the suggested letters (cutoffs) show "Scores are finalized: changing this changes totals." and ask
+ * before saving every change, with a preview of how many students are affected (also when none is
+ * right now). A letter-scale change that would leave assigned final letters outside the scale asks
+ * too, finalized or not. */
 (function (root) {
   'use strict';
   var GT = root.GT;
@@ -15,13 +22,19 @@
   GT.views = GT.views || {};
 
   var SECTIONS = [
+    { id: 'status', title: 'Grading status', icon: 'lock' },
     { id: 'confirm', title: 'Needs confirmation', icon: 'flag' },
     { id: 'course', title: 'Course details', icon: 'file' },
     { id: 'assessments', title: 'Assessments and weights', icon: 'layers' },
     { id: 'calc', title: 'Grade calculation', icon: 'settings' },
     { id: 'letters', title: 'Letter scale', icon: 'chart' },
-    { id: 'data', title: 'Data & privacy', icon: 'lock' }
+    { id: 'data', title: 'Data & privacy', icon: 'database' }
   ];
+
+  var LOCK_TOTALS = 'Scores are finalized: changing this changes totals.';
+  var LOCK_LETTERS = 'Scores are finalized: changing this changes the suggested letters (final letters are not changed).';
+  /** Drop-down step offered when the list is turned on: 0.5, or the first of these that fits the max score. */
+  var STEP_CANDIDATES = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
 
   var CATEGORIES = [
     { value: 'project', label: 'Project' },
@@ -69,6 +82,8 @@
   // item was made team-graded here and received their team's score (key = entryKey of that score,
   // prev = their own entry before, null or late info only). Lets "Make individually graded" undo that fill.
   var teamFill = Object.create(null);
+  var guarding = Object.create(null);  // data-field key -> true while its "scores are finalized" question is open
+  var guardChain = Promise.resolve();  // those questions open one at a time
 
   // ------------------------------------------------------------------ small helpers
 
@@ -198,6 +213,178 @@
     return true;
   }
 
+  // ------------------------------------------------------------------ finalized scores, final letters (STAGE2B)
+  // The core helpers are used when present; the fallbacks keep this view working without them.
+
+  function isLocked(course) {
+    if (!course) return false;
+    if (typeof model.isFinalized === 'function') {
+      try { return !!model.isFinalized(course); } catch (e) { /* fall back */ }
+    }
+    return !!(util.isPlainObject(course.finalized) && typeof course.finalized.at === 'string' && course.finalized.at !== '');
+  }
+
+  function finalizedInfo(course) {
+    return isLocked(course) ? course.finalized : null;
+  }
+
+  function finalLetterOf(s) {
+    if (typeof model.finalLetterOf === 'function') return model.finalLetterOf(s);
+    return s && typeof s.finalLetter === 'string' && s.finalLetter.trim() !== '' ? s.finalLetter : null;
+  }
+
+  function scaleLetters(course) {
+    if (typeof model.scaleLetters === 'function') return model.scaleLetters(course);
+    return sortedScale(course).map(function (r) { return r.letter; });
+  }
+
+  /** Inline notice shown on a control that changes totals (or the suggested letters) once scores are finalized. */
+  function lockNoteHtml(course, kind, extra) {
+    if (!isLocked(course)) return '';
+    return '<div class="set-lock-note" role="note">' + icon('lock') + '<span>' + esc(kind === 'letters' ? LOCK_LETTERS : LOCK_TOTALS) +
+      (extra ? ' ' + esc(extra) : '') + '</span></div>';
+  }
+
+  /** Callout for dialogs whose change affects totals, when the scores are finalized ('' otherwise). */
+  function lockCalloutHtml(course, text) {
+    var f = finalizedInfo(course);
+    if (!f) return '';
+    return '<div class="callout callout-warn set-lock-callout">' + icon('lock') + '<div><strong>Scores are finalized</strong>' +
+      (f.at ? ' (' + esc(ui.dateTime(f.at)) + ')' : '') + '. ' + esc(text || 'Changing this changes totals.') + '</div></div>';
+  }
+
+  function sameNum(a, b) {
+    var fa = typeof a === 'number' && isFinite(a), fb = typeof b === 'number' && isFinite(b);
+    return fa && fb ? util.fix(a) === util.fix(b) : fa === fb;
+  }
+
+  /** What a change would do, worked out on a copy of the course: { active, totals, letters, finals, lost,
+   * lostLetters, error }. totals / letters: active students whose total / suggested letter changes;
+   * finals: those of them who already have a final letter; lost: students (any status) whose final letter
+   * is in the scale now and would not be after the change. */
+  function impactOf(course, apply) {
+    var out = { active: 0, totals: 0, letters: 0, finals: 0, lost: 0, lostLetters: [], error: null };
+    var before, after;
+    try {
+      var copy = util.clone(Object.assign({}, course, { history: [] }));
+      apply(copy);
+      before = GT.store.course() === course ? GT.store.results() : calc.computeCourse(course);
+      after = calc.computeCourse(copy);
+    } catch (err) {
+      out.error = err;
+      return out;
+    }
+    course.students.forEach(function (s) {
+      var b = before.byId[s.id], a = after.byId[s.id];
+      if (!b || !a) return;
+      if (b.finalLetter !== null && b.finalLetter !== undefined && b.finalLetterValid !== false && a.finalLetterValid === false) {
+        out.lost++;
+        if (out.lostLetters.indexOf(b.finalLetter) === -1) out.lostLetters.push(b.finalLetter);
+      }
+      if (s.status === 'withdrawn') return;
+      out.active++;
+      var t = !sameNum(b.total, a.total), l = b.letter !== a.letter;
+      if (t) out.totals++;
+      if (l) out.letters++;
+      if ((t || l) && a.finalLetter !== null && a.finalLetter !== undefined) out.finals++;
+    });
+    return out;
+  }
+
+  /** Dialog text for an impact: the finalized callout plus what changes. kind 'totals' | 'letters'. */
+  function impactHtml(course, im, kind) {
+    var h = lockCalloutHtml(course, kind === 'letters' ? 'Changing this changes the suggested letters.' : 'Changing this changes totals.');
+    var li = [];
+    if (im.active && isLocked(course) && !im.error && !im.totals && !im.letters) {
+      // Finalized: asked anyway (a later score or scale change could make it matter), so say it is harmless now.
+      li.push('<li>' + (kind === 'letters' ? 'No suggested letter changes' : 'No total or suggested letter changes') + ' right now (' +
+        plural(im.active, 'active student') + ' checked).</li>');
+    } else if (im.active && isLocked(course)) {
+      if (kind !== 'letters') li.push('<li>Totals change for <strong>' + im.totals + ' of ' + plural(im.active, 'active student') + '</strong>.</li>');
+      li.push('<li>The suggested letter changes for <strong>' + im.letters + (kind === 'letters' ? ' of ' + plural(im.active, 'active student') : '') + '</strong>.</li>');
+      if (im.finals) {
+        li.push('<li><strong>' + plural(im.finals, 'student') + ' with a final letter ' + (im.finals === 1 ? 'is' : 'are') + ' affected.</strong> ' +
+          'Final letters are never changed automatically: check them after this change.</li>');
+      }
+    }
+    if (im.lost) {
+      li.push('<li><strong>' + plural(im.lost, 'student has', 'students have') + ' the final letter ' + esc(im.lostLetters.join(', ')) + '</strong>, which would no longer be ' +
+        'in the scale. ' + (im.lost === 1 ? 'It is kept' : 'They are kept') + ' and shown in red in the grid until you choose another letter.</li>');
+    }
+    if (li.length) h += '<ul class="set-dlg-list">' + li.join('') + '</ul>';
+    return h + '<p class="muted">The change is logged in History and can be undone (Ctrl+Z).' + (isLocked(course) ? ' The scores stay finalized.' : '') + '</p>';
+  }
+
+  /** Runs o.run() now, unless the change needs a question first: the scores are finalized (every change
+   * of a setting that affects totals or suggested letters asks, even when no student's total or letter
+   * changes right now; the dialog then says so), or final letters would leave the scale. Then it asks
+   * (one question at a time, after the current event) and runs o.run() or o.cancel().
+   * o: { label, kind: 'totals'|'letters', apply(courseCopy), run(), cancel?(), confirmText? } */
+  function guardChange(o) {
+    var course = GT.store.course();
+    if (!course) return;
+    var locked = isLocked(course);
+    var im = locked || o.kind === 'letters' ? impactOf(course, o.apply) : null;
+    var ask = locked || (!!im && !im.error && im.lost > 0);
+    if (!ask) { o.run(); return; }
+    function cancel() { if (o.cancel) o.cancel(); }
+    guardChain = guardChain.then(function () {
+      return new Promise(function (resolve) { setTimeout(resolve, 0); });
+    }).then(function () {
+      return ui.dialog.open({
+        title: locked ? 'Change finalized scores?' : 'Final letters would leave the scale',
+        bodyHtml: '<p class="set-dlg-change">' + esc(o.label) + '</p>' + impactHtml(course, im, o.kind),
+        buttons: [
+          { text: 'Cancel', value: false },
+          { text: o.confirmText || 'Change anyway', value: true, primary: true }
+        ],
+        initialFocus: '.dlg-foot .btn:not(.btn-primary)'
+      });
+    }).then(function (ok) {
+      if (ok) o.run(); else cancel();
+    }, function (err) {
+      cancel();
+      toastError(err);
+    }).then(null, toastError);
+  }
+
+  // ------------------------------------------------------------------ drop-down lists (DECISIONS 8)
+
+  function choiceList(a) {
+    return typeof model.choiceValues === 'function' ? model.choiceValues(a) : [];
+  }
+
+  /** The step to offer when a list is turned on: 0.5 when it fits the max score, else the first larger one that does. */
+  function defaultStep(max) {
+    var limit = model.MAX_CHOICE_STEPS || 200;
+    if (!(max > 0)) return 0.5;
+    for (var i = 0; i < STEP_CANDIDATES.length; i++) {
+      var st = STEP_CANDIDATES[i];
+      if (st <= max && util.fix(max / st) <= limit) return st;
+    }
+    return max < 0.5 ? util.fix(max / 10) : max;
+  }
+
+  /** "5, 4.5, 4 … 0 · 11 values" */
+  function choicePreview(values) {
+    if (!values.length) return '';
+    var shown = values.length <= 6 ? values.map(num).join(', ')
+      : values.slice(0, 3).map(num).join(', ') + ' … ' + num(values[values.length - 1]);
+    return shown + ' · ' + plural(values.length, 'value');
+  }
+
+  /** Students whose current score for `a` is a number that is not on a list with this step. */
+  function offListCount(course, a, step) {
+    var test = { id: a.id, maxScore: a.maxScore, choices: { step: step } };
+    if (typeof model.isChoiceValue !== 'function') return 0;
+    var n = 0;
+    course.students.forEach(function (s) {
+      var e = model.effectiveEntry(course, s, a);
+      if (e && typeof e.value === 'number' && !model.isChoiceValue(test, e.value)) n++;
+    });
+    return n;
+  }
+
   // ------------------------------------------------------------------ inputs
 
   function fieldError(key, stored) {
@@ -306,11 +493,20 @@
       };
     }
     if (prop === 'max') {
+      var listStep = choiceList(a).length ? a.choices.step : null;
+      var limit = model.MAX_CHOICE_STEPS || 200;
       return {
         stored: String(a.maxScore),
+        totals: 'totals',
         parse: function (t) {
           var p = util.parseScoreInput(t);
           if (p.kind !== 'number' || !(p.value > 0)) return { error: 'Max score must be a number above 0, for example 100.' };
+          if (listStep && (util.fix(p.value / listStep) > limit || listStep > p.value)) {
+            return {
+              error: 'With the drop-down list in steps of ' + num(listStep) + ', the max score must be between ' + num(listStep) + ' and ' +
+                num(util.fix(listStep * limit)) + '. Change the step first, or turn the list off.'
+            };
+          }
           return { value: p.value };
         },
         same: function (v) { return v === a.maxScore; },
@@ -321,6 +517,7 @@
     if (prop === 'weight') {
       return {
         stored: String(a.weight),
+        totals: 'totals',
         parse: function (t) {
           var p = util.parseScoreInput(t);
           if (p.kind !== 'number' || p.value < 0) return { error: 'Weight must be a number, 0 or more (for example 25).' };
@@ -331,6 +528,26 @@
         apply: function (c, v) { var x = model.findAssessment(c, aid); if (x) x.weight = v; }
       };
     }
+    if (prop === 'step') {
+      if (!choiceList(a).length) return null;
+      var cur = a.choices.step;
+      var maxSteps = model.MAX_CHOICE_STEPS || 200;
+      return {
+        stored: String(cur),
+        parse: function (t) {
+          var p = util.parseScoreInput(t);
+          if (p.kind !== 'number' || !(p.value > 0)) return { error: 'The step must be a number above 0, for example 0.5.' };
+          if (p.value > a.maxScore) return { error: 'The step must be at most the max score (' + num(a.maxScore) + ').' };
+          if (util.fix(a.maxScore / p.value) > maxSteps) {
+            return { error: 'Too many values: with max ' + num(a.maxScore) + ' the step must be at least ' + num(util.fix(a.maxScore / maxSteps)) + ' (at most ' + maxSteps + ' steps).' };
+          }
+          return { value: p.value };
+        },
+        same: function (v) { return v === cur; },
+        label: function (v) { return 'Set the ' + a.name + ' drop-down list to steps of ' + num(v); },
+        apply: function (c, v) { var x = model.findAssessment(c, aid); if (x) x.choices = { step: v }; }
+      };
+    }
     return null;
   }
 
@@ -338,6 +555,7 @@
     var cur = course.settings.curve || 0;
     return {
       stored: String(cur),
+      totals: 'totals',
       parse: function (t) {
         var p = util.parseScoreInput(t);
         if (p.kind === 'empty') return { value: 0 };
@@ -359,6 +577,7 @@
     if (prop === 'letter') {
       return {
         stored: row.letter,
+        totals: 'letters',
         parse: function (t) {
           var v = String(t).trim();
           if (!v) return { error: 'Enter a letter.' };
@@ -386,6 +605,7 @@
         : 'Enter a cutoff above ' + num(below.min) + ' (' + below.letter + ').';
       return {
         stored: String(row.min),
+        totals: 'letters',
         parse: function (t) {
           var p = util.parseScoreInput(t);
           if (p.kind !== 'number') return { error: 'Enter a number, for example 90.' };
@@ -436,9 +656,118 @@
         extra = '<span class="set-toc-warn" title="Weights add up to ' + esc(num(w.sum)) + '%, not 100%">' + icon('alert', 'icon-sm') +
           '<span class="sr-only">Weights do not add up to 100%</span></span>';
       }
+      if (s.id === 'status' && isLocked(course)) {
+        extra = '<span class="set-toc-lock" title="Scores are finalized">' + icon('check', 'icon-sm') + '<span class="sr-only">Scores are finalized</span></span>';
+      }
       return '<li><button type="button" class="set-toc-link" data-act="goto-sec" data-sec="' + s.id + '" data-field="toc:' + s.id + '">' +
         icon(s.icon) + '<span class="set-toc-text">' + esc(s.title) + '</span>' + extra + '</button></li>';
     }).join('') + '</ul>';
+  }
+
+  // ------------------------------------------------------------------ render: 0. grading status (STAGE2B)
+
+  /** Final-letter counts over active students: from calc's letterSummary when present, else counted here. */
+  function letterCounts(course, results) {
+    var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; });
+    var byLetter = Object.create(null);
+    var out = { active: active.length, assigned: 0, unassigned: 0, manualDiffers: 0, invalid: 0, fillable: 0, orderIssues: 0, byLetter: byLetter };
+    var letters = scaleLetters(course);
+    active.forEach(function (s) {
+      var r = results && results.byId ? results.byId[s.id] : null;
+      var fl = finalLetterOf(s);
+      if (fl === null) {
+        out.unassigned++;
+        if (r && letters.indexOf(r.letter) !== -1) out.fillable++;
+        return;
+      }
+      out.assigned++;
+      byLetter[fl] = (byLetter[fl] || 0) + 1;
+      if (r && r.letterDiffers) out.manualDiffers++;
+      if (letters.indexOf(fl) === -1) out.invalid++;
+    });
+    var sm = results && results.letterSummary;
+    if (sm && typeof sm.assigned === 'number') {
+      out.assigned = sm.assigned;
+      out.unassigned = sm.unassigned;
+      if (typeof sm.manualDiffers === 'number') out.manualDiffers = sm.manualDiffers;
+      if (typeof sm.invalid === 'number') out.invalid = sm.invalid;
+    }
+    out.orderIssues = results && Array.isArray(results.orderIssues) ? results.orderIssues.length : 0;
+    return out;
+  }
+
+  function statusHtml(course, results) {
+    var f = finalizedInfo(course);
+    var lc = letterCounts(course, results);
+    var canCopy = typeof model.copySuggestedToFinal === 'function';
+    var canUnlock = typeof model.unfinalize === 'function' || !!f;
+    var right = f
+      ? '<span class="badge badge-success">' + icon('lock') + 'Scores finalized</span>'
+      : '<span class="badge">' + icon('edit') + 'Scores editable</span>';
+    var h = cardHead('status', 'Grading status',
+      'Enter every score, finalize the scores, then assign each final letter in the Grades tab (sorted by total). ' +
+      'The letter from the cutoffs is only a suggestion; once assigned, the final letters are the grades.', right);
+    h += '<div class="card-body"><div class="set-status-grid">';
+
+    // Scores: finalized or not.
+    h += '<div class="set-status-tile' + (f ? ' is-locked' : '') + '"><div class="set-status-label">Scores</div>';
+    if (f) {
+      h += '<div class="set-status-value">' + icon('lock') + '<span>Finalized</span></div>' +
+        '<div class="set-status-sub">on ' + esc(ui.dateTime(f.at)) + (f.note ? ' · <span class="set-status-note">' + esc(f.note) + '</span>' : '') + '</div>' +
+        '<p class="set-status-help">Score cells are locked in the Grades tab; final letters stay editable. ' +
+        'Weights, max scores, rounding, curve and cutoffs ask before saving.</p>' +
+        '<div class="set-status-actions"><button type="button" class="btn btn-sm" data-act="unlock" data-field="status:unlock"' + (canUnlock ? '' : ' disabled') + '>' +
+        icon('lock') + 'Unlock scores…</button></div>';
+    } else {
+      var canFinalize = typeof ui.openFinalize === 'function';
+      h += '<div class="set-status-value"><span>Not finalized</span></div>' +
+        '<div class="set-status-sub">Scores can be edited.</div>' +
+        '<p class="set-status-help">When every score is in, use <strong>Finalize scores…</strong> in the Grades tab: it checks for missing ' +
+        'or invalid scores first, then locks the score cells.</p>' +
+        '<div class="set-status-actions">' + (canFinalize
+          ? '<button type="button" class="btn btn-sm" data-act="finalize" data-field="status:finalize">' + icon('lock') + 'Finalize scores…</button>'
+          : '<button type="button" class="btn btn-sm" data-act="open-view" data-view="grades" data-field="status:grades">' + icon('grid') + 'Open Grades</button>') +
+        '</div>';
+    }
+    h += '</div>';
+
+    // Final letters.
+    var all = lc.active > 0 && lc.unassigned === 0;
+    var pct = lc.active ? Math.round(100 * lc.assigned / lc.active) : 0;
+    h += '<div class="set-status-tile"><div class="set-status-label">Final letters</div>';
+    if (!lc.active) {
+      h += '<div class="set-status-value"><span>No active students</span></div><div class="set-status-sub">Add students first.</div>';
+    } else {
+      h += '<div class="set-status-value' + (all ? ' is-ok' : '') + '">' + (all ? icon('check') : '') +
+        '<span><span class="num">' + lc.assigned + '</span> of <span class="num">' + lc.active + '</span> assigned</span></div>' +
+        '<div class="set-meter' + (all ? ' is-ok' : '') + '" role="img" aria-label="' + esc(pct + '% of active students have a final letter') + '">' +
+        '<span class="set-meter-bar" style="width:' + pct + '%"></span></div>';
+      var notes = [];
+      notes.push(lc.unassigned
+        ? '<li class="is-warn">' + icon('alert', 'icon-sm') + '<span>' + plural(lc.unassigned, 'active student') + ' without a final letter</span></li>'
+        : '<li class="is-ok">' + icon('check', 'icon-sm') + '<span>Every active student has a final letter</span></li>');
+      if (lc.manualDiffers) notes.push('<li>' + icon('info', 'icon-sm') + '<span>' + lc.manualDiffers + ' differ' + (lc.manualDiffers === 1 ? 's' : '') + ' from the cutoff suggestion</span></li>');
+      if (lc.invalid) notes.push('<li class="is-bad">' + icon('alert', 'icon-sm') + '<span>' + plural(lc.invalid, 'final letter') + ' not in the current scale (shown in red): choose another letter</span></li>');
+      if (lc.orderIssues) {
+        notes.push('<li class="is-warn">' + icon('alert', 'icon-sm') + '<span>' + plural(lc.orderIssues, 'order issue') + ': a student with a lower total has a higher letter than one with a higher total</span></li>');
+      }
+      h += '<ul class="set-status-list">' + notes.join('') + '</ul>';
+      var used = scaleLetters(course).filter(function (l) { return lc.byLetter[l]; });
+      Object.keys(lc.byLetter).forEach(function (l) { if (used.indexOf(l) === -1) used.push(l); });
+      if (used.length) {
+        h += '<div class="set-letter-chips" aria-label="Final letters assigned">' + used.map(function (l) {
+          return '<span class="chip">' + esc(l) + ' <span class="num">×' + lc.byLetter[l] + '</span></span>';
+        }).join('') + '</div>';
+      }
+      h += '<div class="set-status-actions">' +
+        '<button type="button" class="btn btn-sm" data-act="copy-suggested" data-field="status:copy"' + (canCopy && lc.fillable ? '' : ' disabled') + '>' +
+        icon('copy') + 'Copy suggested letters into empty final letters' + (lc.fillable ? ' (' + lc.fillable + ')' : '') + '</button>' +
+        '<button type="button" class="btn btn-sm btn-ghost" data-act="open-view" data-view="grades" data-field="status:assign">' + icon('grid') + 'Assign in Grades</button></div>' +
+        '<p class="set-status-help">Copying fills only the empty final letters of active students, in one step you can undo. ' +
+        'Letters already chosen are not changed.</p>';
+    }
+    h += '</div></div>';
+    return h + '</div>';
   }
 
   // ------------------------------------------------------------------ render: 1. needs confirmation
@@ -575,12 +904,31 @@
       '<td class="num set-weight-cell"><div class="set-input-suffix">' + inputHtml(k + 'weight', String(a.weight), { label: 'Weight of ' + a.name + ' in percent', cls: 'set-in-num', numeric: true, role: 'weight-input', aid: aid }) +
       '<span class="muted">%</span></div></td>' +
       '<td class="set-center"><input type="checkbox" data-field="' + esc(k + 'team') + '" aria-label="' + esc(a.name + ' is team-graded') + '"' + (a.teamGraded ? ' checked' : '') + '></td>' +
+      choicesCellHtml(a) +
       '<td>' + selectHtml(k + 'cat', a.category || 'other', CATEGORIES.some(function (c) { return c.value === a.category; }) ? CATEGORIES
         : CATEGORIES.concat([{ value: a.category, label: a.category }]), { label: 'Category of ' + a.name, cls: 'set-sel' }) + '</td>' +
       '<td class="set-row-actions">' +
       '<button type="button" class="btn btn-sm" data-act="split" data-aid="' + esc(aid) + '" data-field="' + esc(k + 'split') + '" title="Split ' + esc(a.name) + ' into 2 to 4 parts">Split…</button>' +
       '<button type="button" class="btn btn-sm btn-icon btn-ghost set-del" data-act="del-asmt" data-aid="' + esc(aid) + '" data-field="' + esc(k + 'del') + '"' +
       ' aria-label="Delete ' + esc(a.name) + '" title="Delete ' + esc(a.name) + '">' + icon('trash') + '</button></td></tr>';
+  }
+
+  /** "Drop-down list" cell: a checkbox, and when the list is on, its step and a preview of the values. */
+  function choicesCellHtml(a) {
+    var values = choiceList(a);
+    var on = values.length > 0;
+    var k = 'a:' + a.id + ':';
+    var supported = typeof model.choiceValues === 'function';
+    var h = '<td class="set-choices-cell"><label class="check set-choices-toggle"><input type="checkbox" data-field="' + esc(k + 'choices') + '"' +
+      ' aria-label="' + esc('Pick ' + a.name + ' scores from a drop-down list') + '"' + (on ? ' checked' : '') + (supported ? '' : ' disabled') + '>' +
+      '<span>' + (on ? 'On' : 'Off') + '</span></label>';
+    if (on) {
+      var id = domId(k + 'step');
+      h += '<div class="set-input-suffix set-step-row"><label class="muted small" for="' + esc(id) + '">Step</label>' +
+        inputHtml(k + 'step', String(a.choices.step), { id: id, label: 'Step of the ' + a.name + ' drop-down list', cls: 'set-in-num set-in-step', numeric: true, role: 'step-input', aid: a.id }) +
+        '</div><div class="set-sub" data-role="step-preview" data-aid="' + esc(a.id) + '">' + esc(choicePreview(values)) + '</div>';
+    }
+    return h + '</td>';
   }
 
   function weightSumHtml(sum, ok, pending, bad) {
@@ -600,19 +948,23 @@
     var h = cardHead('assessments', 'Assessments and weights',
       'Recalculated instantly. Weighted points = raw ÷ max × weight; the weights should add up to 100%.', right);
     h += '<div class="card-body">';
+    h += lockNoteHtml(course, 'totals', 'Max scores and weights, adding, deleting or splitting items, and team grading ask before saving.');
     if (isUnconfirmed(course, 'projectSplit')) {
       h += '<div class="callout callout-warn set-ph-callout" data-ph-anchor="projectSplit"><div class="set-ph-title"><strong>Project split</strong>' + badge(course, 'projectSplit') + '</div>' +
         '<div>' + esc(phNote(course, 'projectSplit')) + '</div><div class="muted small">Use <strong>Split…</strong> on a project row to divide it into parts, or rename items in place.</div></div>';
     }
+    var lockMark = isLocked(course)
+      ? ' <span class="set-lock-mark" title="' + esc(LOCK_TOTALS) + '">' + icon('lock', 'icon-sm') + '<span class="sr-only">' + esc(LOCK_TOTALS) + '</span></span>' : '';
     h += '<div class="table-wrap set-asmt-wrap" data-ph-anchor="maxScores"><table class="table set-asmt-table">' +
       '<thead><tr><th scope="col">Order</th><th scope="col">Name</th>' +
-      '<th scope="col" class="num">Max score ' + badge(course, 'maxScores', true) + '</th>' +
-      '<th scope="col" class="num">Weight</th><th scope="col" class="set-center">Team-graded</th><th scope="col">Category</th>' +
+      '<th scope="col" class="num">Max score ' + badge(course, 'maxScores', true) + lockMark + '</th>' +
+      '<th scope="col" class="num">Weight' + lockMark + '</th><th scope="col" class="set-center">Team-graded</th>' +
+      '<th scope="col" title="Scores are picked from a list: max, max − step, …, 0">Drop-down list</th><th scope="col">Category</th>' +
       '<th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>';
     h += n ? course.assessments.map(function (a, i) { return asmtRowHtml(course, a, i, n); }).join('')
-      : '<tr><td colspan="7" class="muted">No assessments yet. Add one to start grading.</td></tr>';
+      : '<tr><td colspan="8" class="muted">No assessments yet. Add one to start grading.</td></tr>';
     h += '</tbody><tfoot><tr><td></td><th scope="row">Total weight</th><td></td>' +
-      '<td class="num"><strong data-role="weight-foot" class="' + (w.ok ? 'set-ok' : 'set-warn') + '">' + esc(num(w.sum)) + '%</strong></td><td colspan="3"></td></tr></tfoot></table></div>';
+      '<td class="num"><strong data-role="weight-foot" class="' + (w.ok ? 'set-ok' : 'set-warn') + '">' + esc(num(w.sum)) + '%</strong></td><td colspan="4"></td></tr></tfoot></table></div>';
     h += '<div class="set-weight-sum ' + (w.ok ? 'is-ok' : 'is-warn') + '" data-role="weight-sum" role="status" aria-live="polite">' + weightSumHtml(w.sum, w.ok, false, false) + '</div>';
     var notes = [];
     if (isUnconfirmed(course, 'maxScores')) {
@@ -624,7 +976,10 @@
     if (notes.length) h += '<ul class="set-notes">' + notes.join('') + '</ul>';
     h += '<p class="muted small set-help">A team-graded item gets one score per team, entered once and shared by every member. ' +
       'A different score for one member is a per-member override (◆), which needs the team\'s written agreement. ' +
-      'Switching the team-graded setting keeps every entered score.</p>';
+      'Switching the team-graded setting keeps every entered score.</p>' +
+      '<p class="muted small set-help"><strong>Drop-down list:</strong> the Grades tab offers the values max, max − step, …, 0 plus "(empty)", ' +
+      'so no typos are possible (Class/Project Participation: 5, 4.5, …, 0). Typing a value from the list still works; anything else is refused. ' +
+      'Scores entered before that are not on the list are kept and highlighted.</p>';
     return h + '</div>';
   }
 
@@ -644,12 +999,12 @@
         return '<button type="button" data-act="rounding" data-value="' + r.value + '" data-field="calc:rounding:' + r.value + '" aria-pressed="' + (s.rounding === r.value ? 'true' : 'false') + '">' + esc(r.label) + '</button>';
       }).join('') + '</div>' +
       '<div class="help">Applied after the curve and before the letter grade. Nearest integer rounds halves away from zero, like Excel ROUND: 89.5 becomes 90.' +
-      (roundBadge ? ' ' + esc(phNote(course, 'rounding')) : '') + '</div></div>';
+      (roundBadge ? ' ' + esc(phNote(course, 'rounding')) : '') + '</div>' + lockNoteHtml(course, 'totals') + '</div>';
     var curveBadge = badge(course, 'curve');
     h += '<div data-ph-anchor="curve">' + textField('calc:curve', 'Curve (points added to every total)', String(s.curve || 0), {
       numeric: true, badge: curveBadge, cls: 'set-in-num', suffix: 'points',
       help: 'A flat number of points added to each total, for example 2. Use 0 for no curve.' + (curveBadge ? ' ' + esc(phNote(course, 'curve')) : '')
-    }) + '</div>';
+    }) + lockNoteHtml(course, 'totals') + '</div>';
     h += '</div>';
     h += '<div class="callout set-formula"><strong>How totals are calculated.</strong> Weighted = raw ÷ max × weight. ' +
       'Total = sum of weighted + curve, then rounded (if set). Empty scores count as 0. The letter grade comes from the rounded total.</div>';
@@ -670,11 +1025,13 @@
   function lettersHtml(course, results) {
     var scale = sortedScale(course);
     var n = scale.length;
-    var counts = {};
+    var counts = {}, finals = {};
     if (results) {
       results.activeIds.forEach(function (id) {
         var r = results.byId[id];
         if (r && r.letter) counts[r.letter] = (counts[r.letter] || 0) + 1;
+        var fl = r && typeof r.finalLetter === 'string' ? r.finalLetter : null;
+        if (fl) finals[fl] = (finals[fl] || 0) + 1;
       });
     }
     var ranges = rangeTexts(scale);
@@ -684,13 +1041,17 @@
       '<button type="button" class="btn btn-sm" data-act="reset-letters" data-field="ls:reset">' + icon('undo') + 'Reset to default for this level</button>';
     var h = cardHead('letters', 'Letter scale', 'A student gets the highest letter whose minimum total they reach. Ranges apply to the total after the curve and rounding.', right);
     h += '<div class="card-body">';
+    h += lockNoteHtml(course, 'letters');
     if (isUnconfirmed(course, 'letterScale')) {
       h += '<div class="callout callout-warn set-ph-callout"><div class="set-ph-title"><strong>Letter-grade cutoffs</strong>' + badge(course, 'letterScale') + '</div><div>' +
         esc(phNote(course, 'letterScale')) + '</div></div>';
     }
+    h += '<p class="muted small set-ls-intro">The cutoffs give each student a <strong>suggested</strong> letter. The final letter is chosen by hand in the ' +
+      'Grades tab (a drop-down of these letters); the cutoffs never change a final letter.</p>';
     h += '<div class="table-wrap set-ls-wrap" data-ph-anchor="letterScale"><table class="table set-ls-table"><thead><tr>' +
       '<th scope="col">Letter</th><th scope="col" class="num">Minimum total</th><th scope="col">Range</th>' +
-      '<th scope="col" class="num">Active students</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>';
+      '<th scope="col" class="num" title="Active students whose suggested letter (from the cutoffs) this is">Suggested</th>' +
+      '<th scope="col" class="num" title="Active students who have this final letter">Final</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>';
     h += scale.map(function (r, i) {
       var bottom = i === n - 1;
       var k = 'ls:' + i + ':';
@@ -704,6 +1065,7 @@
           : inputHtml(k + 'min', String(r.min), { label: 'Minimum total for ' + r.letter, cls: 'set-in-num', numeric: true, role: 'ls-min' })) + '</td>' +
         '<td><span class="num" data-role="ls-range" data-i="' + i + '">' + esc(ranges[i]) + '</span>' + passMark + '</td>' +
         '<td class="num">' + (counts[r.letter] || 0) + '</td>' +
+        '<td class="num">' + (finals[r.letter] || 0) + '</td>' +
         '<td class="set-row-actions">' + (bottom ? '' :
           '<button type="button" class="btn btn-sm btn-icon btn-ghost set-del" data-act="del-letter" data-letter="' + esc(r.letter) + '" data-field="' + esc(k + 'del') + '"' +
           ' aria-label="Remove letter ' + esc(r.letter) + '" title="Remove ' + esc(r.letter) + '"' + (n <= 2 ? ' disabled' : '') + '>' + icon('trash') + '</button>') + '</td></tr>';
@@ -819,19 +1181,23 @@
       courseId = null;
       return;
     }
-    if (course.id !== courseId) {
+    var otherCourse = course.id !== courseId;
+    if (otherCourse) {
       errors = Object.create(null);
       courseId = course.id;
       el.gtSec = null;
     }
     var results = ctx.results || GT.store.results();
-    var focus = captureFocus(el);
+    // Text typed for another course (switched, restored or replaced meanwhile) is never carried over:
+    // it would be saved into this course on the next blur.
+    var focus = otherCourse ? null : captureFocus(el);
     rendering = true;
     try {
       if (!el.gtSec) { el.innerHTML = skeleton(); el.gtSec = {}; }
       var parts = {
         head: headHtml(course),
         toc: tocHtml(course),
+        status: statusHtml(course, results),
         confirm: confirmHtml(course),
         course: courseHtml(course),
         assessments: assessmentsHtml(course),
@@ -858,6 +1224,7 @@
     }
     updateLiveWeights(el);
     updateLivePreview(el);
+    updateLiveSteps(el);
     if (ctx.params && ctx.params !== lastParams) {
       lastParams = ctx.params;
       if (ctx.params.section) setTimeout(function () { gotoSection(ctx.params.section); }, 0);
@@ -942,10 +1309,16 @@
     }
   }
 
+  function updateLiveSteps(host) {
+    if (!host) return;
+    ui.$$('input[data-role="step-input"]', host).forEach(updateStepPreview);
+  }
+
   // ------------------------------------------------------------------ commit and revert
 
   function commitInput(t) {
     var key = t.getAttribute('data-field');
+    if (key && guarding[key]) return; // its "scores are finalized" question is open
     var course = GT.store.course();
     var h = course && key ? handlerFor(course, key) : null;
     if (!h) return;
@@ -957,21 +1330,38 @@
     }
     var had = !!errors[key];
     delete errors[key];
-    var shown = typeof r.value === 'number' ? String(r.value) : r.value;
-    if (h.same(r.value)) {
+    var value = r.value;
+    var shown = typeof value === 'number' ? String(value) : value;
+    if (h.same(value)) {
       t.value = h.stored;
       t.defaultValue = h.stored;
       if (had) rerenderSoon();
-      else { updateLiveWeights(boundEl); updateLivePreview(boundEl); }
+      else { updateLiveWeights(boundEl); updateLivePreview(boundEl); updateLiveSteps(boundEl); }
       return;
     }
-    t.value = shown;
-    try {
-      GT.store.transact(h.label(r.value), function (c) { h.apply(c, r.value); });
-    } catch (err) {
-      errors[key] = { text: t.value, msg: err && err.message ? err.message : String(err), base: h.stored };
-      rerenderSoon();
+    function save() {
+      var el = document.body.contains(t) ? t : byField(boundEl, key);
+      if (el) el.value = shown;
+      try {
+        GT.store.transact(h.label(value), function (c) { h.apply(c, value); });
+      } catch (err) {
+        errors[key] = { text: shown, msg: err && err.message ? err.message : String(err), base: h.stored };
+        rerenderSoon();
+      }
     }
+    if (!h.totals) { save(); return; }
+    guarding[key] = true;
+    guardChange({
+      label: h.label(value),
+      kind: h.totals,
+      apply: function (c) { h.apply(c, value); },
+      run: function () { delete guarding[key]; save(); },
+      cancel: function () {
+        delete guarding[key];
+        var el = byField(boundEl, key);
+        if (el) revertInput(el);
+      }
+    });
   }
 
   function revertInput(t) {
@@ -984,7 +1374,7 @@
     t.value = v;
     t.defaultValue = v;
     if (had) rerenderSoon();
-    else { updateLiveWeights(boundEl); updateLivePreview(boundEl); }
+    else { updateLiveWeights(boundEl); updateLivePreview(boundEl); updateLiveSteps(boundEl); }
   }
 
   // ------------------------------------------------------------------ actions: placeholders
@@ -1006,6 +1396,110 @@
       c.placeholders[key] = on ? { confirmed: true, confirmedAt: util.nowIso() } : { confirmed: false, confirmedAt: null };
     });
     ui.toast(on ? info.label + ' marked confirmed.' : info.label + ' needs confirmation again.', { type: on ? 'success' : 'info' });
+  }
+
+  // ------------------------------------------------------------------ actions: grading status (STAGE2B)
+
+  function unlockScores() {
+    var course = GT.store.course();
+    var f = finalizedInfo(course);
+    if (!f) return;
+    var courseId = course.id;
+    ui.dialog.confirm({
+      title: 'Unlock scores?',
+      messageHtml: '<p>Scores were finalized on <strong>' + esc(ui.dateTime(f.at)) + '</strong>. Unlocking makes the score cells editable again in the Grades tab.</p>' +
+        '<ul class="set-dlg-list"><li>Final letters stay as they are.</li>' +
+        '<li>The unlock is logged in the change history (Scores finalized: yes → no).</li>' +
+        '<li>Finalize again from the Grades tab when the changes are done.</li></ul>',
+      confirmText: 'Unlock scores'
+    }).then(function (ok) {
+      if (!ok) { refocusIfLost('status:unlock'); return; }
+      var cur = GT.store.course();
+      if (!cur || cur.id !== courseId || !isLocked(cur)) return;
+      pendingFocus = typeof ui.openFinalize === 'function' ? 'status:finalize' : 'status:grades';
+      try {
+        GT.store.transact('Unlock scores', function (c) {
+          if (typeof model.unfinalize === 'function') model.unfinalize(c); else c.finalized = null;
+        }, { courseId: courseId });
+      } catch (err) { toastError(err); return; }
+      ui.toast('Scores unlocked: score cells can be edited again. The unlock is logged in History.', { type: 'success', timeout: 6000 });
+    });
+  }
+
+  function copySuggested() {
+    var course = GT.store.course();
+    if (!course || typeof model.copySuggestedToFinal !== 'function') return;
+    var courseId = course.id;
+    var n = letterCounts(course, GT.store.results()).fillable;
+    if (!n) { ui.toast('Every active student with a suggested letter already has a final letter.'); return; }
+    var unconfirmed = isUnconfirmed(course, 'letterScale');
+    ui.dialog.confirm({
+      title: 'Copy suggested letters?',
+      messageHtml: '<p>Fill the empty final letters of <strong>' + plural(n, 'active student') + '</strong> with their suggested letter from the cutoffs.</p>' +
+        '<ul class="set-dlg-list"><li>Final letters already chosen are not changed.</li><li>Withdrawn students are skipped.</li>' +
+        '<li>One step: undo it with Ctrl+Z. Each letter can still be changed afterwards.</li></ul>' +
+        (unconfirmed ? '<div class="callout callout-warn">The cutoffs are placeholders that still need confirmation, so check every copied letter.</div>' : ''),
+      confirmText: 'Copy ' + plural(n, 'letter')
+    }).then(function (ok) {
+      if (!ok) { refocusIfLost('status:copy'); return; }
+      var changed = 0;
+      pendingFocus = 'status:assign';
+      try {
+        GT.store.transact('Copy suggested letters into empty final letters', function (c) {
+          changed = model.copySuggestedToFinal(c, calc.computeCourse(c), { onlyEmpty: true, activeOnly: true });
+        }, { courseId: courseId });
+      } catch (err) { toastError(err); return; }
+      ui.toast(changed ? plural(changed, 'final letter') + ' filled from the suggestions. Press Ctrl+Z to undo.' : 'No final letter was changed.',
+        { type: changed ? 'success' : 'info' });
+    });
+  }
+
+  // ------------------------------------------------------------------ actions: drop-down lists (DECISIONS 8)
+
+  function toggleChoices(aid, cb) {
+    var course = GT.store.course();
+    var a = course && model.findAssessment(course, aid);
+    if (!a || typeof model.choiceValues !== 'function') return;
+    var on = cb.checked;
+    var has = choiceList(a).length > 0;
+    if (on === has) return;
+    pendingFocus = 'a:' + aid + ':choices';
+    if (on) {
+      var step = defaultStep(a.maxScore);
+      var off = offListCount(course, a, step);
+      try {
+        GT.store.transact('Use a drop-down list for ' + a.name, function (c) {
+          var x = model.findAssessment(c, aid);
+          if (x) x.choices = { step: step };
+        });
+      } catch (err) { toastError(err); return; }
+      var now = model.findAssessment(GT.store.course(), aid);
+      var desc = now && typeof model.describeChoices === 'function' ? model.describeChoices(now) : '';
+      ui.toast(a.name + ' scores are now picked from a list' + (desc ? ' (' + desc + ')' : '') + '. Change the step next to the checkbox if needed.' +
+        (off ? ' ' + plural(off, 'score is', 'scores are') + ' not on the list: kept, and highlighted in the grid.' : ''),
+        { type: off ? 'warn' : 'success', timeout: 7000 });
+    } else {
+      try {
+        GT.store.transact('Stop using a drop-down list for ' + a.name, function (c) {
+          var x = model.findAssessment(c, aid);
+          if (x) x.choices = null;
+        });
+      } catch (err2) { toastError(err2); return; }
+      ui.toast(a.name + ' scores are typed freely again. Every score is kept.', { type: 'success' });
+    }
+  }
+
+  function updateStepPreview(input) {
+    var course = GT.store.course();
+    var aid = input.getAttribute('data-aid');
+    var a = course && model.findAssessment(course, aid);
+    var out = boundEl && boundEl.querySelector('[data-role="step-preview"][data-aid="' + cssEsc(aid) + '"]');
+    if (!a || !out) return;
+    var p = util.parseScoreInput(input.value);
+    var test = { id: a.id, maxScore: a.maxScore, choices: p.kind === 'number' ? { step: p.value } : null };
+    var values = p.kind === 'number' && p.value <= a.maxScore ? choiceList(test) : [];
+    var saved = a.choices && a.choices.step;
+    out.textContent = values.length ? choicePreview(values) + (p.value !== saved ? ' (not saved yet)' : '') : 'Not a valid step';
   }
 
   /** After a dialog closes without a change, put focus back on the control that opened it
@@ -1143,6 +1637,14 @@
           : '') +
         '<p class="muted">You can undo this (Ctrl+Z).</p>';
     }
+    if (isLocked(course)) {
+      // Finalized: say whether this changes any total (making it team-graded can give scoreless members their team's score).
+      var imT = impactOf(course, function (c) {
+        if (toTeam) model.convertAssessmentToTeam(c, aid); else model.convertAssessmentToIndividual(c, aid);
+      });
+      body += !imT.error && (imT.totals || imT.letters) ? impactHtml(course, imT, 'totals')
+        : lockCalloutHtml(course, 'This switch does not change any total' + (refill.length ? ' unless you leave students without a score' : '') + '.');
+    }
     var title = toTeam ? 'Make ' + a.name + ' team-graded?' : 'Make ' + a.name + ' individually graded?';
     var confirmText = toTeam ? 'Make team-graded' : 'Make individually graded';
     var ask = refill.length
@@ -1222,16 +1724,21 @@
     var course = GT.store.course();
     if (!course) return;
     var w = calc.weightStatus(course);
+    var canList = typeof model.choiceValues === 'function';
     ui.dialog.form({
       title: 'Add assessment',
       confirmText: 'Add assessment',
+      introHtml: lockCalloutHtml(course, 'A new item starts empty, so one with a weight above 0 changes totals.'),
       fields: [
         { name: 'name', label: 'Name', value: '', placeholder: 'e.g. Quiz 1', required: true },
         { name: 'maxScore', label: 'Max score', value: '100', help: 'The highest possible raw score, for example 100 or 30.' },
         { name: 'weight', label: 'Weight %', value: '0', help: 'The weights now add up to ' + num(w.sum) + '%. A new item with a weight above 0 means lowering other weights.' },
         { name: 'category', label: 'Category', type: 'select', value: 'other', options: CATEGORIES },
         { name: 'teamGraded', label: 'Team-graded (one score per team, shared by its members)', type: 'checkbox', value: false }
-      ],
+      ].concat(canList ? [{
+        name: 'choices', label: 'Pick scores from a drop-down list (max, max − 0.5, …, 0)', type: 'checkbox', value: false,
+        help: 'No typos possible. Above a max of 100 the step starts larger (at most 200 steps); change the step in the table afterwards.'
+      }] : []),
       validate: function (v) {
         var name = cleanText(v.name);
         if (!name) return 'Enter a name.';
@@ -1251,12 +1758,14 @@
       var newId = null;
       try {
         GT.store.transact('Add assessment ' + name, function (c) {
+          var max = util.parseScoreInput(v.maxScore).value;
           var na = model.createAssessment({
             name: name,
-            maxScore: util.parseScoreInput(v.maxScore).value,
+            maxScore: max,
             weight: util.parseScoreInput(v.weight).value,
             teamGraded: !!v.teamGraded,
-            category: cat
+            category: cat,
+            choices: v.choices ? { step: defaultStep(max) } : null
           });
           c.assessments.push(na);
           newId = na.id;
@@ -1280,6 +1789,11 @@
       : 'No student has a score for ' + esc(a.name) + ' yet.') + '</p>' +
       '<p class="muted">' + esc(a.name) + ' is worth ' + esc(num(a.weight)) + '%. Without it the weights add up to ' + esc(num(after)) + '%. ' +
       'You can undo this right away (Ctrl+Z), and the deletion is logged in History.</p>';
+    if (isLocked(course)) {
+      var im = impactOf(course, function (c) { model.removeAssessment(c, aid); });
+      if (!im.error && (im.totals || im.letters)) html += impactHtml(course, im, 'totals');
+      else html += lockCalloutHtml(course, 'Deleting ' + a.name + ' does not change any total.');
+    }
     ui.dialog.confirm({
       title: 'Delete ' + a.name + '?',
       messageHtml: html,
@@ -1330,7 +1844,7 @@
       ? '<div class="callout callout-warn set-ph-callout"><div class="set-ph-title"><strong>Project split</strong>' + badge(course, 'projectSplit') + '</div><div>' +
         esc(phNote(course, 'projectSplit')) + '</div></div>'
       : '';
-    body.innerHTML = phHtml +
+    body.innerHTML = lockCalloutHtml(course, 'The new parts start empty, so splitting ' + a.name + ' changes totals.') + phHtml +
       '<p>Split <strong>' + esc(a.name) + '</strong> (' + esc(num(a.weight)) + '%, max ' + esc(num(a.maxScore)) + (a.teamGraded ? ', team-graded' : '') +
       ') into 2 to ' + MAX_PARTS + ' parts. The part weights must add up to <strong>' + esc(num(a.weight)) + '%</strong>.</p>' +
       '<ul class="set-dlg-list muted">' +
@@ -1470,7 +1984,13 @@
     var course = GT.store.course();
     var r = ROUNDING.filter(function (x) { return x.value === v; })[0];
     if (!course || !r || course.settings.rounding === v) return;
-    GT.store.transact('Set rounding: ' + r.long, function (c) { c.settings.rounding = v; });
+    guardChange({
+      label: 'Set rounding: ' + r.long,
+      kind: 'totals',
+      apply: function (c) { c.settings.rounding = v; },
+      run: function () { GT.store.transact('Set rounding: ' + r.long, function (c) { c.settings.rounding = v; }); },
+      cancel: function () { refocusIfLost('calc:rounding:' + v); }
+    });
   }
 
   function setPassing(v) {
@@ -1506,13 +2026,22 @@
       if (!v) return;
       var letter = String(v.letter).trim();
       var min = util.parseScoreInput(v.min).value;
-      try {
-        GT.store.transact('Add letter ' + letter, function (c) {
-          c.settings.letterScale = c.settings.letterScale.concat([{ letter: letter, min: min }]);
-          normalizeScale(c);
-        });
-      } catch (err) { toastError(err); return; }
-      ui.toast('Letter ' + letter + ' added from ' + num(min) + '.', { type: 'success' });
+      function apply(c) {
+        c.settings.letterScale = c.settings.letterScale.concat([{ letter: letter, min: min }]);
+        normalizeScale(c);
+      }
+      guardChange({
+        label: 'Add letter ' + letter + ' from ' + num(min),
+        kind: 'letters',
+        apply: apply,
+        run: function () {
+          try {
+            GT.store.transact('Add letter ' + letter, apply);
+          } catch (err) { toastError(err); return; }
+          ui.toast('Letter ' + letter + ' added from ' + num(min) + '.', { type: 'success' });
+        },
+        cancel: function () { refocusIfLost('ls:add'); }
+      });
     });
   }
 
@@ -1526,13 +2055,25 @@
     if (i === -1 || i === scale.length - 1) return;
     var passBefore = course.settings.passingLetter;
     var nextIdx = i < scale.length - 2 ? i : i - 1;
-    pendingFocus = nextIdx >= 0 && scale.length - 1 > 2 ? 'ls:' + nextIdx + ':del' : 'ls:add';
-    GT.store.transact('Remove letter ' + letter, function (c) {
+    function apply(c) {
       c.settings.letterScale = c.settings.letterScale.filter(function (r) { return r.letter !== letter; });
       normalizeScale(c);
+    }
+    guardChange({
+      label: 'Remove letter ' + letter,
+      kind: 'letters',
+      apply: apply,
+      confirmText: 'Remove ' + letter,
+      run: function () {
+        pendingFocus = nextIdx >= 0 && scale.length - 1 > 2 ? 'ls:' + nextIdx + ':del' : 'ls:add';
+        try {
+          GT.store.transact('Remove letter ' + letter, apply);
+        } catch (err) { toastError(err); return; }
+        var passAfter = GT.store.course().settings.passingLetter;
+        ui.toast('Letter ' + letter + ' removed.' + (passAfter !== passBefore ? ' The passing letter is now ' + passAfter + '.' : '') + ' Press Ctrl+Z to undo.', { type: 'success' });
+      },
+      cancel: function () { refocusIfLost('ls:' + i + ':del'); }
     });
-    var passAfter = GT.store.course().settings.passingLetter;
-    ui.toast('Letter ' + letter + ' removed.' + (passAfter !== passBefore ? ' The passing letter is now ' + passAfter + '.' : '') + ' Press Ctrl+Z to undo.', { type: 'success' });
   }
 
   function resetLetters() {
@@ -1541,13 +2082,20 @@
     var def = model.defaultLetterScale(course.level);
     var pass = model.defaultPassingLetter(course.level);
     var passNow = course.settings.passingLetter;
+    var im = impactOf(course, function (c) {
+      c.settings.letterScale = model.defaultLetterScale(c.level);
+      c.settings.passingLetter = model.defaultPassingLetter(c.level);
+      normalizeScale(c);
+    });
+    var effect = !im.error && (isLocked(course) || im.lost) ? impactHtml(course, im, 'letters')
+      : '<p class="muted">You can undo this (Ctrl+Z).</p>';
     ui.dialog.confirm({
       title: 'Reset the letter scale?',
       messageHtml: '<p>Replace the current cutoffs with the default ' + esc(course.level) + ' scale:</p>' +
         '<p class="set-dlg-scale">' + esc(def.map(function (r) { return r.letter + ' ' + num(r.min); }).join(' · ')) + '</p>' +
         '<p>The passing letter ' + (passNow === pass ? 'stays at the default, <strong>' + esc(pass) + '</strong>.'
           : 'goes back to the default, <strong>' + esc(pass) + '</strong> (now ' + esc(passNow) + ').') + '</p>' +
-        '<p class="muted">These defaults are placeholders too. You can undo this (Ctrl+Z).</p>',
+        '<p class="muted">These defaults are placeholders too.</p>' + effect,
       confirmText: 'Reset letter scale'
     }).then(function (ok) {
       if (!ok) return;
@@ -1587,6 +2135,9 @@
       case 'add-letter': addLetter(); break;
       case 'del-letter': deleteLetter(b.getAttribute('data-letter')); break;
       case 'reset-letters': resetLetters(); break;
+      case 'unlock': unlockScores(); break;
+      case 'finalize': if (typeof ui.openFinalize === 'function') ui.openFinalize(); break;
+      case 'copy-suggested': copySuggested(); break;
       case 'backup': if (a.backup) a.backup(); break;
       case 'restore': if (a.restore) a.restore(); break;
       case 'delete-all': if (a.deleteAll) a.deleteAll(); break;
@@ -1602,6 +2153,7 @@
     var k = splitKey(key);
     if (t.type === 'checkbox') {
       if (k.kind === 'a' && k.prop === 'team') toggleTeamGraded(k.id, t);
+      else if (k.kind === 'a' && k.prop === 'choices') toggleChoices(k.id, t);
       else if (key === 'data:privacy') GT.store.setUi({ privacy: !!t.checked });
       return;
     }
@@ -1642,6 +2194,7 @@
     var role = e.target && e.target.getAttribute ? e.target.getAttribute('data-role') : null;
     if (role === 'weight-input') updateLiveWeights(boundEl);
     else if (role === 'ls-min' || role === 'ls-letter') updateLivePreview(boundEl);
+    else if (role === 'step-input') updateStepPreview(e.target);
   }
 
   function onToggle(e) {
@@ -1682,6 +2235,7 @@
 
   function destroy() {
     errors = Object.create(null);
+    guarding = Object.create(null);
     pendingFocus = null;
     pointerDown = false;
     deferred = false;

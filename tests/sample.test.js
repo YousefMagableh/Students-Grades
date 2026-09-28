@@ -223,7 +223,11 @@ test('score ranges per assessment and team propagation', () => {
       assert.equal(e.a_p2, undefined, 'Project II comes from the team score only');
       if (e.a_t1) assert.ok(e.a_t1.value >= 40 && e.a_t1.value <= 100 && Number.isInteger(e.a_t1.value * 2));
       if (e.a_t2) assert.ok(e.a_t2.value >= 35 && e.a_t2.value <= 100 && Number.isInteger(e.a_t2.value * 2));
-      if (e.a_part) assert.ok(e.a_part.value >= 60 && e.a_part.value <= 100 && e.a_part.value % 5 === 0);
+      // Participation is out of 5 (DECISIONS 1): 3..5 in steps of 0.5, always a drop-down value.
+      if (e.a_part) {
+        assert.ok(e.a_part.value >= 3 && e.a_part.value <= 5 && Number.isInteger(e.a_part.value * 2), `participation ${e.a_part.value}`);
+        assert.ok(model.isChoiceValue(model.findAssessment(c, 'a_part'), e.a_part.value));
+      }
       if (e.a_paper) assert.ok(Number.isInteger(e.a_paper.value) && e.a_paper.value >= 70 && e.a_paper.value <= 98);
     }
   }
@@ -449,4 +453,45 @@ test('assessment ids such as "toString" get normal generated scores (third revie
   const incomplete = course.students.filter((s) => results.byId[s.id].incomplete);
   assert.equal(incomplete.length, 2);
   for (const s of course.students) assert.ok(Number.isFinite(results.byId[s.id].total));
+});
+
+test('stage 2b: participation out of 5 on the drop-down list, no final letters, not finalized', () => {
+  for (const tpl of ['SE4351', 'SE6362']) {
+    const course = model.createCourse(tpl);
+    model.finalize(course, '2026-12-10T12:00:00.000Z', 'before loading');
+    course.students.push(model.createStudent({ lastName: 'Student 99', finalLetter: 'A' }));
+    sample.loadInto(course);
+    assert.equal(course.finalized, null, `${tpl}: loading sample data unlocks the scores`);
+    assert.ok(course.students.every((s) => s.finalLetter === null), `${tpl}: no final letters`);
+    const part = model.findAssessment(course, 'a_part');
+    assert.equal(part.maxScore, 5);
+    const values = course.students.map((s) => model.getEntry(course.scores, s.id, 'a_part')).filter(Boolean).map((e) => e.value);
+    assert.ok(values.length > 0);
+    for (const v of values) {
+      assert.ok(model.isChoiceValue(part, v), `${tpl}: ${v} is a list value`);
+      assert.ok(v >= 3 && v <= 5, `${tpl}: ${v}`);
+    }
+    const results = calc.computeCourse(course);
+    assert.deepEqual(results.orderIssues, []);
+    assert.equal(results.letterSummary.assigned, 0);
+    assert.equal(results.letterSummary.unassigned, results.activeIds.length);
+    for (const id of results.activeIds) {
+      assert.equal(results.byId[id].letterSource, 'cutoffs');
+      assert.equal(results.byId[id].notOnListCount, 0);
+    }
+  }
+});
+
+test('stage 2b: a drop-down item with another step gets list values (nearest, ties up)', () => {
+  const course = model.createCourse('SE4351');
+  model.findAssessment(course, 'a_part').choices = { step: 2 }; // 5, 3, 1, 0
+  model.findAssessment(course, 'a_t1').choices = { step: 10 };  // 100, 90, ..., 0
+  sample.loadInto(course);
+  for (const aid of ['a_part', 'a_t1']) {
+    const a = model.findAssessment(course, aid);
+    for (const s of course.students) {
+      const e = model.getEntry(course.scores, s.id, aid);
+      if (e) assert.ok(model.isChoiceValue(a, e.value), `${aid} ${e.value}`);
+    }
+  }
 });

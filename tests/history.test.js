@@ -769,11 +769,331 @@ describe('bulkEntry, displayValue, toRows', () => {
   });
 
   test('kindGroup matches the History view filter groups', () => {
-    ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late'].forEach((k) => assert.equal(history.kindGroup(k), 'grades'));
+    ['score', 'team-score', 'propagation', 'override', 'override-removed', 'late', 'final-letter'].forEach((k) => assert.equal(history.kindGroup(k), 'grades'));
     ['status', 'team-membership', 'student'].forEach((k) => assert.equal(history.kindGroup(k), 'students'));
     assert.equal(history.kindGroup('settings'), 'settings');
     assert.equal(history.kindGroup('attendance'), 'attendance');
     assert.equal(history.kindGroup('bulk'), 'other');
     assert.equal(history.kindGroup('nonsense'), 'other');
+  });
+});
+
+// ================================================================ stage 2b: final letters, finalizing, drop-down lists
+
+describe('final letters (STAGE2B)', () => {
+  /** Course with 15 students (No 1..15), no teams. */
+  function roster(n) {
+    const c = model.createCourse('SE4351');
+    const list = [];
+    for (let i = 1; i <= (n || 15); i++) list.push(addStudent(c, 'Student ' + String(i).padStart(2, '0'), 'X'));
+    return { c, list };
+  }
+
+  test('the kind is known, labeled and in the grades group', () => {
+    assert.ok(history.KINDS.includes('final-letter'));
+    assert.equal(history.KIND_LABELS['final-letter'], 'Final letter');
+    assert.ok(history.KIND_GROUPS.grades.includes('final-letter'));
+    assert.equal(history.LETTER_LIMIT, 10);
+  });
+
+  test('one letter set, changed and cleared: kind final-letter, field "Final letter", old and new values', () => {
+    const { c, alpha, t1 } = setup();
+    let out = change(c, (co) => model.setFinalLetter(co, alpha.id, 'B+'));
+    assert.deepEqual(briefs(out), [['final-letter', 'Student 01, Alpha', 'Final letter', '', 'B+']]);
+    assert.equal(out[0].studentId, alpha.id);
+    assert.equal(out[0].teamId, t1.id);
+    assert.equal(out[0].teamName, 'Team 1');
+    assert.equal(out[0].fieldKey, 'student.finalLetter');
+    assert.deepEqual(Object.keys(out[0]).sort(), SHAPE);
+    out = change(c, (co) => model.setFinalLetter(co, alpha.id, 'A-'));
+    assert.deepEqual(briefs(out), [['final-letter', 'Student 01, Alpha', 'Final letter', 'B+', 'A-']]);
+    out = change(c, (co) => model.setFinalLetter(co, alpha.id, null));
+    assert.deepEqual(briefs(out), [['final-letter', 'Student 01, Alpha', 'Final letter', 'A-', '']]);
+    // Setting the same letter again logs nothing.
+    model.setFinalLetter(c, alpha.id, 'C');
+    assert.deepEqual(change(c, (co) => model.setFinalLetter(co, alpha.id, 'C')), []);
+  });
+
+  test('a letter change does not log a score or anything else, and undo logs the reverse', () => {
+    const { c, bravo } = setup();
+    const before = snap(c);
+    model.setFinalLetter(c, bravo.id, 'A');
+    const after = snap(c);
+    assert.deepEqual(kinds(diff(before, after)), ['final-letter']);
+    const back = diff(after, before, { source: 'undo' });
+    assert.deepEqual(briefs(back), [['final-letter', 'Student 02, Bravo', 'Final letter', 'A', '']]);
+    assert.equal(back[0].source, 'undo');
+  });
+
+  test('up to 10 changes are itemized in name order', () => {
+    const { c, list } = roster(15);
+    const out = change(c, (co) => {
+      model.setFinalLetters(co, list.slice(0, 10).reverse().map((s) => ({ studentId: s.id, letter: 'A' })));
+    });
+    assert.equal(out.length, 10);
+    assert.ok(out.every((e) => e.kind === 'final-letter' && e.field === 'Final letter' && e.newValue === 'A'));
+    assert.deepEqual(out.map((e) => e.studentName), list.slice(0, 10).map((s) => model.studentName(s)));
+  });
+
+  test('more than 10 changes in one transaction: one summary "Final letters: n changed" listing up to 10 students by No', () => {
+    const { c, list } = roster(15);
+    list[14].finalLetter = 'F';
+    const out = change(c, (co) => {
+      // A band assignment: 4 A, 3 B, 4 C, and one letter cleared.
+      const band = (from, to, letter) => list.slice(from, to).map((s) => ({ studentId: s.id, letter }));
+      model.setFinalLetters(co, band(0, 4, 'A').concat(band(4, 7, 'B'), band(7, 11, 'C'), band(14, 15, null)));
+    });
+    assert.equal(out.length, 1);
+    const e = out[0];
+    assert.equal(e.kind, 'final-letter');
+    assert.equal(e.field, 'Final letters');
+    assert.equal(e.fieldKey, 'finalLetters');
+    assert.equal(e.oldValue, '');
+    assert.equal(e.newValue, '12 changed');
+    assert.equal(e.studentId, null);
+    assert.equal(e.studentName, null);
+    assert.equal(e.note, 'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; A ×4, B ×3, C ×4, cleared ×1');
+    assert.equal(`${e.field}: ${e.newValue}`, 'Final letters: 12 changed');
+    // Every student's change is kept (review F4), in name order, beyond the 10 listed in the note.
+    assert.deepEqual(Object.keys(e).sort(), SHAPE.concat('details').sort());
+    const changed = list.slice(0, 11).concat(list[14]);
+    assert.deepEqual(e.details, changed.map((s, i) => ({
+      studentId: s.id, studentName: model.studentName(s), no: s.no,
+      oldValue: i === 11 ? 'F' : '', newValue: i < 4 ? 'A' : i < 7 ? 'B' : i < 11 ? 'C' : ''
+    })));
+  });
+
+  test('a band summary stays traceable per student: involvesStudent, detailFor, entryDetails (review F4)', () => {
+    const { c, list } = roster(15);
+    const out = change(c, (co) => model.setFinalLetters(co, list.slice(0, 12).map((s) => ({ studentId: s.id, letter: 'A' }))));
+    assert.equal(out.length, 1);
+    const e = out[0];
+    // The 12th student is not in the note, but the entry still concerns them.
+    assert.equal(e.note, 'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; A ×12');
+    assert.equal(history.involvesStudent(e, list[11].id), true);
+    assert.deepEqual(history.detailFor(e, list[11].id),
+      { studentId: list[11].id, studentName: 'Student 12, X', no: 12, oldValue: '', newValue: 'A' });
+    assert.equal(history.involvesStudent(e, list[12].id), false);
+    assert.equal(history.detailFor(e, list[12].id), null);
+    assert.equal(history.entryDetails(e).length, 12);
+    // Undo logs the reverse, with the same details.
+    const cleared = snap(c);
+    cleared.students.forEach((s) => { s.finalLetter = null; });
+    const back = diff(snap(c), cleared, { source: 'undo' });
+    assert.equal(back.length, 1);
+    assert.equal(history.detailFor(back[0], list[11].id).oldValue, 'A');
+    assert.equal(history.detailFor(back[0], list[11].id).newValue, '');
+    // Itemized entries match by their own studentId; they carry no details.
+    const one = change(c, (co) => model.setFinalLetter(co, list[0].id, 'B'))[0];
+    assert.equal(history.involvesStudent(one, list[0].id), true);
+    assert.equal(history.involvesStudent(one, list[1].id), false);
+    assert.deepEqual(history.entryDetails(one), []);
+    assert.equal(history.detailFor(one, list[0].id), null);
+  });
+
+  test('details are read defensively (saved files may hold anything)', () => {
+    const e = { studentId: null, details: [null, 5, 'x', [], { studentId: '' }, { studentId: 7 },
+      { studentId: 's1', studentName: 3, no: 'No 1', oldValue: null, newValue: 'A' }, { studentId: 's2', no: NaN }] };
+    assert.deepEqual(history.entryDetails(e), [
+      { studentId: 's1', studentName: '3', no: null, oldValue: '', newValue: 'A' },
+      { studentId: 's2', studentName: '', no: null, oldValue: '', newValue: '' }
+    ]);
+    assert.equal(history.involvesStudent(e, 's2'), true);
+    assert.equal(history.involvesStudent(e, ''), false);
+    assert.equal(history.involvesStudent(e, null), false);
+    [null, undefined, 5, 'x', [], {}, { details: 'no' }, { details: { studentId: 's1' } }].forEach((x) => {
+      assert.deepEqual(history.entryDetails(x), []);
+      assert.equal(history.involvesStudent(x, 's1'), false);
+      assert.equal(history.detailFor(x, 's1'), null);
+    });
+    assert.equal(history.involvesStudent({ studentId: 's9' }, 's9'), true);
+  });
+
+  test('toRows adds one row per student after a band summary; { studentId } keeps only that student (review F4)', () => {
+    const { c, list } = roster(12);
+    list[0].finalLetter = 'B';
+    const out = change(c, (co) => model.setFinalLetters(co, list.map((s) => ({ studentId: s.id, letter: 'A' }))));
+    out[0].userNote = 'meeting with Dr. X';
+    out[0].userNoteAt = '2026-12-10T16:00:00.000Z';
+    const rows = history.toRows(out);
+    assert.equal(rows.length, 1 + 1 + 12);
+    assert.deepEqual(rows[1], [TS, 'edit', 'final-letter', '', '', 'Final letters', '', '12 changed',
+      'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; A ×12', 'meeting with Dr. X', '2026-12-10T16:00:00.000Z']);
+    assert.deepEqual(rows[2], [TS, 'edit', 'final-letter', 'Student 01, X', '', 'Final letter', 'B', 'A', 'Part of "Final letters: 12 changed"', '', '']);
+    assert.deepEqual(rows[13], [TS, 'edit', 'final-letter', 'Student 12, X', '', 'Final letter', '', 'A', 'Part of "Final letters: 12 changed"', '', '']);
+    const mine = history.toRows(out, { studentId: list[11].id });
+    assert.equal(mine.length, 3);
+    assert.deepEqual(mine[2], rows[13]);
+    // A filter for a student outside the band keeps the summary row only; odd opts are ignored.
+    assert.equal(history.toRows(out, { studentId: 'nobody' }).length, 2);
+    assert.equal(history.toRows(out, { studentId: 5 }).length, 14);
+    assert.equal(history.toRows(out, 'x').length, 14);
+  });
+
+  test('exactly 11 changes are summarized; students are listed by No, not by storage order', () => {
+    const { c, list } = roster(11);
+    c.students.reverse();
+    const out = change(c, (co) => { list.forEach((s) => { s.finalLetter = 'B'; }); });
+    assert.equal(out.length, 1);
+    assert.equal(out[0].newValue, '11 changed');
+    assert.equal(out[0].note, 'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; B ×11');
+  });
+
+  test('the summary counts letters outside the scale after the scale letters', () => {
+    const { c, list } = roster(12);
+    const out = change(c, (co) => {
+      list.forEach((s, i) => { s.finalLetter = i < 6 ? 'W' : 'A-'; });
+    });
+    assert.equal(out[0].note, 'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; A- ×6, W ×6');
+  });
+
+  test('added and deleted students are covered by their own entries, not by final-letter entries', () => {
+    const { c, alpha } = setup();
+    alpha.finalLetter = 'B';
+    const out = change(c, (co) => {
+      co.students.push(model.createStudent({ lastName: 'Student 09', firstName: 'India', finalLetter: 'A' }));
+      model.deleteStudent(co, alpha.id);
+    });
+    assert.ok(!out.some((e) => e.kind === 'final-letter'));
+    assert.deepEqual(kinds(out).filter((k) => k === 'student'), ['student', 'student']);
+    // Their notes say which final letter was deleted or came back (review F4).
+    const added = out.find((e) => e.newValue === 'Added');
+    const deleted = out.find((e) => e.newValue === 'Deleted permanently');
+    assert.equal(added.note, 'final letter A');
+    assert.equal(deleted.studentId, alpha.id);
+    assert.equal(deleted.note, 'No 1, Team 1. Scores, overrides, attendance and the final letter (B) were deleted with the student');
+    // Undoing the deletion brings the letter back, and the note says so.
+    const restored = snap(c);
+    restored.students.push(util.clone(alpha));
+    const back = diff(snap(c), restored, { source: 'undo' });
+    assert.equal(back.find((e) => e.newValue === 'Added').note, 'No 1, Team 1, final letter B');
+  });
+
+  test('a deleted student without a final letter keeps the usual note', () => {
+    const { c, echo } = setup();
+    const out = change(c, (co) => model.deleteStudent(co, echo.id));
+    assert.equal(out[0].note, 'No 5. Scores, overrides and attendance were deleted with the student');
+  });
+
+  test('a scale change that leaves a letter outside the scale does not rewrite the letter or log it', () => {
+    const { c, alpha } = setup();
+    alpha.finalLetter = 'A+';
+    const out = change(c, (co) => { co.settings.letterScale = model.defaultLetterScale('graduate'); });
+    assert.ok(!out.some((e) => e.kind === 'final-letter'));
+    assert.equal(alpha.finalLetter, 'A+');
+  });
+
+  test('odd stored letters (numbers, blanks) read as empty and never throw', () => {
+    const before = { students: [{ id: 's', lastName: 'Student 01', finalLetter: 5 }] };
+    const after = { students: [{ id: 's', lastName: 'Student 01', finalLetter: '  ' }] };
+    assert.deepEqual(diff(before, after), []);
+    after.students[0].finalLetter = 'C';
+    assert.deepEqual(briefs(diff(before, after)), [['final-letter', 'Student 01', 'Final letter', '', 'C']]);
+  });
+});
+
+describe('finalizing the scores (STAGE2B)', () => {
+  // Noon UTC is the same calendar day in every time zone from UTC-11 to UTC+11.
+  const AT = '2026-12-10T12:00:00.000Z';
+
+  test('finalize: kind settings, field "Scores finalized", no -> yes (date), with the note', () => {
+    const { c } = setup();
+    const out = change(c, (co) => model.finalize(co, AT, 'Grading meeting'));
+    assert.deepEqual(briefs(out), [['settings', '', 'Scores finalized', 'no', 'yes (2026-12-10)']]);
+    assert.equal(out[0].fieldKey, 'course.finalized');
+    assert.equal(out[0].note, 'Score cells locked; final letters stay editable. Note: Grading meeting');
+  });
+
+  test('unfinalize: yes (date) -> no, noted as unlocked', () => {
+    const { c } = setup();
+    model.finalize(c, AT, '');
+    const out = change(c, (co) => model.unfinalize(co));
+    assert.deepEqual(briefs(out), [['settings', '', 'Scores finalized', 'yes (2026-12-10)', 'no']]);
+    assert.equal(out[0].note, 'Score cells unlocked: scores can be edited again');
+  });
+
+  test('finalizing again (new date or note) is logged; nothing changed logs nothing', () => {
+    const { c } = setup();
+    model.finalize(c, AT, '');
+    assert.deepEqual(change(c, (co) => { co.finalized = { at: AT, note: '' }; }), []);
+    let out = change(c, (co) => model.finalize(co, '2026-12-11T12:00:00.000Z', ''));
+    assert.deepEqual(briefs(out), [['settings', '', 'Scores finalized', 'yes (2026-12-10)', 'yes (2026-12-11)']]);
+    out = change(c, (co) => model.finalize(co, '2026-12-11T12:00:00.000Z', 'second meeting'));
+    assert.equal(out.length, 1);
+    assert.match(out[0].note, /Note: second meeting$/);
+  });
+
+  test('finalizing with letters copied in one transaction logs both, settings first', () => {
+    const { c, alpha, bravo } = setup();
+    const out = change(c, (co) => {
+      model.finalize(co, AT, '');
+      model.setFinalLetters(co, [{ studentId: alpha.id, letter: 'B' }, { studentId: bravo.id, letter: 'C' }]);
+    });
+    assert.deepEqual(kinds(out), ['settings', 'final-letter', 'final-letter']);
+  });
+
+  test('a malformed finalized value reads as not finalized', () => {
+    assert.deepEqual(diff({ finalized: { at: '' } }, { finalized: 'yes' }), []);
+    const out = diff({ finalized: 7 }, { finalized: { at: 'not a date' } });
+    assert.deepEqual(briefs(out), [['settings', '', 'Scores finalized', 'no', 'yes (not a date)']]);
+  });
+});
+
+describe('drop-down lists and participation out of 5 (DECISIONS 1, 8)', () => {
+  test('turning a list off and on: "<name>: drop-down list"', () => {
+    const { c } = setup();
+    let out = change(c, (co) => { model.findAssessment(co, PART).choices = null; });
+    assert.deepEqual(briefs(out), [['settings', '', 'Class/Project Participation: drop-down list', 'yes (steps of 0.5)', 'no']]);
+    assert.equal(out[0].fieldKey, 'assessment:' + PART + '.choices');
+    assert.equal(out[0].note, 'Scores are typed in freely');
+    out = change(c, (co) => { model.findAssessment(co, T1).choices = { step: 5 }; });
+    assert.deepEqual(briefs(out), [['settings', '', 'Test 1: drop-down list', 'no', 'yes (steps of 5)']]);
+    assert.equal(out[0].note, 'Scores are chosen from a list (max down to 0)');
+  });
+
+  test('changing the step is logged; an equal list is not', () => {
+    const { c } = setup();
+    assert.deepEqual(change(c, (co) => { model.findAssessment(co, PART).choices = { step: 0.5 }; }), []);
+    const out = change(c, (co) => { model.findAssessment(co, PART).choices = { step: 1 }; });
+    assert.deepEqual(briefs(out), [['settings', '', 'Class/Project Participation: drop-down list', 'yes (steps of 0.5)', 'yes (steps of 1)']]);
+  });
+
+  test('a participation score typed out of 5 is logged as entered', () => {
+    const { c, echo } = setup();
+    const out = change(c, (co) => score(co, echo, PART, '4.5'));
+    assert.deepEqual(briefs(out), [['score', 'Student 05, Echo', 'Class/Project Participation', '', '4.5']]);
+  });
+
+  test('an added or removed assessment with a list says so', () => {
+    const { c } = setup();
+    let out = change(c, (co) => { co.assessments.push(model.createAssessment({ id: 'a_q', name: 'Quiz', maxScore: 10, weight: 0, choices: { step: 1 } })); });
+    assert.deepEqual(briefs(out), [['settings', '', 'Assessment', '', 'Quiz (weight 0%, max 10, drop-down list in steps of 1)']]);
+    out = change(c, (co) => model.removeAssessment(co, PART));
+    assert.deepEqual(briefs(out), [['settings', '', 'Assessment', 'Class/Project Participation (weight 5%, max 5, drop-down list in steps of 0.5)', '']]);
+  });
+});
+
+describe('stage 2b robustness', () => {
+  test('many letter changes with a garbage letter scale still give one summary and no error entry', () => {
+    const students = [];
+    for (let i = 1; i <= 12; i++) students.push({ id: 's' + i, no: i, lastName: 'Student ' + i });
+    [[null, 5, { letter: 'A', min: 90 }], 'A', null].forEach((scale) => {
+      const before = { settings: { letterScale: scale }, students };
+      const after = util.clone(before);
+      after.students.forEach((s) => { s.finalLetter = 'A'; });
+      const out = diff(before, after);
+      assert.ok(!out.some((e) => e.fieldKey === 'history.error'), JSON.stringify(out));
+      assert.deepEqual(briefs(out), [['final-letter', '', 'Final letters', '', '12 changed']]);
+      assert.equal(out[0].note, 'Students No 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, …; A ×12');
+    });
+  });
+
+  test('a summary for students without a No names only how many there are', () => {
+    const students = [];
+    for (let i = 1; i <= 11; i++) students.push({ id: 's' + i, lastName: 'Student ' + i });
+    const after = util.clone({ students });
+    after.students.forEach((s) => { s.finalLetter = 'B'; });
+    const out = diff({ students }, after);
+    assert.equal(out[0].note, '11 students; B ×11');
   });
 });

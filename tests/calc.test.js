@@ -23,9 +23,12 @@ function setScore(c, s, aid, value, extra) { model.setEntry(c.scores, s.id, aid,
 function setTeamScore(c, t, aid, value, extra) { model.setEntry(c.teamScores, t.id, aid, Object.assign({ value }, extra || {})); }
 function asmt(c, aid) { return model.findAssessment(c, aid); }
 function detail(c, s, aid) { return calc.scoreDetail(c, s, asmt(c, aid)); }
-/** Sets the same raw score on all five default items (student without a team, so team items are
- * individual). With default weights summing to 100 and max 100, the total equals v. */
-function fillAll(c, s, v) { FIVE.forEach((aid) => setScore(c, s, aid, v)); }
+/** Sets the same percentage v on all five default items (student without a team, so team items are
+ * individual): v itself on the max-100 items, and v / 20 on Class/Project Participation, which is out
+ * of 5 (DECISIONS 1). With the default weights summing to 100, the total equals v. */
+function fillAll(c, s, v) {
+  FIVE.forEach((aid) => setScore(c, s, aid, util.fix(v * asmt(c, aid).maxScore / 100)));
+}
 /** Student (no team) with the given raw scores: { a_t1: 84.1, ... }. */
 function studentWith(c, scores, name) {
   const s = addStudent(c, name || 'Student 01', 'Alpha');
@@ -64,7 +67,11 @@ describe('74.0 example (V1): Project I 90, Project II 85, Test 1 80, Test 2 70, 
   test('74.0 example: SE 4351 total is exactly 74 with weighted items 9, 17, 20, 28, 0 and not incomplete', () => {
     const { c, s } = build('SE4351', 0);
     const r = calc.studentResult(c, s);
-    // 90/100*10 = 9; 85/100*20 = 17; 80/100*25 = 20; 70/100*40 = 28; 0/100*5 = 0; sum = 74.
+    // 90/100*10 = 9; 85/100*20 = 17; 80/100*25 = 20; 70/100*40 = 28; 0/5*5 = 0; sum = 74.
+    // Participation is out of 5 (DECISIONS 1), and 0 is 0 on any scale.
+    assert.equal(asmt(c, PART).maxScore, 5);
+    assert.equal(r.items[PART].raw, 0);
+    assert.equal(r.items[PART].notOnList, false); // 0 is on the drop-down list
     assert.equal(r.items[P1].weighted, 9);
     assert.equal(r.items[P2].weighted, 17);
     assert.equal(r.items[T1].weighted, 20);
@@ -318,11 +325,12 @@ describe('letter scales (K6)', () => {
   });
 
   test('letter scales: floating-point boundary, a total of 90 in decimal (89.99999999999999 naively) is A-', () => {
-    // Project I 80 (8), Project II 80 (16), Test 1 88.6 (22.15), Test 2 99.5 (39.8), Participation 81 (4.05).
+    // Project I 80 (8), Project II 80 (16), Test 1 88.6 (22.15), Test 2 99.5 (39.8), Participation 4.05 of 5 (4.05).
     // Decimal sum: 8 + 16 + 22.15 + 39.8 + 4.05 = 90.00 exactly.
-    const raws = { [P1]: 80, [P2]: 80, [T1]: 88.6, [T2]: 99.5, [PART]: 81 };
+    const raws = { [P1]: 80, [P2]: 80, [T1]: 88.6, [T2]: 99.5, [PART]: 4.05 };
     const weights = { [P1]: 10, [P2]: 20, [T1]: 25, [T2]: 40, [PART]: 5 };
-    const naive = FIVE.reduce((s, aid) => s + raws[aid] * weights[aid] / 100, 0);
+    const maxes = { [P1]: 100, [P2]: 100, [T1]: 100, [T2]: 100, [PART]: 5 };
+    const naive = FIVE.reduce((s, aid) => s + raws[aid] * weights[aid] / maxes[aid], 0);
     assert.ok(naive < 90, `precondition: naive float sum ${naive} should fall just below 90`);
 
     ['SE4351', 'SE6362'].forEach((tpl) => {
@@ -333,7 +341,7 @@ describe('letter scales (K6)', () => {
       setTeamScore(c, t, P2, 80);
       setScore(c, s, T1, 88.6);
       setScore(c, s, T2, 99.5);
-      setScore(c, s, PART, 81);
+      setScore(c, s, PART, 4.05);
       const r = calc.studentResult(c, s);
       assert.equal(r.items[T1].weighted, 22.15);
       assert.equal(r.items[T2].weighted, 39.8);
@@ -403,7 +411,7 @@ describe('weighted points (K1)', () => {
 describe('empty, invalid and out-of-range entries (K2, G4)', () => {
   test('invalid text counts as 0, state invalid, missing, and is counted in invalidCount', () => {
     const c = course('SE4351');
-    const s = studentWith(c, { [P1]: 100, [P2]: 100, [T2]: 100, [PART]: 100 });
+    const s = studentWith(c, { [P1]: 100, [P2]: 100, [T2]: 100, [PART]: 5 });
     model.setEntry(c.scores, s.id, T1, model.entryFromInput('abc'));
     const x = detail(c, s, T1);
     assert.equal(x.state, 'invalid');
@@ -525,8 +533,8 @@ describe('rounding and curve (K3)', () => {
   });
 
   test('the letter uses the rounded total (89.5 -> 90 -> A- with integer rounding, B+ without)', () => {
-    // Test 1 98 -> 24.5, Test 2 100 -> 40, Project II 100 -> 20, Participation 100 -> 5: 89.5.
-    const scores = { [T1]: 98, [T2]: 100, [P2]: 100, [PART]: 100 };
+    // Test 1 98 -> 24.5, Test 2 100 -> 40, Project II 100 -> 20, Participation 5 of 5 -> 5: 89.5.
+    const scores = { [T1]: 98, [T2]: 100, [P2]: 100, [PART]: 5 };
     const ri = totalWith(scores, 'integer');
     assert.equal(ri.totalUnrounded, 89.5);
     assert.equal(ri.total, 90);
@@ -896,7 +904,7 @@ describe('non-finite totals stay out of class figures (review F6)', () => {
     const b = addStudent(c, 'Student 02', 'Bravo');
     fillAll(c, a, 80);
     fillAll(c, b, 90);
-    model.setEntry(c.scores, b.id, T1, null); // b has no Test 1 score: 9 + 18 + 36 + 4.5 = 67.5
+    model.setEntry(c.scores, b.id, T1, null); // b has no Test 1 score: 9 + 18 + 36 + 4.5 (4.5 of 5) = 67.5
     asmt(c, T1).weight = 1e308; // only reachable by setting the weight in code; normalize rejects it
     const res = calc.computeCourse(c);
     assert.ok(!Number.isFinite(res.byId[a.id].total)); // 80 x 1e308 overflows
@@ -982,5 +990,352 @@ describe('what-if helpers (review F9: minTotalForLetter, neededScore)', () => {
     assert.equal(calc.neededScore(c, s, T2, 'A-').needed, 106.25);
     assert.equal(calc.neededScore(c, s, PAPER, 'A'), null);
     assert.equal(calc.neededScore(c, s, T2, 'A+'), null);
+  });
+});
+
+// ================================================================ stage 2b: drop-down values (notOnList)
+
+describe('drop-down values: notOnList (DECISIONS 8)', () => {
+  test('participation on the list (4.5, 0, 5) is not flagged; off the list (4.25) is flagged but still counted', () => {
+    const c = course('SE4351');
+    const s = studentWith(c, { [PART]: 4.5 });
+    let x = detail(c, s, PART);
+    assert.equal(x.notOnList, false);
+    assert.equal(x.weighted, 4.5); // 4.5 / 5 x 5
+    [0, 5, 0.5].forEach((v) => {
+      setScore(c, s, PART, v);
+      assert.equal(detail(c, s, PART).notOnList, false, String(v));
+    });
+    setScore(c, s, PART, 4.25);
+    x = detail(c, s, PART);
+    assert.equal(x.notOnList, true);
+    assert.equal(x.outOfRange, false);
+    assert.equal(x.state, 'number');
+    assert.equal(x.weighted, 4.25); // kept and counted as entered
+    const r = calc.studentResult(c, s);
+    assert.equal(r.notOnListCount, 1);
+    assert.equal(r.total, 4.25);
+  });
+
+  test('a float-noisy list value (4.500000000000001) is on the list', () => {
+    const c = course('SE4351');
+    const s = studentWith(c, { [PART]: 0.1 * 3 * 15 });
+    assert.equal(detail(c, s, PART).notOnList, false);
+  });
+
+  test('a value above the max is both out of range and not on the list (100 typed on the 5-point scale)', () => {
+    const c = course('SE4351');
+    const s = studentWith(c, { [PART]: 100 });
+    const x = detail(c, s, PART);
+    assert.equal(x.outOfRange, true);
+    assert.equal(x.notOnList, true);
+    assert.equal(x.weighted, 100); // 100 / 5 x 5: highlighted, never silently changed
+  });
+
+  test('empty and invalid cells, and items without a list, are never notOnList', () => {
+    const c = course('SE4351');
+    const s = studentWith(c, { [T1]: 83.7 });
+    assert.equal(detail(c, s, PART).notOnList, false); // empty
+    model.setEntry(c.scores, s.id, PART, model.entryFromInput('good'));
+    assert.equal(detail(c, s, PART).state, 'invalid');
+    assert.equal(detail(c, s, PART).notOnList, false);
+    assert.equal(detail(c, s, T1).notOnList, false); // free entry
+    assert.equal(calc.studentResult(c, s).notOnListCount, 0);
+  });
+
+  test('turning the list off clears the flag; a team-graded item with a list checks the team score', () => {
+    const c = course('SE4351');
+    const s = studentWith(c, { [PART]: 4.25 });
+    asmt(c, PART).choices = null;
+    assert.equal(detail(c, s, PART).notOnList, false);
+    const t = addTeam(c, 'Team 1');
+    const m = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    asmt(c, P1).choices = { step: 10 };
+    setTeamScore(c, t, P1, 85);
+    assert.equal(detail(c, m, P1).notOnList, true);
+    setTeamScore(c, t, P1, 90);
+    assert.equal(detail(c, m, P1).notOnList, false);
+  });
+
+  test('each list is built once per assessment, not once per score (review F6), and follows in-place edits', () => {
+    // 59 students x four 100-point items with 201-value lists (step 0.5) plus participation (11 values).
+    const c = course('SE4351');
+    FIVE.forEach((aid) => { if (asmt(c, aid).maxScore === 100) asmt(c, aid).choices = { step: 0.5 }; });
+    for (let i = 1; i <= 59; i++) {
+      const s = addStudent(c, 'Student ' + String(i).padStart(2, '0'), 'X');
+      fillAll(c, s, 60 + 10 * (i % 5)); // participation 3, 3.5, ..., 5: every value is on its list
+    }
+    // Count the list work done in model (it calls util.fix once per list value it builds).
+    const realFix = util.fix;
+    let calls = 0;
+    util.fix = function () { calls++; return realFix.apply(this, arguments); };
+    let first, second;
+    try {
+      calc.computeCourse(c);
+      first = calls;
+      calls = 0;
+      calc.computeCourse(c);
+      second = calls;
+    } finally {
+      util.fix = realFix;
+    }
+    // Rebuilding the list for each of the 59 x 5 scores took about 59 x (4 x 202 + 12) = 48,000 calls.
+    assert.ok(first < 2500, 'first computeCourse: ' + first + ' util.fix calls in model');
+    assert.ok(second < 600, 'next computeCourse: ' + second + ' util.fix calls in model');
+    const r = calc.computeCourse(c);
+    assert.equal(c.students.reduce((n, s) => n + r.byId[s.id].notOnListCount, 0), 0);
+    // A list changed in place (same assessment object) is read fresh: steps of 7 miss most values.
+    asmt(c, T1).choices.step = 7;
+    const s1 = c.students[0];
+    setScore(c, s1, T1, 70);
+    assert.equal(detail(c, s1, T1).notOnList, true); // 100, 93, ..., 2, 0: 70 is not on it
+    setScore(c, s1, T1, 72);
+    assert.equal(detail(c, s1, T1).notOnList, false);
+    asmt(c, T1).maxScore = 99; // 99, 92, ..., 1, 0
+    assert.equal(detail(c, s1, T1).notOnList, true);
+    setScore(c, s1, T1, 71);
+    assert.equal(detail(c, s1, T1).notOnList, false);
+  });
+});
+
+// ================================================================ stage 2b: final letters
+
+describe('final letters: effectiveLetter, letterDiffers, finalLetterValid (STAGE2B)', () => {
+  function withTotal(c, name, total, extra) {
+    const s = addStudent(c, name, 'X', extra);
+    fillAll(c, s, total);
+    return s;
+  }
+
+  test('no final letter: the suggestion from the cutoffs is the effective letter', () => {
+    const c = course('SE4351');
+    const s = withTotal(c, 'Student 01', 84);
+    const r = calc.studentResult(c, s);
+    assert.equal(r.letter, 'B');
+    assert.equal(r.finalLetter, null);
+    assert.equal(r.finalLetterValid, true);
+    assert.equal(r.effectiveLetter, 'B');
+    assert.equal(r.letterSource, 'cutoffs');
+    assert.equal(r.letterDiffers, false);
+  });
+
+  test('a manual letter equal to the suggestion: manual, not different', () => {
+    const c = course('SE4351');
+    const s = withTotal(c, 'Student 01', 84);
+    model.setFinalLetter(c, s.id, 'B');
+    const r = calc.studentResult(c, s);
+    assert.equal(r.finalLetter, 'B');
+    assert.equal(r.effectiveLetter, 'B');
+    assert.equal(r.letterSource, 'manual');
+    assert.equal(r.letterDiffers, false);
+    assert.equal(r.finalLetterValid, true);
+  });
+
+  test('83.65 graded A and 83.4 graded B, like the previous sheet: the manual letter wins', () => {
+    const c = course('SE4351');
+    const hi = withTotal(c, 'Student 01', 83.65);
+    const lo = withTotal(c, 'Student 02', 83.4);
+    model.setFinalLetter(c, hi.id, 'A');
+    model.setFinalLetter(c, lo.id, 'B');
+    const res = calc.computeCourse(c);
+    assert.equal(res.byId[hi.id].letter, 'B'); // the cutoff suggestion
+    assert.equal(res.byId[hi.id].effectiveLetter, 'A');
+    assert.equal(res.byId[hi.id].letterDiffers, true);
+    assert.equal(res.byId[lo.id].effectiveLetter, 'B');
+    assert.equal(res.byId[lo.id].letterDiffers, false);
+    assert.deepEqual(res.orderIssues, []);
+  });
+
+  test('finalLetterValid after a scale change: A+ is kept, flagged, and still the effective letter', () => {
+    const c = course('SE4351');
+    const s = withTotal(c, 'Student 01', 98);
+    model.setFinalLetter(c, s.id, 'A+');
+    assert.equal(calc.studentResult(c, s).finalLetterValid, true);
+    c.settings.letterScale = model.defaultLetterScale('graduate'); // no A+
+    const r = calc.studentResult(c, s);
+    assert.equal(r.finalLetter, 'A+');
+    assert.equal(r.finalLetterValid, false);
+    assert.equal(r.effectiveLetter, 'A+');
+    assert.equal(r.letterSource, 'manual');
+    assert.equal(r.letter, 'A');
+    assert.equal(r.letterDiffers, true);
+    const res = calc.computeCourse(c);
+    assert.equal(res.letterSummary.invalid, 1);
+    assert.equal(res.letterSummary.assigned, 1);
+    // Renaming the letter back in the scale makes it valid again.
+    c.settings.letterScale = [{ letter: 'A+', min: 97 }].concat(model.defaultLetterScale('graduate'));
+    assert.equal(calc.studentResult(c, s).finalLetterValid, true);
+  });
+
+  test('a blank stored letter counts as no letter', () => {
+    const c = course('SE4351');
+    const s = withTotal(c, 'Student 01', 70);
+    s.finalLetter = '  ';
+    const r = calc.studentResult(c, s);
+    assert.equal(r.finalLetter, null);
+    assert.equal(r.letterSource, 'cutoffs');
+    assert.equal(r.effectiveLetter, 'C-');
+  });
+
+  test('letterIndex: position in the scale, highest first; -1 when absent', () => {
+    const ug = course('SE4351').settings.letterScale;
+    assert.equal(calc.letterIndex(ug, 'A+'), 0);
+    assert.equal(calc.letterIndex(ug, 'B'), 4);
+    assert.equal(calc.letterIndex(ug, 'F'), 12);
+    assert.equal(calc.letterIndex(ug, 'Z'), -1);
+    assert.equal(calc.letterIndex(ug, ''), -1);
+    assert.equal(calc.letterIndex(ug, null), -1);
+    assert.equal(calc.letterIndex(ug.slice().reverse(), 'A+'), 0, 'unsorted scales are sorted first');
+    assert.equal(calc.letterIndex(undefined, 'A'), -1);
+  });
+});
+
+describe('orderIssues and letterSummary (STAGE2B)', () => {
+  function withTotal(c, name, total, letter, extra) {
+    const s = addStudent(c, name, 'X', extra);
+    fillAll(c, s, total);
+    if (letter !== undefined) s.finalLetter = letter;
+    return s;
+  }
+
+  test('no letters, no issues; summary counts every active student as unassigned', () => {
+    const c = course('SE4351');
+    withTotal(c, 'Student 01', 90);
+    withTotal(c, 'Student 02', 80);
+    withTotal(c, 'Student 03', 70, undefined, { status: 'withdrawn' });
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, []);
+    assert.deepEqual(res.letterSummary, { active: 2, assigned: 0, unassigned: 2, manualDiffers: 0, invalid: 0 });
+  });
+
+  test('a lower total with a higher letter forms one pair { higherTotalId, lowerTotalId }', () => {
+    const c = course('SE4351');
+    const a = withTotal(c, 'Student 01', 91, 'B+');
+    const b = withTotal(c, 'Student 02', 88, 'A-');
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, [{ higherTotalId: a.id, lowerTotalId: b.id }]);
+    assert.equal(res.byId[a.id].orderIssue, true);
+    assert.equal(res.byId[b.id].orderIssue, true);
+  });
+
+  test('ties never form a pair, whatever the letters', () => {
+    const c = course('SE4351');
+    const a = withTotal(c, 'Student 01', 85, 'B');
+    const b = withTotal(c, 'Student 02', 85, 'A');
+    const d = withTotal(c, 'Student 03', 85, 'C');
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, []);
+    [a, b, d].forEach((s) => assert.equal(res.byId[s.id].orderIssue, false));
+  });
+
+  test('ties with float noise are still ties (80.1 via different items)', () => {
+    const c = course('SE4351');
+    const a = addStudent(c, 'Student 01', 'X');
+    const b = addStudent(c, 'Student 02', 'X');
+    fillAll(c, a, 80.1);
+    // 80.1 again, reached differently: Test 2 91 (36.4), Test 1 83.4 (20.85), Project II 90.5 (18.1),
+    // Project I 47.5 (4.75), Participation 0: 36.4 + 20.85 + 18.1 + 4.75 = 80.1.
+    [[P1, 47.5], [P2, 90.5], [T1, 83.4], [T2, 91], [PART, 0]].forEach(([aid, v]) => setScore(c, b, aid, v));
+    a.finalLetter = 'C';
+    b.finalLetter = 'A';
+    const res = calc.computeCourse(c);
+    assert.equal(res.byId[a.id].total, 80.1);
+    assert.equal(res.byId[b.id].total, 80.1);
+    assert.deepEqual(res.orderIssues, []);
+  });
+
+  test('equal letters and letters in total order are fine; every out-of-order pair is listed', () => {
+    const c = course('SE4351');
+    const s1 = withTotal(c, 'Student 01', 95, 'A');
+    const s2 = withTotal(c, 'Student 02', 90, 'A');
+    const s3 = withTotal(c, 'Student 03', 85, 'B');
+    const s4 = withTotal(c, 'Student 04', 80, 'A');   // above 2 of the 3 higher totals
+    const s5 = withTotal(c, 'Student 05', 75, 'C');
+    const s6 = withTotal(c, 'Student 06', 70, 'B');   // above s5 only
+    const res = calc.computeCourse(c);
+    // s4 (A) vs s3 (B): issue. s4 vs s1, s2 (A): same letter. s6 (B) vs s5 (C): issue. s6 vs s3 (B): same.
+    assert.deepEqual(res.orderIssues, [
+      { higherTotalId: s3.id, lowerTotalId: s4.id },
+      { higherTotalId: s5.id, lowerTotalId: s6.id }
+    ]);
+    assert.deepEqual([s1, s2, s3, s4, s5, s6].map((s) => res.byId[s.id].orderIssue), [false, false, true, true, true, true]);
+  });
+
+  test('only students with a final letter of the scale are compared; withdrawn students never are', () => {
+    const c = course('SE4351');
+    const a = withTotal(c, 'Student 01', 95, 'C');
+    withTotal(c, 'Student 02', 90);                                  // no letter
+    withTotal(c, 'Student 03', 85, 'W');                             // not a scale letter
+    withTotal(c, 'Student 04', 80, 'A', { status: 'withdrawn' });    // withdrawn
+    const e = withTotal(c, 'Student 05', 75, 'B');
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, [{ higherTotalId: a.id, lowerTotalId: e.id }]);
+  });
+
+  test('pairs follow total order (highest first), not storage order', () => {
+    const c = course('SE4351');
+    const low = withTotal(c, 'Student 01', 60, 'A');
+    const high = withTotal(c, 'Student 02', 99, 'F');
+    const mid = withTotal(c, 'Student 03', 80, 'B');
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, [
+      { higherTotalId: high.id, lowerTotalId: mid.id },
+      { higherTotalId: high.id, lowerTotalId: low.id },
+      { higherTotalId: mid.id, lowerTotalId: low.id }
+    ]);
+    assert.deepEqual(calc.findOrderIssues(c, Object.values(res.byId)), res.orderIssues);
+  });
+
+  test('letterSummary: assigned, unassigned (active without a letter), manualDiffers, invalid', () => {
+    const c = course('SE4351');
+    withTotal(c, 'Student 01', 95, 'A');     // suggestion A: same
+    withTotal(c, 'Student 02', 88, 'A-');    // suggestion B+: differs
+    withTotal(c, 'Student 03', 81);          // unassigned
+    withTotal(c, 'Student 04', 74, 'W');     // outside the scale: assigned, differs, invalid
+    withTotal(c, 'Student 05', 60, 'D', { status: 'withdrawn' }); // not counted
+    withTotal(c, 'Student 06', 50, null, { status: 'withdrawn' }); // not counted
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.letterSummary, { active: 4, assigned: 3, unassigned: 1, manualDiffers: 2, invalid: 1 });
+    assert.equal(res.letterSummary.assigned + res.letterSummary.unassigned, res.activeIds.length);
+  });
+
+  test('a withdrawn student keeps their final letter in the results (exports), outside the summary', () => {
+    const c = course('SE4351');
+    const w = withTotal(c, 'Student 01', 60, 'D', { status: 'withdrawn' });
+    const res = calc.computeCourse(c);
+    assert.equal(res.byId[w.id].effectiveLetter, 'D');
+    assert.equal(res.byId[w.id].letterSource, 'manual');
+    assert.deepEqual(res.letterSummary, { active: 0, assigned: 0, unassigned: 0, manualDiffers: 0, invalid: 0 });
+  });
+
+  test('bands like the previous sheet (A for the top 4, B for the next 3, C for the rest) have no issues', () => {
+    const c = course('SE4351');
+    const totals = [91.65, 90.2, 89.1, 88.4, 86.35, 84, 83.75, 81.4, 77.2, 71.9];
+    const letters = ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'C', 'C', 'C'];
+    totals.forEach((t, i) => withTotal(c, 'Student ' + String(i + 1).padStart(2, '0'), t, letters[i]));
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, []);
+    assert.equal(res.letterSummary.assigned, 10);
+    assert.equal(res.letterSummary.unassigned, 0);
+    // Moving one student up a band out of order shows exactly that student's pairs.
+    c.students[8].finalLetter = 'B'; // 77.2 now B, above 81.4's C
+    const again = calc.computeCourse(c);
+    assert.deepEqual(again.orderIssues, [{ higherTotalId: c.students[7].id, lowerTotalId: c.students[8].id }]);
+  });
+});
+
+describe('stage 2b robustness', () => {
+  test('letterIndex ignores junk rows and non-array scales', () => {
+    assert.equal(calc.letterIndex([null, 5, { letter: 'B', min: 80 }, { letter: 'A', min: 90 }], 'B'), 1);
+    assert.equal(calc.letterIndex('A', 'A'), -1);
+    assert.equal(calc.letterIndex({ letter: 'A' }, 'A'), -1);
+  });
+
+  test('a course whose students all lack totals still has a letter summary and no order issues', () => {
+    const c = course('SE4351');
+    addStudent(c, 'Student 01', 'Alpha').finalLetter = 'A';
+    const res = calc.computeCourse(c);
+    assert.deepEqual(res.orderIssues, []);
+    assert.equal(res.letterSummary.assigned, 1);
   });
 });

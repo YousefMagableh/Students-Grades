@@ -93,14 +93,16 @@ describe('default state (C1, C2, C4)', () => {
 });
 
 describe('assessment defaults (A1, A2, A4)', () => {
+  // Participation is out of 5 with a drop-down list in steps of 0.5 (DECISIONS 1 and 8); the other
+  // items are out of 100 with free entry.
   const FIVE = [
-    { id: 'a_p1', name: 'Project I', maxScore: 100, weight: 10, teamGraded: true },
-    { id: 'a_p2', name: 'Project II', maxScore: 100, weight: 20, teamGraded: true },
-    { id: 'a_t1', name: 'Test 1', maxScore: 100, weight: 25, teamGraded: false },
-    { id: 'a_t2', name: 'Test 2', maxScore: 100, weight: 40, teamGraded: false },
-    { id: 'a_part', name: 'Class/Project Participation', maxScore: 100, weight: 5, teamGraded: false }
+    { id: 'a_p1', name: 'Project I', maxScore: 100, weight: 10, teamGraded: true, choices: null },
+    { id: 'a_p2', name: 'Project II', maxScore: 100, weight: 20, teamGraded: true, choices: null },
+    { id: 'a_t1', name: 'Test 1', maxScore: 100, weight: 25, teamGraded: false, choices: null },
+    { id: 'a_t2', name: 'Test 2', maxScore: 100, weight: 40, teamGraded: false, choices: null },
+    { id: 'a_part', name: 'Class/Project Participation', maxScore: 5, weight: 5, teamGraded: false, choices: { step: 0.5 } }
   ];
-  const pick = (a) => ({ id: a.id, name: a.name, maxScore: a.maxScore, weight: a.weight, teamGraded: a.teamGraded });
+  const pick = (a) => ({ id: a.id, name: a.name, maxScore: a.maxScore, weight: a.weight, teamGraded: a.teamGraded, choices: a.choices });
 
   test('SE 4351 has exactly the five defaults, weights summing to 100', () => {
     const c = course('SE4351');
@@ -118,16 +120,30 @@ describe('assessment defaults (A1, A2, A4)', () => {
     assert.equal(paper.name, 'Term Paper');
     assert.equal(paper.weight, 0);
     assert.equal(paper.maxScore, 100);
+    assert.equal(paper.choices, null);
     assert.equal(paper.teamGraded, false);
     assert.equal(paper.category, 'paper');
     assert.equal(c.assessments.reduce((s, a) => s + a.weight, 0), 100);
   });
 
-  test('createAssessment defaults: max 100, weight 0, not team-graded, new id', () => {
+  test('custom courses get the same five defaults, participation out of 5 with the drop-down list', () => {
+    const c = course('custom');
+    assert.deepEqual(c.assessments.map(pick), FIVE);
+  });
+
+  test('template assessments are independent objects (no shared choices)', () => {
+    const a = course('SE4351'), b = course('SE4351');
+    assert.notEqual(model.findAssessment(a, 'a_part').choices, model.findAssessment(b, 'a_part').choices);
+    model.findAssessment(a, 'a_part').choices.step = 1;
+    assert.equal(model.findAssessment(b, 'a_part').choices.step, 0.5);
+  });
+
+  test('createAssessment defaults: max 100, weight 0, not team-graded, no drop-down list, new id', () => {
     const a = model.createAssessment({ name: 'Questionnaire' });
     assert.equal(a.name, 'Questionnaire');
     assert.equal(a.maxScore, 100);
     assert.equal(a.weight, 0);
+    assert.equal(a.choices, null);
     assert.equal(a.teamGraded, false);
     assert.ok(typeof a.id === 'string' && a.id.startsWith('a_'));
   });
@@ -1518,5 +1534,433 @@ describe('stage 2 model helpers', () => {
     assert.equal(c.attendance.records[s.id], undefined);
     assert.equal(c.attendance.totals[s.id], undefined);
     assert.equal(model.deleteStudent(c, s.id), false);
+  });
+});
+
+// ================================================================ stage 2b: drop-down lists (DECISIONS 8)
+
+describe('drop-down lists: choices, choiceValues, isChoiceValue (DECISIONS 8)', () => {
+  const part = (c) => model.findAssessment(c, 'a_part');
+
+  test('participation out of 5 in steps of 0.5 has exactly 11 values, highest first, ending at 0', () => {
+    const c = course('SE4351');
+    assert.deepEqual(part(c).choices, { step: 0.5 });
+    assert.deepEqual(model.choiceValues(part(c)), [5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5, 0]);
+    assert.equal(model.hasChoices(part(c)), true);
+    assert.equal(model.describeChoices(part(c)), '0–5 in steps of 0.5');
+    ['SE6362', 'custom'].forEach((tpl) => assert.equal(model.choiceValues(part(course(tpl))).length, 11, tpl));
+  });
+
+  test('items without a list have no values; free entry is the default', () => {
+    const c = course('SE4351');
+    const t1 = model.findAssessment(c, 'a_t1');
+    assert.equal(t1.choices, null);
+    assert.deepEqual(model.choiceValues(t1), []);
+    assert.equal(model.hasChoices(t1), false);
+    assert.equal(model.describeChoices(t1), '');
+    assert.deepEqual(model.choiceValues(null), []);
+    assert.deepEqual(model.choiceValues(undefined), []);
+    assert.deepEqual(model.choiceValues({ maxScore: 5 }), []);
+  });
+
+  test('values are free of float noise (max 5, step 0.1: 51 values, 4.7 and 0.3 exact)', () => {
+    const v = model.choiceValues({ maxScore: 5, choices: { step: 0.1 } });
+    assert.equal(v.length, 51);
+    assert.deepEqual(v.slice(0, 4), [5, 4.9, 4.8, 4.7]);
+    assert.ok(v.includes(0.3));
+    assert.equal(v[v.length - 1], 0);
+  });
+
+  test('a step that does not divide the max still ends at 0 (max 5, step 2 -> 5, 3, 1, 0)', () => {
+    assert.deepEqual(model.choiceValues({ maxScore: 5, choices: { step: 2 } }), [5, 3, 1, 0]);
+    assert.deepEqual(model.choiceValues({ maxScore: 1, choices: { step: 0.3 } }), [1, 0.7, 0.4, 0.1, 0]);
+    assert.deepEqual(model.choiceValues({ maxScore: 5, choices: { step: 10 } }), [5, 0]);
+  });
+
+  test('at most 200 steps: max 100 step 0.5 (201 values) is kept, max 100.5 step 0.5 is not', () => {
+    assert.equal(model.MAX_CHOICE_STEPS, 200);
+    assert.equal(model.choiceValues({ maxScore: 100, choices: { step: 0.5 } }).length, 201);
+    assert.deepEqual(model.choiceValues({ maxScore: 100.5, choices: { step: 0.5 } }), []);
+    assert.deepEqual(model.choiceValues({ maxScore: 5, choices: { step: 0.001 } }), []);
+  });
+
+  test('invalid steps give no list', () => {
+    [0, -0.5, NaN, Infinity, '0.5', null, 1e7].forEach((step) => {
+      assert.deepEqual(model.choiceValues({ maxScore: 5, choices: { step } }), [], String(step));
+    });
+    [null, 'yes', [0.5], 0.5, true].forEach((choices) => {
+      assert.deepEqual(model.choiceValues({ maxScore: 5, choices }), [], JSON.stringify(choices));
+    });
+    assert.deepEqual(model.choiceValues({ maxScore: 0, choices: { step: 0.5 } }), []);
+    assert.deepEqual(model.choiceValues({ maxScore: -5, choices: { step: 0.5 } }), []);
+  });
+
+  test('isChoiceValue compares after util.fix: 4.5 and 4.500000000000001 are on the list, 4.25 is not', () => {
+    const a = part(course('SE4351'));
+    assert.equal(model.isChoiceValue(a, 4.5), true);
+    assert.equal(model.isChoiceValue(a, 0.1 * 3 * 15), true); // 4.500000000000001
+    assert.equal(model.isChoiceValue(a, 5), true);
+    assert.equal(model.isChoiceValue(a, 0), true);
+    assert.equal(model.isChoiceValue(a, -0), true);
+    assert.equal(model.isChoiceValue(a, 0.5), true);
+    assert.equal(model.isChoiceValue(a, 4.25), false);
+    assert.equal(model.isChoiceValue(a, 4.4999999999), false);
+    assert.equal(model.isChoiceValue(a, 5.5), false);
+    assert.equal(model.isChoiceValue(a, -0.5), false);
+    assert.equal(model.isChoiceValue(a, 100), false);
+    assert.equal(model.isChoiceValue(a, '4.5'), false);
+    assert.equal(model.isChoiceValue(a, NaN), false);
+    assert.equal(model.isChoiceValue(a, null), false);
+    assert.equal(model.isChoiceValue(a, undefined), false);
+    const tenth = { maxScore: 5, choices: { step: 0.1 } };
+    assert.equal(model.isChoiceValue(tenth, 0.1 + 0.2), true); // 0.30000000000000004
+    // No list: nothing is a list value.
+    assert.equal(model.isChoiceValue(model.findAssessment(course('SE4351'), 'a_t1'), 80), false);
+  });
+
+  test('lists are remembered per assessment but follow in-place edits of max score and step (review F6)', () => {
+    const a = { maxScore: 5, choices: { step: 0.5 } };
+    const eleven = [5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5, 0];
+    const v = model.choiceValues(a);
+    assert.deepEqual(v, eleven);
+    // Each call returns a new array: changing one never changes the list.
+    v[0] = -1;
+    v.push(99);
+    assert.deepEqual(model.choiceValues(a), eleven);
+    assert.notEqual(model.choiceValues(a), model.choiceValues(a));
+    assert.equal(model.isChoiceValue(a, 99), false);
+    // The step object edited in place.
+    a.choices.step = 1;
+    assert.deepEqual(model.choiceValues(a), [5, 4, 3, 2, 1, 0]);
+    assert.equal(model.isChoiceValue(a, 4.5), false);
+    assert.equal(model.isChoiceValue(a, 4), true);
+    // The max score edited in place.
+    a.maxScore = 3;
+    assert.deepEqual(model.choiceValues(a), [3, 2, 1, 0]);
+    assert.equal(model.isChoiceValue(a, 5), false);
+    // A new choices object, then a max score that makes the list too long (1000 / 1.5 > 200).
+    a.choices = { step: 1.5 };
+    assert.deepEqual(model.choiceValues(a), [3, 1.5, 0]);
+    a.maxScore = 1000;
+    assert.deepEqual(model.choiceValues(a), []);
+    assert.equal(model.hasChoices(a), false);
+    assert.equal(model.isChoiceValue(a, 0), false);
+    // Turned off and on again; a frozen assessment works too.
+    a.maxScore = 5;
+    a.choices = null;
+    assert.equal(model.hasChoices(a), false);
+    a.choices = { step: 0.5 };
+    assert.equal(model.isChoiceValue(a, 4.5), true);
+    assert.equal(model.describeChoices(a), '0–5 in steps of 0.5');
+    const frozen = Object.freeze({ maxScore: 5, choices: Object.freeze({ step: 2.5 }) });
+    assert.deepEqual(model.choiceValues(frozen), [5, 2.5, 0]);
+    assert.deepEqual(model.choiceValues(frozen), [5, 2.5, 0]);
+  });
+
+  test('normalizeChoices keeps { step } only for a valid list and drops extra keys', () => {
+    assert.deepEqual(model.normalizeChoices({ step: 0.5, extra: 1 }, 5), { step: 0.5 });
+    assert.equal(model.normalizeChoices({ step: 0.5 }, 1000), null);
+    assert.equal(model.normalizeChoices({ step: 0 }, 5), null);
+    assert.equal(model.normalizeChoices(null, 5), null);
+    assert.equal(model.normalizeChoices({ step: 1 }, 'x'), null);
+  });
+
+  test('createAssessment keeps a valid list, drops an invalid one, and never shares the object', () => {
+    const given = { step: 1 };
+    const a = model.createAssessment({ name: 'Quiz', maxScore: 10, choices: given });
+    assert.deepEqual(a.choices, { step: 1 });
+    assert.notEqual(a.choices, given);
+    assert.deepEqual(model.choiceValues(a), [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    assert.equal(model.createAssessment({ name: 'Quiz', maxScore: 1000, choices: { step: 1 } }).choices, null);
+    assert.equal(model.createAssessment({ name: 'Quiz', choices: { step: -1 } }).choices, null);
+  });
+
+  test('normalizeCourse keeps choices only when step > 0 and max / step <= 200', () => {
+    const c = model.normalizeCourse({
+      assessments: [
+        { id: 'a_1', name: 'Participation', maxScore: 5, weight: 5, choices: { step: 0.5 } },
+        { id: 'a_2', name: 'Zero step', maxScore: 5, weight: 0, choices: { step: 0 } },
+        { id: 'a_3', name: 'Too many', maxScore: 100, weight: 0, choices: { step: 0.25 } },
+        { id: 'a_4', name: 'Junk', maxScore: 100, weight: 0, choices: 'dropdown' },
+        { id: 'a_5', name: 'None', maxScore: 100, weight: 0 },
+        { id: 'a_6', name: 'Negative', maxScore: 5, weight: 0, choices: { step: -1 } },
+        { id: 'a_7', name: 'Edge', maxScore: 100, weight: 0, choices: { step: 0.5 } }
+      ]
+    });
+    assert.deepEqual(c.assessments.map((a) => a.choices), [{ step: 0.5 }, null, null, null, null, null, { step: 0.5 }]);
+  });
+
+  test('splitAssessment: the new parts share the list', () => {
+    const c = course('SE4351');
+    model.splitAssessment(c, 'a_part', [{ name: 'Class participation', weight: 2.5 }, { name: 'Project participation', weight: 2.5 }]);
+    assert.deepEqual(c.assessments[5].choices, { step: 0.5 });
+    assert.equal(c.assessments[5].maxScore, 5);
+    assert.notEqual(c.assessments[5].choices, c.assessments[4].choices);
+  });
+});
+
+// ================================================================ stage 2b: final letters and finalizing
+
+describe('final letters (STAGE2B)', () => {
+  function withStudents(template, n) {
+    const c = course(template);
+    const list = [];
+    for (let i = 1; i <= n; i++) list.push(addStudent(c, 'Student ' + String(i).padStart(2, '0'), 'X'));
+    return { c, list };
+  }
+
+  test('createStudent: finalLetter defaults to null and keeps a given string', () => {
+    assert.equal(model.createStudent({ lastName: 'Student 01' }).finalLetter, null);
+    assert.equal(model.createStudent({ finalLetter: 'B+' }).finalLetter, 'B+');
+    assert.equal(model.createStudent({ finalLetter: '' }).finalLetter, null);
+    assert.equal(model.createStudent({ finalLetter: '  ' }).finalLetter, null);
+    assert.equal(model.createStudent({ finalLetter: 3 }).finalLetter, null);
+    assert.equal(course('SE4351').finalized, null);
+  });
+
+  test('scaleLetters lists the scale highest first; matchLetter reads typed text', () => {
+    const ug = course('SE4351'), g = course('SE6362');
+    assert.deepEqual(model.scaleLetters(ug), ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F']);
+    assert.deepEqual(model.scaleLetters(g), ['A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'F']);
+    // An unsorted scale in memory is still listed by cutoff.
+    ug.settings.letterScale = ug.settings.letterScale.slice().reverse();
+    assert.equal(model.scaleLetters(ug)[0], 'A+');
+    assert.equal(model.matchLetter(g, 'B+'), 'B+');
+    assert.equal(model.matchLetter(g, 'b+'), 'B+');
+    assert.equal(model.matchLetter(g, ' a- '), 'A-');
+    assert.equal(model.matchLetter(g, 'A−'), 'A-'); // typed with a minus sign
+    assert.equal(model.matchLetter(g, 'A+'), null); // no A+ on the graduate scale
+    assert.equal(model.matchLetter(g, 'E'), null);
+    assert.equal(model.matchLetter(g, ''), null);
+    assert.equal(model.matchLetter(g, null), null);
+    assert.equal(model.matchLetter(g, 4), null);
+    assert.equal(model.isScaleLetter(g, 'B'), true);
+    assert.equal(model.isScaleLetter(g, 'b'), false);
+    assert.equal(model.isScaleLetter(g, 'D'), false);
+  });
+
+  test('setFinalLetter: sets, reports changes, canonicalizes case and clears', () => {
+    const { c, list: [a] } = withStudents('SE4351', 1);
+    assert.equal(model.setFinalLetter(c, a.id, 'B+'), true);
+    assert.equal(a.finalLetter, 'B+');
+    assert.equal(model.setFinalLetter(c, a.id, 'B+'), false, 'same letter: no change');
+    assert.equal(model.setFinalLetter(c, a.id, 'a-'), true);
+    assert.equal(a.finalLetter, 'A-');
+    assert.equal(model.setFinalLetter(c, a.id, null), true);
+    assert.equal(a.finalLetter, null);
+    assert.equal(model.setFinalLetter(c, a.id, null), false);
+    model.setFinalLetter(c, a.id, 'F');
+    assert.equal(model.setFinalLetter(c, a.id, ''), true);
+    assert.equal(a.finalLetter, null);
+    model.setFinalLetter(c, a.id, 'C');
+    assert.equal(model.setFinalLetter(c, a.id, undefined), true);
+    assert.equal(a.finalLetter, null);
+  });
+
+  test('setFinalLetter throws a readable Error for a letter that is not in the scale, and changes nothing', () => {
+    const { c, list: [a] } = withStudents('SE6362', 1);
+    model.setFinalLetter(c, a.id, 'B');
+    ['A+', 'E', 'D', 'B++', 7, true, {}].forEach((bad) => {
+      assert.throws(() => model.setFinalLetter(c, a.id, bad), (e) => {
+        assert.ok(e instanceof Error && !(e instanceof TypeError));
+        assert.match(e.message, /not a letter of this course's scale \(A, A-, B\+, B, B-, C\+, C, F\)/);
+        return true;
+      }, String(bad));
+      assert.equal(a.finalLetter, 'B');
+    });
+  });
+
+  test('setFinalLetter for an unknown student changes nothing and returns false', () => {
+    const { c } = withStudents('SE4351', 1);
+    assert.equal(model.setFinalLetter(c, 's_missing', 'A'), false);
+    assert.equal(model.setFinalLetter(c, 'constructor', 'A'), false);
+  });
+
+  test('a letter left over from an old scale is replaced normally', () => {
+    const { c, list: [a] } = withStudents('SE4351', 1);
+    a.finalLetter = 'A+';
+    c.settings.letterScale = model.defaultLetterScale('graduate');
+    assert.equal(model.setFinalLetter(c, a.id, 'A'), true);
+    assert.equal(a.finalLetter, 'A');
+  });
+
+  test('setFinalLetters: one band in one call, invalid letters and unknown students skipped', () => {
+    const { c, list } = withStudents('SE4351', 5);
+    list[0].finalLetter = 'A';
+    const res = model.setFinalLetters(c, [
+      { studentId: list[0].id, letter: 'A' },      // unchanged
+      { studentId: list[1].id, letter: 'A' },
+      { studentId: list[2].id, letter: 'b' },      // canonicalized to B
+      { studentId: list[3].id, letter: 'Z' },      // invalid
+      { studentId: 's_nope', letter: 'A' },        // unknown student
+      null,
+      { studentId: list[4].id, letter: null }      // already empty
+    ]);
+    assert.equal(res.changed, 2);
+    assert.equal(res.skipped, 3);
+    assert.deepEqual(res.skippedItems.map((x) => x.reason), ['letter', 'student', 'student']);
+    assert.deepEqual(res.skippedItems[0], { studentId: list[3].id, letter: 'Z', reason: 'letter' });
+    assert.deepEqual(list.map((s) => s.finalLetter), ['A', 'A', 'B', null, null]);
+    assert.deepEqual(model.setFinalLetters(c, 'junk'), { changed: 0, skipped: 0, skippedItems: [] });
+    // Clearing a band.
+    assert.equal(model.setFinalLetters(c, list.map((s) => ({ studentId: s.id, letter: null }))).changed, 3);
+    assert.ok(list.every((s) => s.finalLetter === null));
+  });
+
+  test('copySuggestedToFinal fills only empty letters of active students by default', () => {
+    const { c, list } = withStudents('SE4351', 4);
+    const [a, b, d, w] = list;
+    w.status = 'withdrawn';
+    const results = { byId: {
+      [a.id]: { letter: 'B+' }, [b.id]: { letter: 'C' }, [d.id]: { letter: 'A' }, [w.id]: { letter: 'F' }
+    } };
+    b.finalLetter = 'B';       // already assigned: kept
+    d.finalLetter = 'Q';       // invalid, but not empty: kept
+    assert.equal(model.copySuggestedToFinal(c, results), 1);
+    assert.deepEqual(list.map((s) => s.finalLetter), ['B+', 'B', 'Q', null]);
+    // Nothing left to fill.
+    assert.equal(model.copySuggestedToFinal(c, results), 0);
+    // Overwrite everything, withdrawn included.
+    assert.equal(model.copySuggestedToFinal(c, results, { onlyEmpty: false, activeOnly: false }), 3);
+    assert.deepEqual(list.map((s) => s.finalLetter), ['B+', 'C', 'A', 'F']);
+  });
+
+  test('copySuggestedToFinal uses calc results and skips unknown or missing suggestions', () => {
+    const { c, list } = withStudents('SE4351', 3);
+    ['a_p1', 'a_p2', 'a_t1', 'a_t2'].forEach((aid) => {
+      model.setEntry(c.scores, list[0].id, aid, { value: 95 });
+      model.setEntry(c.scores, list[1].id, aid, { value: 80 });
+    });
+    model.setEntry(c.scores, list[0].id, 'a_part', { value: 5 });
+    model.setEntry(c.scores, list[1].id, 'a_part', { value: 4 });
+    const res = calc.computeCourse(c);
+    // 95 x 0.95 + 5 = 95.25 -> A; 80 x 0.95 + 4 = 80 -> B-; no scores -> 0 -> F.
+    assert.equal(model.copySuggestedToFinal(c, res), 3);
+    assert.deepEqual(list.map((s) => s.finalLetter), ['A', 'B-', 'F']);
+    list.forEach((s) => { s.finalLetter = null; });
+    assert.equal(model.copySuggestedToFinal(c, { byId: { [list[0].id]: { letter: 'Q' } } }), 0);
+    assert.equal(model.copySuggestedToFinal(c, null), 0);
+    assert.equal(model.copySuggestedToFinal(c, {}), 0);
+    assert.ok(list.every((s) => s.finalLetter === null));
+  });
+
+  test('finalize, unfinalize and isFinalized', () => {
+    const c = course('SE4351');
+    assert.equal(model.isFinalized(c), false);
+    const f = model.finalize(c, '2026-12-10T12:00:00.000Z', 'Grading meeting with the instructor');
+    assert.deepEqual(c.finalized, { at: '2026-12-10T12:00:00.000Z', note: 'Grading meeting with the instructor' });
+    assert.equal(f, c.finalized);
+    assert.equal(model.isFinalized(c), true);
+    assert.equal(model.unfinalize(c), true);
+    assert.equal(c.finalized, null);
+    assert.equal(model.isFinalized(c), false);
+    assert.equal(model.unfinalize(c), false);
+    model.finalize(c);
+    assert.ok(!isNaN(Date.parse(c.finalized.at)), 'defaults to now');
+    assert.equal(c.finalized.note, '');
+    assert.equal(model.isFinalized({ finalized: { at: '' } }), false);
+    assert.equal(model.isFinalized({ finalized: 'yes' }), false);
+    assert.equal(model.isFinalized(null), false);
+  });
+
+  test('normalizeCourse keeps a final letter as a string (even outside the scale) and flags nothing away', () => {
+    const c = model.normalizeCourse({
+      template: 'SE6362', level: 'graduate',
+      students: [
+        { id: 's_1', lastName: 'Student 01', finalLetter: 'B+' },
+        { id: 's_2', lastName: 'Student 02', finalLetter: 'A+' },   // not on the graduate scale: kept
+        { id: 's_3', lastName: 'Student 03', finalLetter: '' },
+        { id: 's_4', lastName: 'Student 04', finalLetter: 4 },
+        { id: 's_5', lastName: 'Student 05', finalLetter: { letter: 'A' } },
+        { id: 's_6', lastName: 'Student 06' },
+        { id: 's_7', lastName: 'Student 07', finalLetter: '   ' }
+      ]
+    });
+    assert.deepEqual(c.students.map((s) => s.finalLetter), ['B+', 'A+', null, null, null, null, null]);
+    const r = calc.computeCourse(c);
+    assert.equal(r.byId.s_2.finalLetterValid, false);
+    assert.equal(r.byId.s_1.finalLetterValid, true);
+  });
+
+  test('normalizeCourse keeps finalized only as { at, note }', () => {
+    const f = (x) => model.normalizeCourse({ finalized: x }).finalized;
+    assert.deepEqual(f({ at: '2026-12-10T12:00:00.000Z', note: 'ok', extra: 1 }), { at: '2026-12-10T12:00:00.000Z', note: 'ok' });
+    assert.deepEqual(f({ at: '2026-12-10T12:00:00.000Z' }), { at: '2026-12-10T12:00:00.000Z', note: '' });
+    assert.deepEqual(f({ at: '2026-12-10T12:00:00.000Z', note: 5 }), { at: '2026-12-10T12:00:00.000Z', note: '' });
+    assert.equal(f({ at: '' }), null);
+    assert.equal(f({ at: 5 }), null);
+    assert.equal(f(true), null);
+    assert.equal(f('2026-12-10'), null);
+    assert.equal(f(undefined), null);
+    assert.equal(f([{ at: 'x' }]), null);
+  });
+
+  test('a JSON round trip keeps final letters, the finalized state and the drop-down list', () => {
+    const st = model.createDefaultState();
+    const c = st.courses[0];
+    const a = addStudent(c, 'Student 01', 'Alpha');
+    const b = addStudent(c, 'Student 02', 'Bravo');
+    model.setFinalLetter(c, a.id, 'A-');
+    b.finalLetter = 'W'; // outside the scale: kept and flagged, never dropped
+    model.finalize(c, '2026-12-10T12:00:00.000Z', 'meeting');
+    model.findAssessment(c, 'a_t1').choices = { step: 5 };
+    const back = model.normalizeState(roundTrip(st));
+    assert.deepEqual(back, st);
+    assert.equal(back.courses[0].students[1].finalLetter, 'W');
+    assert.deepEqual(back.courses[0].finalized, { at: '2026-12-10T12:00:00.000Z', note: 'meeting' });
+    assert.deepEqual(model.findAssessment(back.courses[0], 'a_t1').choices, { step: 5 });
+  });
+
+  test('duplicateCourse copies final letters and the finalized state', () => {
+    const c = course('SE4351');
+    const a = addStudent(c, 'Student 01', 'Alpha');
+    model.setFinalLetter(c, a.id, 'B');
+    model.finalize(c, '2026-12-10T12:00:00.000Z', '');
+    const copy = model.duplicateCourse(c, '2026-12-11T12:00:00.000Z');
+    assert.equal(copy.students[0].finalLetter, 'B');
+    assert.deepEqual(copy.finalized, c.finalized);
+    assert.notEqual(copy.finalized, c.finalized);
+  });
+
+  test('the max scores placeholder note says participation is out of 5 like the previous sheet', () => {
+    const note = model.placeholderInfo(course('SE4351'), 'maxScores').note;
+    assert.match(note, /max score of 100/);
+    assert.match(note, /Participation, which is out of 5 like the previous TA's sheet \(5 = full marks/);
+  });
+});
+
+describe('parseChoiceInput: strict drop-down entry (DECISIONS 8)', () => {
+  const part = () => model.findAssessment(course('SE4351'), 'a_part');
+
+  test('list values are accepted as the list spells them', () => {
+    assert.deepEqual(model.parseChoiceInput(part(), '4.5'), { kind: 'number', value: 4.5 });
+    assert.deepEqual(model.parseChoiceInput(part(), ' 4.50 '), { kind: 'number', value: 4.5 });
+    assert.deepEqual(model.parseChoiceInput(part(), '5'), { kind: 'number', value: 5 });
+    assert.deepEqual(model.parseChoiceInput(part(), '0'), { kind: 'number', value: 0 });
+    assert.deepEqual(model.parseChoiceInput(part(), '.5'), { kind: 'number', value: 0.5 });
+    assert.deepEqual(model.parseChoiceInput(part(), '90%'), { kind: 'number', value: 4.5 }); // 90% of 5
+    assert.deepEqual(model.parseChoiceInput(part(), 3), { kind: 'number', value: 3 });
+  });
+
+  test('blank input is empty (clears the cell)', () => {
+    assert.deepEqual(model.parseChoiceInput(part(), ''), { kind: 'empty' });
+    assert.deepEqual(model.parseChoiceInput(part(), '   '), { kind: 'empty' });
+    assert.deepEqual(model.parseChoiceInput(part(), null), { kind: 'empty' });
+  });
+
+  test('anything else is invalid with the list in the message, never a stored value', () => {
+    const msg = 'Choose a value from the list (0–5 in steps of 0.5).';
+    assert.deepEqual(model.parseChoiceInput(part(), '4.25'), { kind: 'invalid', text: '4.25', message: msg });
+    assert.deepEqual(model.parseChoiceInput(part(), '100'), { kind: 'invalid', text: '100', message: msg });
+    assert.deepEqual(model.parseChoiceInput(part(), '-1'), { kind: 'invalid', text: '-1', message: msg });
+    assert.deepEqual(model.parseChoiceInput(part(), 'five'), { kind: 'invalid', text: 'five', message: msg });
+    assert.deepEqual(model.parseChoiceInput(part(), '4,5'), { kind: 'invalid', text: '4,5', message: msg });
+  });
+
+  test('an item without a list parses like any score cell', () => {
+    const t1 = model.findAssessment(course('SE4351'), 'a_t1');
+    assert.deepEqual(model.parseChoiceInput(t1, '83.7'), { kind: 'number', value: 83.7 });
+    assert.deepEqual(model.parseChoiceInput(t1, 'abc'), { kind: 'invalid', text: 'abc' });
+    assert.deepEqual(model.parseChoiceInput(t1, ''), { kind: 'empty' });
   });
 });

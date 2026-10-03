@@ -254,6 +254,7 @@ html { scroll-padding-top: calc(var(--head-h, 96px) + 8px); }
 .statusbar .dot.error { background: var(--danger); }
 .statusbar .spacer { flex: 1; }
 .statusbar .sb-info { display: contents; } /* app.js rewrites only this part; its spans stay flex items */
+.statusbar .sb-actions { display: inline-flex; gap: 2px; margin-left: auto; } /* Help and Shortcuts stay together */
 
 .page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .page-header h1 { margin: 0; }
@@ -470,6 +471,20 @@ button.chip { font: inherit; font-size: 12px; cursor: pointer; }
 .dl dd { margin: 0; }
 
 .shortcut-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13px; align-items: center; }
+.shortcut-h { margin: 16px 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
+.shortcut-h:first-child { margin-top: 0; }
+@media (max-width: 560px) {
+  /* phones: the keys above their description, so a long description never squeezes the keys */
+  .shortcut-list { grid-template-columns: 1fr; gap: 2px 0; }
+  .shortcut-list > div:nth-child(2n) { margin-bottom: 8px; color: var(--text-muted); }
+}
+
+/* Help / About dialog (app.js showAbout) */
+.about h3 { display: flex; align-items: center; gap: 6px; margin: 16px 0 6px; font-size: 14px; }
+.about p { margin: 0 0 8px; line-height: 1.5; }
+.about .about-version { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.about .about-stale { padding: 8px 10px; border-radius: var(--radius-sm); background: var(--warn-bg); border: 1px solid var(--warn-border); }
+.about a { color: var(--accent); }
 
 @media (max-width: 1100px) {
   .course-picker select { max-width: 240px; }

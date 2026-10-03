@@ -466,7 +466,7 @@
     { k: 'complete', label: 'Complete', help: 'Active students with every weighted score entered.' },
     { k: 'incomplete', label: 'Incomplete (≥ 1 empty score)', help: 'Active students with at least one empty score. An empty score counts as 0 in the total.' },
     { k: 'invalidEntries', label: 'Invalid entries', help: 'Scores typed as text that is not a number. They count as 0 until fixed in the Grades tab.' },
-    { k: 'overrides', label: 'Overrides', help: 'Team-graded scores changed for one member (an unequal split needs the team\'s written agreement).' }
+    { k: 'overrides', label: 'Overrides (◆)', help: 'Team-graded scores changed for one member (an unequal split needs the team\'s written agreement).' }
   ];
 
   function overviewHtml(d) {
@@ -933,7 +933,7 @@
     var table = '<div class="table-wrap st-twrap" data-scroll="teams"><table class="table st-table"><caption class="sr-only">Summary per team</caption><thead><tr>' +
       '<th scope="col">Team</th><th scope="col" class="num">Members</th><th scope="col" class="num">Average total</th><th scope="col" class="num">Lowest – highest</th>' +
       teamA.map(function (a) { return '<th scope="col" class="num" title="The team score entered once for the whole team">' + esc(a.name) + ' <span class="st-qual">(team score)</span></th>'; }).join('') +
-      '<th scope="col" class="num" title="Per-member overrides of team-graded scores">Overrides</th>' +
+      '<th scope="col" class="num" title="Per-member overrides of team-graded scores">Overrides (◆)</th>' +
       (attOn ? '<th scope="col" class="num" title="Average number of unexcused (not allowed) absences per active member">Avg unexcused absences</th>' : '') +
       '</tr></thead><tbody>' + rows + '</tbody></table></div>';
     return head + '<div class="card-body st-teams-body">' + chart + table + '</div>';

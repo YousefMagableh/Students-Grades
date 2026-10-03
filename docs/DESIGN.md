@@ -52,12 +52,21 @@ js/core/importer.js         reading files, column mapping, import plan + apply (
 js/ui/exchange.js           Import / Export tab (stage 4)
 js/storage.js               IndexedDB → localStorage → memory adapter
 js/store.js                 app state, transactions, undo/redo, autosave, subscriptions
-js/ui/*.js                  widgets and views
-js/app.js                   boot: load state, render shell, wire header/nav
+js/ui/widgets.js            shared widgets (dialogs, menus, toasts, icons, downloads)
+js/ui/grid.js               Grades tab, incl. the Meeting view and the "Late work…" dialog (stages 2, 2b, 6)
+js/ui/students.js           Students & Teams tab, student details (stages 2, 6)
+js/ui/settings.js           Settings tab, incl. the Late work card (stages 2, 6)
+js/ui/history-view.js       History tab (stage 2)
+js/ui/attendance.js         Attendance tab, roll call (stage 3)
+js/ui/stats.js              Statistics tab (stage 5, section 11)
+js/ui/summary.js            printable Summary tab (stage 6, section 12)
+js/app.js                   boot: load state, render shell, wire header/nav, shortcuts and Help / About
 vendor/exceljs.min.js       vendored ExcelJS 4.4.0 (+ vendor/exceljs.LICENSE.txt), loaded on demand
-tests/*.test.js             node --test unit tests (no dependencies)
+tests/*.test.js             node --test unit tests (no dependencies); tests/repo.test.js checks the files themselves
+                            (local scripts only, CSP, no network APIs, .gitignore, version)
 tests/helpers/mini-excel.js tiny spreadsheet formula evaluator used by the export tests and the smoke test
-tests/e2e/smoke.mjs         headless Chromium smoke test (uses globally installed playwright)
+tests/e2e/smoke.mjs         headless Chromium smoke test from file:// (uses globally installed playwright): every
+                            stage, light and dark, 390 px, the Summary PDF, and zero network requests
 ```
 
 ## 2. Data model (`GT.model`)
@@ -347,8 +356,11 @@ use `effectiveLetter` (section 3).
 - `model.finalize(course, isoNow, note)` → sets and returns `course.finalized = { at, note }` (`at` defaults
   to now; finalizing again replaces both). `model.unfinalize(course)` → `finalized = null`, true when it was
   finalized. `model.isFinalized(course)`; `model.normalizeFinalized(x)`.
-- Sample data (`GT.sample.loadInto`) has no final letters, sets `finalized = null`, and gives participation
-  list values (3 … 5 in steps of 0.5; other values are unchanged, each assessment keeps its own PRNG stream).
+- Sample data (`GT.sample.loadInto(course, { lateWork })`) has no final letters, sets `finalized = null`, and
+  gives participation list values (3 … 5 in steps of 0.5; other values are unchanged, each assessment keeps
+  its own PRNG stream). `{ lateWork: true }` adds the two late-work cases of section 7.5 (the course menu's
+  "Load sample data…" passes it); without it the data has no late work, so the default export keeps the old
+  sheet's layout (tests load it both ways).
 
 ## 3. Calculations (`GT.calc`) — K1–K8
 
@@ -535,8 +547,17 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `navigate('history', { studentId })`, `navigate('grades', { studentId, assessmentId })`,
   `navigate('attendance', { studentId })` (selects the student's row; totals mode: their Absent input),
   `navigate('attendance', { section: 'settings' | 'warnings' })` (scrolls to that card).
+  - `navigate('grades', { focus: { studentId, assessmentId } })` is the same as the flat form: it selects
+    that student's raw score cell (or, without a valid `assessmentId`, the student's row in the current
+    column), clears the search, shows withdrawn rows again when the student is withdrawn and they are
+    hidden, scrolls the cell into view and gives it the keyboard focus. The Settings late-work list uses it.
+  - `GT.ui.openLateWork(studentId, assessmentId)` opens the grid's "Late work…" dialog for that score from
+    any view (Student details uses it; section 13).
+  - `GT.ui.openStudent(id)`, `GT.ui.openFinalize()` (section 6.1).
 - Shared widgets: `GT.ui.dialog.confirm/prompt/open`, `GT.ui.toast(message, { type })`,
   `GT.ui.download(filename, blobOrText, mime)`, `GT.ui.loadExcel()`, `GT.ui.icon(name)` (inline SVG).
+- App shell (`js/app.js`): `GT.app.VERSION` ('1.0.0', as in package.json), `GT.app.showShortcuts()`,
+  `GT.app.showAbout()`, `GT.app.SHORTCUTS` (the list the shortcuts dialog shows; section 14).
 
 ### 6.1 Final grades in the UI (STAGE2B, DECISIONS 2, 5–8)
 
@@ -565,7 +586,17 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
     "Order changed: re-sort" (`[data-act="resort"]`, shown when the snapshot differs from a fresh sort).
   - Meeting view (`gridPrefs.meeting`, the previous sort in `gridPrefs.meetingPrev`): No, Last, First, the
     raw scores, Total, the absence columns, participation, Suggested, Final letter, Rank; sorted by Total,
-    high to low; larger text; participation and Final letter marked "fill in the meeting".
+    high to low; larger text; participation and Final letter marked "fill in the meeting". It fits a
+    1280 px window, also for SE 6362 with attendance on (STAGE6 carry-over):
+    - Last Name and First Name are only as wide as the longest name shown needs (`meetingNameWidths`, at
+      most `WM.last` / `WM.first`); a withdrawn student's badge is a short "W" (title "Withdrawn"), and
+      First Name's sticky offset follows Last Name's width (CSS variable `--sc3-left` on the table).
+    - A short item name that ends with a long word ("Term Paper") may wrap; one that ends with a short word
+      ("Project I", "Test 1") stays on one line.
+    - Final letter and Rank are pinned on the right (`position: sticky`, classes `pr pr2` / `pr pr1`, edge
+      line on `pr-first`), so they stay on screen without sideways scrolling whatever the names and the
+      window width; `ensureVisible` scrolls a cell out from under them. Phones (≤ 720 px) and print do not
+      pin them.
   - Absence columns "Excused (allowed)", "Unexcused (not allowed)", "Total absences" (toggles
     `gridPrefs.cols.attExcused / attUnexcused / attTotal`) appear when attendance is not off (per-session
     and totals modes) and read `GT.attendance.summary(course, studentId)` (section 7), cached per render.
@@ -742,6 +773,13 @@ student with 4 **excused** absences never next to each other and no unexcused on
 absences excused by the instructor (medical)"), so the Excused column is not all zeros. The warnings are the
 same with either `excusedCountsTowardStreak` setting: one 'drop', one 'fail'. Each case uses its own random
 stream, so every other value of the sample stays as it was. SE 6362 (off) gets random marks only.
+
+Late work (`loadInto(course, { lateWork: true })`, its own random stream 'late'; STAGE6 §1): exactly two
+cases per dataset, on students without another role:
+1. one active student's Test 1, 1 week late, penalty applied (note "Sample note: Test 1 handed in 1 week
+   late, not pre-approved");
+2. one team's Project I, 1 week late, penalty waived (pre-approved), on the team score, so it reaches every
+   member without an override (the team of the override member is avoided).
 
 ## 8. Export (`GT.exporter`) — E1–E3
 
@@ -1057,7 +1095,17 @@ workbook written by Grade Tracker).
   II 20%" = 17.6 gives 88 while Project II weighs 25%; a note says so; a header of 0% is ignored with a
   note). Text that is not a number is stored as invalid text on a free-entry item (like typing it; counted,
   highlighted, counts as 0) and **skipped** on an item with a drop-down list (DECISIONS 8). A number not on the list is imported and counted
-  as `notOnList` (highlighted afterwards, `calc.scoreDetail().notOnList`). Weeks late: "2", "2 (waived)".
+  as `notOnList` (highlighted afterwards, `calc.scoreDetail().notOnList`). Weeks late (`late:<aid>`,
+  `parseLate`), case-insensitive, a whole number of weeks only (`util.parseCount`):
+  - as exported: "2", "2 (waived)";
+  - as typed: "2 waived", "1 week", "1 wk", "2 weeks late", "2 weeks late, penalty waived",
+    "2 (penalty waived)";
+  - a bare "waived", "(waived)" or "penalty waived" keeps the student's stored weeks late and waives the
+    penalty; with no weeks stored it is reported ('"waived" needs the weeks late, for example "1
+    (waived)"') and ignored;
+  - "0" (or an empty cell with "Empty cells: clear") removes the late work; anything else (fractions, signs,
+    text) is reported and ignored. The weeks are compared with the student's effective entry (team score,
+    override or own score, `calc.resolveEntry`), like the score itself.
   Status: withdrawn / w / wd / dropped / drop / inactive → withdrawn; active / a / enrolled → active; empty →
   active for a new student (for an existing one it follows `emptyCells`); anything else is reported and
   ignored. Final letters through `model.matchLetter` ("b+" → "B+"); letters not in the scale are skipped
@@ -1324,3 +1372,122 @@ Conventions for every course function `f(course, results, …)`:
 - "Apply cutoffs to Settings" writes `simulate(…).scale` (already normalized) into
   `course.settings.letterScale`; this changes only the suggested letters.
 - What-if (ST2) is `calc.neededScore(course, student, assessmentId, letter)` (section 3).
+
+## 11. The Statistics tab (`js/ui/stats.js`, `css/stats.css`) — ST1–ST3, STAGE5 section 2 and Addendum
+
+`GT.views.stats` (tab "Statistics"). Every figure comes from `GT.stats` (section 10) and `GT.calc`; the view
+only lays them out, and each `GT.stats` call is guarded (a missing or incomplete module shows a "loading"
+state, never an error). Active students only; letters are effective letters (toggle on the letter chart).
+Read-only and always available, also when the scores are finalized (the header then says "Scores
+finalized on <date>"; the statistics stay read-only).
+
+- Sections, in order, with a "Jump to" bar: `#st-overview` (the eLearning-style panel: STATISTICS, STATUS
+  DISTRIBUTION, GRADE DISTRIBUTION, the population line "Active students only (n = N)", the Count pill,
+  and a "measure" select: Total, or an item's raw score with the bins in percent of its max),
+  the summary cards (quartiles with a box plot, pass rate with the `passingLetter` badge, average / median /
+  SD), `#st-hist` (histogram, 10- or 5-point bins), `#st-letters` (letter distribution: "Final letters
+  (effective)" or "Suggested (cutoffs)", and "n of N final letters assigned"), `#st-assess` (per assessment),
+  `#st-perf` (top and bottom 5), `#st-teams` (per team, with "Avg unexcused" when attendance is on),
+  `#st-whatif`, `#st-planner`, `#st-border`.
+- Test hooks: panel cells carry `data-stat="<describe key>"` with the exact value in `data-v`, the bins
+  `data-bin`, the status rows `data-status`; the what-if output `[data-wi-out="needs|reached|unreachable"]`
+  with `data-needed`, its every-letter table `[data-wl]`; `GT.views.stats.sandbox()` (a copy of the
+  planner scale) and `lastRenderMs()`.
+- Charts are inline SVG drawn at the card's measured width and colored only through CSS custom properties
+  (light and dark): `role="img"`, `<title>`, `<desc>`, a `<title>` per mark, and "Show as table".
+- What-if (ST2): student (active, "No 12 · name" in the option text), assessment (default: the first empty
+  item with weight > 0) and target letter; the result is `calc.neededScore` (section 3), "on time", with
+  the assumptions in one line and the score needed for every letter.
+- Cutoff planner: a dot plot of the active totals (each dot's `<title>` names the student, "No N" only in
+  privacy mode), the current cutoffs as lines, the largest gaps shaded (`stats.gaps`), and an editable
+  sandbox scale (↑/↓ nudge a cutoff by 0.5, Shift by 0.1; a cutoff that breaks the order is refused,
+  marked `aria-invalid` and blocks Apply). Editing it stores nothing: the lines, the simulated distribution
+  and the "current → simulated" list follow live (`stats.simulate`). "Apply cutoffs to Settings" writes the
+  scale in ONE transaction after a confirm (undo label "Apply cutoffs from the planner"); the letterScale
+  placeholder stays unconfirmed. "Use these as final letters…" asks "Only students without a final letter"
+  (default) or "All active students", shows how many letters change, and calls `model.setFinalLetters` in
+  ONE transaction (undo label "Use planner letters as final letters (students without one)" or "(all
+  active students)", one Ctrl+Z). "Reset sandbox" reloads the
+  stored scale; a scale changed elsewhere while the sandbox is edited keeps the edits, with a note.
+- Borderline: `stats.borderline(…, within)` (default 1; more than 0 and at most 20; Enter saves it).
+- Preferences: `ui.statsPrefs = { binWidth: 10|5, letters: 'effective'|'suggested', within, guide }`.
+  Transient state (measure, what-if choices, sandbox, table toggles) lives in the module.
+- Rendering rebuilds each section's markup as a string and writes a host only when it changed, so autosave
+  notifications cost nothing and a focused input keeps its focus and typed text. 59 students render in
+  well under 50 ms. Empty states: "No course", and "No statistics yet" for a course without active students
+  (links to Students & Teams and "Load sample data…"). Print: the controls are hidden, the charts kept.
+
+## 12. The Summary tab (`js/ui/summary.js`, `css/summary.css`) — D1 printable summary, STAGE6 section 2 and Addendum
+
+`GT.views.summary` (tab "Summary"): a print-first page for the grading meeting.
+
+- Header (course code, title, term, level, the generated date and time, student counts, finalized status);
+  one line naming every unconfirmed placeholder ("Placeholders, not yet confirmed with the instructor (†)");
+  the assessments and weights; the grade settings (cutoffs, rounding, curve, late rule, passing grade,
+  attendance, final letters); the grade table; the statistics (count, mean, median, sample SD, min, max,
+  pass rate, letter distribution); a notes and signature area.
+- Grade table: No, Last Name, First Name, Team, the raw scores (Class/Project Participation always, the
+  others with "Raw scores"), the weighted points (option), Total, the letter, Rank, and Excused,
+  Unexcused and Total absences when attendance is not off. Active students by name, then the withdrawn
+  ones ("Withdrawn (n)" group), marked **W**, with "—" as rank. The letter column is the effective letter:
+  "Letter (suggested)" while no final letter is assigned, else "Final letter", with "—" for active students
+  who have none yet. Marks: ◆ per-member override, late work, streak markers in the absence columns.
+- Options (screen only, `.no-print`): Include withdrawn students (on), Raw scores (on), Weighted scores
+  (off), **Hide names (use No only)** (the name columns are not rendered at all), the landscape hint and
+  **Print…** (`window.print()`). Preferences: `ui.summaryPrefs = { withdrawn, raw, weighted, hideNames }`.
+- Print: a named page (`@page summary`: Letter landscape, 12 mm margins, "Confidential: student grades" and
+  "Page n of N" in the margins) used only when the Summary tab prints; white background and black text also
+  in the dark theme, 10 px table text, `thead { display: table-header-group }`, rows never split, privacy
+  blur off. While printing, the document title is "<course> grade summary <date>" and "Generated" is fresh.
+- Statistics use `GT.stats` when it is loaded (else a small local helper with the same definitions,
+  `GT.views.summary.localDescribe`). Empty states: "No course", "No students in this course yet".
+
+## 13. Late work in the UI (K4) — STAGE6 section 1 and Addendum
+
+- Grades grid (`js/ui/grid.js`): "Late work…" in the cell menu of every raw score cell (Shift+F10, the
+  menu key or right-click; "Late work (1 week)" when set) and **Ctrl+L** (Cmd+L) on the active cell, also
+  while typing a score (it is saved first). The browser's Ctrl+L is blocked only while a grid cell has the
+  focus; elsewhere in the grid Ctrl+L explains that late work belongs to a score. `GT.ui.openLateWork(sid,
+  aid)` opens the same dialog from any view.
+- The dialog (`dialog.late-dialog`): the item and the student (No in the title, the name `pii`), where the
+  entry lives (`.late-where`: "Individual score", "Per-member override (◆)", or "<Team> team score … for the
+  whole team" for a team-graded cell without an override, where the late info goes on the **team entry**
+  and propagates), **Weeks late** (`#late-weeks`, a whole number 0–52, `util.parseCount`, an inline error
+  otherwise), **Penalty waived (pre-approved)** (`#late-waived`), and a live preview (`#late-preview`: "Raw
+  85 − 20 (2 weeks × 10 points) = 65 → weighted 6.5"; "× max ÷ 100" when the max is not 100). Save is ONE
+  `GT.store.transact` with `model.withLate` (history kind 'late'); Esc closes, and the focus returns to
+  the cell. Finalized (`model.isFinalized`): read-only, "Scores are finalized. Unlock them to change late
+  work." Works on drop-down items (participation) too, without special handling.
+- Badges: "L2" (warn tint) = 2 weeks late, penalty applied; "L2✓" (muted, struck-through L) = waived; the
+  cell tooltip gives the penalty and the adjusted score, the weighted cell's tooltip says "Adjusted after
+  late penalty". A column with late work is widened just enough for its badge. The legend shows both marks.
+- Settings: a **Late work** card (`#set-sec-late`): "Points deducted per week late"
+  (`settings.latePointsPerWeek`, ≥ 0, one transaction), the lateWork placeholder badge and note, the rule in
+  words, and the list of every late entry (student or team, item, weeks, waived, penalty) with links to the
+  Grades cell (`navigate('grades', { focus: … })`).
+- Students & Teams: a "Late work" column (item · weeks · penalty or "waived"); Student details show the
+  weeks and the penalty per item, with a button that opens the dialog (`GT.ui.openLateWork`).
+- Export and import: section 8 (`late:<aid>`, the `MAX(0,R-P)/M*W` formula and the cell note) and
+  section 9.4 (the accepted spellings).
+
+## 14. Shell polish: Help / About, shortcuts, terminology, empty states — STAGE6 section 3
+
+- **Help / About** (`GT.app.showAbout()`, the status bar's "Help" button): what the app is, that it works
+  offline and sends nothing, where the data is stored (the storage backend in use; another browser, profile
+  or private window does not see it; clearing site data deletes it), a backup reminder with the last backup
+  date (highlighted when none or older than 7 days), version `GT.app.VERSION` (1.0.0) and a relative
+  `README.md` link (`a.about-readme`, opens the local file). Buttons: Keyboard shortcuts, Download backup,
+  Close.
+- **Keyboard shortcuts** (`?`, the status bar's "Shortcuts" button, or Help → Keyboard shortcuts): grouped
+  "Everywhere", "Grades grid", "Attendance grid (per session)", "Roll call", "Statistics and Import /
+  Export". `GT.app.SHORTCUTS` holds the list; each entry was checked against the key handlers (app.js;
+  grid.js `gridKey` and `editorKey`; attendance.js `gridKey` and the roll call; stats.js planner sandbox;
+  exchange.js column list). Page shortcuts do not run while a text field has the focus or a dialog is
+  open (dialogs keep their own Esc, Enter and, in the session manager, Ctrl+Z).
+- **Terminology** used in every view: "Class/Project Participation" (the item's own name in messages),
+  "Withdrawn" (never "Dropped"; an imported "dropped" status still means withdrawn), "Override" with ◆
+  ("per-member override"), "Team score", "Final letter", "Suggested", "Excused (allowed)" and "Unexcused
+  (not allowed)".
+- **Empty states**: every tab has one for "no course" and for a course without students; Attendance also
+  for "attendance is off" and Statistics for "no active students". The Import / Export tab stays usable
+  without students (an export then has only the header row, and it says so).

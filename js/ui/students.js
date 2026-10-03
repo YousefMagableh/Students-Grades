@@ -603,7 +603,7 @@
       '<div class="callout callout-danger"><strong>This permanently deletes ' + esc(studentRef(s)) + '</strong> (' + nameHtml(s) + ') ' +
       'with their scores (' + plural(scoreCount, 'entry', 'entries') + '), per-member overrides, attendance records (' + plural(marks, 'mark') + ') and absence totals. ' +
       'The change history keeps only a note that the student was deleted.</div>' +
-      '<p class="del-advice">If the student dropped the course, <strong>withdraw</strong> them instead: withdrawn students stay in history and exports and are excluded from statistics.</p>' +
+      '<p class="del-advice">If the student left the course, <strong>withdraw</strong> them instead: withdrawn students stay in history and exports and are excluded from statistics.</p>' +
       '<div class="field"><label for="del-confirm">Type ' + (req === 'DELETE' ? '<strong>DELETE</strong>' : 'the student’s No, <strong>' + esc(req) + '</strong>,') +
       ' to confirm</label><input id="del-confirm" type="text" autocomplete="off" spellcheck="false" inputmode="' + (req === 'DELETE' ? 'text' : 'numeric') + '"></div>';
     var buttons = [];

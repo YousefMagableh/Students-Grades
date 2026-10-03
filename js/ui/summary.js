@@ -485,7 +485,7 @@
     if (d.state !== 'number') return '';
     out = esc(num(d.raw, Math.max(dec, 2)));
     if (d.outOfRange) { used.bad = true; out += mk('!', 'Outside 0–' + num(a.maxScore), 'sum-mk-bad'); }
-    if (d.override) { used.override = true; out += mk('◆', 'Individual override of the team score'); }
+    if (d.override) { used.override = true; out += mk('◆', 'Per-member override of the team score'); }
     if (d.weeksLate > 0) {
       if (d.waived) {
         used.waived = true;
@@ -530,7 +530,7 @@
     if (used.incomplete) add('*', 'Incomplete: an empty score counts as 0');
     if (used.withdrawn) add('W', 'Withdrawn: not counted in rank or statistics');
     if (used.noFinal) add(DASH, 'No final letter assigned yet');
-    if (used.override) add('◆', 'Individual override of the team score');
+    if (used.override) add('◆', 'Per-member override of the team score');
     if (used.late) add('L2', 'Weeks late, penalty applied (the total uses the reduced score)', 'sum-mk-warn');
     if (used.waived) add('L2✓', 'Late, penalty waived', 'sum-mk-waived');
     if (used.over) add('▲', 'Above the absence threshold', 'sum-mk-warn');

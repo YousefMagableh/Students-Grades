@@ -47,6 +47,11 @@
   // Meeting view (larger text, no Team column) uses WM and its own offsets (.gt-grid.meeting .sc2/.sc3).
   var W = { no: 52, last: 106, first: 136, team: 70, total: 74, rank: 54, pct: 90, diff: 62 };
   var WM = { no: 56, last: 128, first: 132, total: 70, rank: 48, final: 90 };
+  // Meeting view: Last and First Name are only as wide as the longest name needs (at most WM.last and
+  // WM.first; meetingNameWidths), and a withdrawn student's badge is a short "W", so the meeting columns
+  // fit at 1280 px (SE 6362 with attendance on). Final letter and Rank are also pinned on the right
+  // (css/grid.css .pr1/.pr2, offsets from WM.rank), so they stay on screen whatever the names and the
+  // window width.
   var HEAD_PAD = 17;   // header cell padding (2 × 8 px) plus slack
   // Meeting view: header cells have 6 px side padding (css/grid.css .gt-grid.meeting thead th) and a
   // placeholder badge may wrap under its text, so the decision columns (Participation, Suggested, Final
@@ -519,16 +524,36 @@
     return out;
   }
 
+  /** Meeting view: { last, first } column widths that fit the longest names shown (15px, weight 550, as
+   * css/grid.css draws them), never wider than WM nor narrower than their headers. A withdrawn
+   * student's first name may shrink to a few letters next to its "W" badge (as it does next to the
+   * "Withdrawn" badge in the other view). */
+  function meetingNameWidths(course, prefs) {
+    var CELL = 20;                         // 2 × 8 px padding, the border and slack
+    var nameW = function (t) { return textWidth(t, 550, 15); };
+    var last = textWidth('Last Name', 700, 12) + 16 + HEAD_PAD_MEET;   // with the sort arrow
+    var first = textWidth('First Name', 700, 12) + HEAD_PAD_MEET;
+    var badge = textWidth('W', 650, 10) + 10 + 2 + 2 + 2;            // .wd-badge: padding, border, margin, gap
+    course.students.forEach(function (s) {
+      var wd = s.status === 'withdrawn';
+      if (wd && !prefs.showWithdrawn) return;
+      last = Math.max(last, nameW(s.lastName || '(no last name)') + CELL);
+      first = Math.max(first, wd ? Math.min(nameW(s.firstName || ''), 24) + badge + CELL : nameW(s.firstName || '') + CELL);
+    });
+    return { last: clamp(Math.ceil(last), 72, WM.last), first: clamp(Math.ceil(first), 72, WM.first) };
+  }
+
   function buildColumns(course, prefs, results) {
     var meet = prefs.meeting;
     var locked = isFinalized(course);
     var late = lateNeeds(course, results, meet ? 15 : 13);
     var w = meet ? WM : W;
     var pad = meet ? HEAD_PAD_MEET : HEAD_PAD;
+    var names = meet ? meetingNameWidths(course, prefs) : w;
     var cols = [
       { key: 'no', kind: 'no', label: 'No', edit: 'text', sticky: 1, width: w.no, num: true },
-      { key: 'last', kind: 'last', label: 'Last Name', edit: 'text', sticky: 2, width: w.last },
-      { key: 'first', kind: 'first', label: 'First Name', edit: 'text', sticky: 3, width: w.first }
+      { key: 'last', kind: 'last', label: 'Last Name', edit: 'text', sticky: 2, width: names.last },
+      { key: 'first', kind: 'first', label: 'First Name', edit: 'text', sticky: 3, width: names.first }
     ];
     if (!meet) cols.push({ key: 'team', kind: 'team', label: 'Team', edit: 'team', sticky: 4, width: W.team });
     // Header names (bold 12px) wrap at spaces, so a column needs room for its longest word; the
@@ -545,8 +570,9 @@
       var maxLine = subW('max ' + num(a.maxScore, 4) + (list.length ? ' · list' : '')) + (meet ? 0 : badgeW('maxScores'));
       // "10% · team" may wrap before "· team" (css/grid.css .hs-w).
       var weightLine = Math.max(subW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a)), a.teamGraded ? subW('· team') : 0);
-      // Meeting view: a short name stays on one line ("Project" / "I" would read badly).
-      var name = meet && String(a.name).length <= 12 ? nameW(a.name) : longestWordW(a.name);
+      // Meeting view: a short name that ends with a short word stays on one line ("Project" / "I" would
+      // read badly); "Term Paper" may wrap at its space.
+      var name = meet && String(a.name).length <= 12 && /(^|\s)\S{1,3}$/.test(String(a.name).trim()) ? nameW(a.name) : longestWordW(a.name);
       // A column with late work makes room for the "L2✓" badge next to the score (only as much as it needs,
       // so the Meeting view still fits at 1280 px).
       return Math.max(clamp(Math.max(name, maxLine, weightLine) + pad, 64, 164), late[a.id] ? Math.min(Math.ceil(late[a.id]), 200) : 0);
@@ -595,6 +621,8 @@
       cols = cols.concat(raws.filter(function (c) { return c.a.category !== 'participation'; }));
       cols.push(total);
       cols = cols.concat(att, part);
+      finalCol.pinR = 2;
+      rank.pinR = 1;
       cols.push(suggested, finalCol, rank);
     } else {
       cols = cols.concat(raws);
@@ -875,8 +903,18 @@
     return right;
   }
 
+  /** Left edge of the columns pinned on the right (Meeting view: Final letter and Rank), or null when
+   * none is pinned (other views, phones and print, where css/grid.css leaves them in place). */
+  function pinnedLeft() {
+    var row = dom.table.tHead && dom.table.tHead.rows[0];
+    var th = row ? row.querySelector('th.pr-first') : null;
+    if (!th || root.getComputedStyle(th).right === 'auto') return null;
+    return th.getBoundingClientRect().left;
+  }
+
   /** Scrolls the grid (and, if needed, the page) so the cell is fully visible below the sticky
-   * header, above the sticky footer and right of the sticky identity columns. */
+   * header, above the sticky footer, right of the sticky identity columns and left of the columns
+   * pinned on the right. */
   function ensureVisible(td) {
     if (!td || !dom || !dom.wrap) return;
     var wrap = dom.wrap;
@@ -890,6 +928,8 @@
     if (root.getComputedStyle(td).position !== 'sticky') {
       var left = Math.max(wr.left + wrap.clientLeft, stickyRight());
       var right = wr.left + wrap.clientLeft + wrap.clientWidth;
+      var pl = pinnedLeft();
+      if (pl !== null) right = Math.min(right, pl);
       if (cr.left < left) wrap.scrollLeft -= (left - cr.left);
       else if (cr.right > right) wrap.scrollLeft += (cr.right - right);
     }
@@ -959,6 +999,15 @@
     return key ? ui.placeholderBadge(course, key, { compact: true }) : '';
   }
 
+  /** Classes of a column pinned on the right (Meeting view): ' pr pr<n>', plus ' pr-first' on the
+   * leftmost one, which draws the edge line. '' for every other column. */
+  function pinClass(col) {
+    if (!col.pinR) return '';
+    var maxPin = 0;
+    layout.cols.forEach(function (c) { if (c.pinR > maxPin) maxPin = c.pinR; });
+    return ' pr pr' + col.pinR + (col.pinR === maxPin ? ' pr-first' : '');
+  }
+
   function headHtml(ctx) {
     var course = ctx.course, prefs = layout.prefs, dec = ctx.dec;
     var h = '<colgroup>';
@@ -967,7 +1016,7 @@
     ctx.cols.forEach(function (col, i) {
       var cls = 'h-' + col.kind + (col.sticky ? ' sc sc' + col.sticky : '') + (col.group ? ' g g' + col.group : '') +
         (col.ro ? ' ro' : '') + (col.num ? ' num' : '') + (col.toFill ? ' to-fill' : '') +
-        (col.sticky && col.sticky === ctx.nId ? ' sc-last' : '');
+        (col.sticky && col.sticky === ctx.nId ? ' sc-last' : '') + pinClass(col);
       var inner = '', title = '', aria = '';
       var a = col.a;
       var fillTag = col.toFill ? '<span class="h-sub h-fill">fill in the meeting</span>' : '';
@@ -1118,7 +1167,12 @@
           cls = 'c-first sc sc3';
           body = s.firstName ? '<span class="pii">' + esc(s.firstName) + '</span>' : '';
           // Withdrawn: the name shrinks (ellipsis) so the badge always stays visible.
-          if (wd) body = '<span class="fn-wd">' + body + '<span class="badge wd-badge">Withdrawn</span></span>';
+          // The Meeting view (narrower name columns) shows a short "W" badge.
+          if (wd) {
+            body = '<span class="fn-wd">' + body + (layout.prefs.meeting
+              ? '<span class="badge wd-badge" title="Withdrawn"><span aria-hidden="true">W</span><span class="sr-only">Withdrawn</span></span>'
+              : '<span class="badge wd-badge">Withdrawn</span>') + '</span>';
+          }
           break;
         case 'team':
           cls = 'c-team sc sc4';
@@ -1271,6 +1325,7 @@
           cls = '';
       }
       if (col.sticky && col.sticky === ctx.nId) cls += ' sc-last';
+      cls += pinClass(col);
       h += '<td role="gridcell" data-c="' + i + '" class="' + cls + '"' + (ro ? ' aria-readonly="true"' : '') +
         (title ? ' title="' + esc(title) + '"' : '') + '>' + body + '</td>';
     }
@@ -1292,7 +1347,7 @@
       ui.icon('users', 'icon-sm') + ' <span class="tl-name">' + esc(team ? team.name : 'No team') + '</span><span class="tl-meta"> · ' +
       plural(all.length, 'member') + (wd ? ' (' + wd + ' withdrawn)' : '') + ' · team average ' + avg + '</span></th>';
     for (var i = ctx.nId; i < cols.length; i++) {
-      var col = cols[i], inner = '', cls = 'tr-cell' + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '');
+      var col = cols[i], inner = '', cls = 'tr-cell' + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '') + pinClass(col);
       if (team && col.kind === 'raw' && col.a.teamGraded) {
         var e = model.getEntry(course.teamScores, team.id, col.aid);
         var p = calc.parseEntry(e);
@@ -1317,7 +1372,7 @@
       'Class average <span class="muted">(active)</span></th>';
     for (var i = ctx.nId; i < cols.length; i++) {
       var col = cols[i], v = '', title = '';
-      var cls = 'f-' + col.kind + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '');
+      var cls = 'f-' + col.kind + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '') + pinClass(col);
       if (col.kind === 'raw' || col.kind === 'weighted') {
         var sum = 0, n = 0;
         active.forEach(function (s) {
@@ -1586,7 +1641,7 @@
     return ui.icon('lock') + '<span class="glb-text"><strong>Scores finalized' +
       (fz.at ? ' on ' + esc(ui.dateTime(fz.at)) : '') + '.</strong> Score cells are locked; final letters stay editable.' +
       (note ? ' <span class="muted glb-note"' + (shortNote !== note ? ' title="' + esc(note) + '"' : '') + '>Note: ' + esc(shortNote) + '</span>' : '') +
-      (nPart ? '<span class="glb-part">' + ui.icon('alert', 'icon-sm') + 'Participation is empty for ' + esc(plural(nPart, 'active student')) +
+      (nPart ? '<span class="glb-part">' + ui.icon('alert', 'icon-sm') + esc(participationName(course)) + ' is empty for ' + esc(plural(nPart, 'active student')) +
         ' and is locked too. To set it in the meeting, unlock the scores first.</span>' : '') +
       '</span><button type="button" class="btn btn-sm" data-act="unlock">' + ui.icon('lock') + 'Unlock scores…</button>';
   }
@@ -1658,6 +1713,9 @@
     table.setAttribute('aria-label', 'Grades for ' + course.code);
     table.classList.toggle('grouped', layout.prefs.grouped);
     table.classList.toggle('meeting', layout.prefs.meeting);
+    // Meeting view: First Name is pinned right after No and Last Name, whose width fits the names.
+    if (layout.prefs.meeting) table.style.setProperty('--sc3-left', (layout.cols[0].width + layout.cols[1].width) + 'px');
+    else table.style.removeProperty('--sc3-left');
     table.classList.toggle('locked', ctx.locked);
     if (dom.resort && dom.resort.hidden !== !layout.stale) {
       dom.resort.hidden = !layout.stale;
@@ -3492,6 +3550,12 @@
   }
 
   /** Active students with an empty participation cell (the "fill in the meeting" column). */
+  /** The name of the course's participation item ("Class/Project Participation" in both templates). */
+  function participationName(course) {
+    var a = course ? course.assessments.filter(function (x) { return x.category === 'participation'; })[0] : null;
+    return a && a.name ? a.name : 'Class/Project Participation';
+  }
+
   function emptyMeetingCells(course, results) {
     var n = 0;
     var part = course.assessments.filter(function (a) { return a.category === 'participation' && (a.weight || 0) > 0; });
@@ -3702,7 +3766,7 @@
     var p = getPrefs();
     if (!p.meeting) {
       setPrefs({ meeting: true, meetingPrev: p.sort + ':' + p.dir, sort: 'total', dir: 'desc' });
-      gridToast('Meeting view: sorted by total, high to low. Participation and Final letter are highlighted to fill in the meeting.', { type: 'info', timeout: 5000 });
+      gridToast('Meeting view: sorted by total, high to low. ' + participationName(cur()) + ' and Final letter are highlighted to fill in the meeting.', { type: 'info', timeout: 5000 });
     } else {
       var prev = String(p.meetingPrev || '').split(':');
       var patch = { meeting: false, meetingPrev: '' };

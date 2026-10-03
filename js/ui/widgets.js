@@ -270,7 +270,8 @@
 
   /** Form dialog. fields: [{ name, label, type: 'text'|'number'|'select'|'checkbox'|'textarea'|'date',
    *  value, options: [{ value, label }], placeholder, help, min, max, step, required, pii }].
-   *  validate(values) -> error string | null. Resolves with a values object or null. */
+   *  validate(values) -> error string | null. onMount(dlgEl) runs once the dialog is open (a field's
+   *  control is [name="<field name>"]). Resolves with a values object or null. */
   dialog.form = function (opts) {
     var o = opts || {};
     var html = (o.introHtml || '') + (o.fields || []).map(function (f, i) {
@@ -311,6 +312,7 @@
       title: o.title,
       bodyHtml: html,
       wide: o.wide,
+      onMount: o.onMount ? function (dlg) { o.onMount(dlg); } : null,
       buttons: [
         { text: o.cancelText || 'Cancel', value: null },
         {

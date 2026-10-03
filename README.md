@@ -80,7 +80,7 @@ assigned, they are the grades (the export uses them, and so will the statistics,
    and is picked from a drop-down list: 5, 4.5, 4 … 0. Typing a value from the list also works; anything else
    is refused, so no typo can be stored. Each assessment's list can be turned on or off in **Settings**.
 2. Optional: **Meeting view** (Grades tab) shows only the scores, Total, absences, participation, the
-   suggested and final letters and the rank, in larger text, sorted by total.
+   suggested and final letters and the rank, in larger text, sorted by total. Final letter and Rank stay pinned at the right edge.
 3. **Finalize scores…** (Grades tab, or Settings → Grading status) checks for missing or invalid scores,
    then locks the score cells so they cannot change by accident, and sorts by total, high to low.
    Participation is a score too: set it before finalizing, or unlock first.
@@ -310,7 +310,8 @@ student, text, dates) and **Export CSV** are at the top.
 
 ## Keyboard shortcuts
 
-Press **?** in the app for the full list. The main ones:
+Press **?** in the app (or **Help** in the status bar at the bottom) for the full list, grouped by where each
+shortcut works. The main ones:
 
 | Keys | Action |
 | --- | --- |

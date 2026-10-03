@@ -70,9 +70,10 @@ async function ready() {
 }
 
 /** Closes stray dialogs and menus, then replaces all data with the SE 4351 sample course on the
- * Grades tab (light theme, privacy off). Every check that needs data starts here. */
-async function resetSample() {
-  await page.evaluate(() => {
+ * Grades tab (light theme, privacy off). Every check that needs data starts here.
+ * opts.lateWork: also load the two sample late-work cases (as the course menu's "Load sample data" does). */
+async function resetSample(opts = {}) {
+  await page.evaluate((o) => {
     document.querySelectorAll('dialog').forEach((d) => { try { d.close(); } catch (e) { /* closed */ } d.remove(); });
     if (GT.ui.closeMenu) GT.ui.closeMenu();
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
@@ -80,9 +81,9 @@ async function resetSample() {
     st.ui.theme = 'light';
     st.meta.lastBackupAt = new Date().toISOString(); // keep the backup reminder banner out of the way
     GT.store.replaceState(st, 'test');
-    GT.store.transact('Load sample data', (c) => GT.sample.loadInto(c), { source: 'sample', historyMode: 'bulk' });
+    GT.store.transact('Load sample data', (c) => GT.sample.loadInto(c, { lateWork: !!o.lateWork }), { source: 'sample', historyMode: 'bulk' });
     GT.app.navigate('grades');
-  });
+  }, opts);
   // The rows must be the new students (sample ids are new on every load), not the previous table.
   await page.waitForFunction((n) => {
     const rows = [...document.querySelectorAll('.gt-grid tbody tr.gr')];
@@ -442,6 +443,117 @@ async function withLocalStoragePage(init, arg, fn) {
   }
 }
 
+// Stage 5 helpers: the Statistics tab.
+
+/** Resolves once the app has drawn the current data: a store change re-renders on the next animation
+ * frame (app.js requestRender), so two frames later every view shows it. For checks that expect the
+ * screen NOT to change (a withdrawn student's edit), where there is nothing new to wait for. */
+function rendered() {
+  return page.evaluate(() => new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res))));
+}
+
+/** Opens the Statistics tab and waits until its panel counts the active students of the current data. */
+async function gotoStats() {
+  await gotoView('stats');
+  await page.waitForFunction(() => {
+    const el = document.querySelector('#st-overview [data-stat="count"]');
+    return el && Number(el.getAttribute('data-v')) === GT.stats.activeTotals(GT.store.course(), GT.store.results()).length;
+  });
+}
+
+/** The eLearning-style panel as shown: { <stat>: { v (data-v), text } }, bins (the 12 counts, panel
+ * order) and status ({ <key>: count } of STATUS DISTRIBUTION). */
+function statsPanel() {
+  return page.evaluate(() => {
+    const out = { bins: [], status: {} };
+    document.querySelectorAll('#st-overview [data-stat]').forEach((td) => {
+      out[td.getAttribute('data-stat')] = { v: td.getAttribute('data-v'), text: td.textContent.trim() };
+    });
+    out.bins = [...document.querySelectorAll('#st-overview [data-bin]')].map((td) => Number(td.textContent.trim()));
+    document.querySelectorAll('#st-overview [data-status]').forEach((td) => { out.status[td.getAttribute('data-status')] = Number(td.textContent.trim()); });
+    return out;
+  });
+}
+
+// Stage 6 helpers: late work and the Summary tab.
+
+/** Selects a grid cell and opens "Late work…" with Ctrl+L; returns the dialog. */
+async function openLateWork(sid, c) {
+  await gridCell(sid, c).click();
+  await page.keyboard.press('Control+l');
+  const dlg = page.locator('dialog[open].late-dialog');
+  await dlg.waitFor();
+  return dlg;
+}
+
+/** Opens the Summary tab and waits until its grade table shows the current students. */
+async function gotoSummary() {
+  await gotoView('summary');
+  await page.waitForFunction(() => {
+    const t = document.querySelector('.view-summary .sum-grades');
+    const ids = new Set(GT.store.course().students.map((s) => s.id));
+    const rows = t ? [...t.querySelectorAll('tbody tr[data-sid]')] : [];
+    return rows.length > 0 && rows.every((tr) => ids.has(tr.getAttribute('data-sid')));
+  });
+}
+
+/** The Summary grade table as shown: rows top to bottom { sid, wd, no, total, letter, rank } and the
+ * letter column's header. Footnote markers (<sup>) are left out of the cell text. */
+function summaryTable() {
+  return page.evaluate(() => {
+    const t = document.querySelector('.view-summary .sum-grades');
+    const txt = (el) => (el ? [...el.childNodes].filter((n) => !(n.nodeType === 1 && n.tagName === 'SUP')).map((n) => n.textContent).join('').trim() : null);
+    const rows = [...t.querySelectorAll('tbody tr[data-sid]')].map((tr) => ({
+      sid: tr.getAttribute('data-sid'), wd: tr.classList.contains('sum-wd'), no: txt(tr.querySelector('.sum-c-no')),
+      total: txt(tr.querySelector('.sum-c-total')), letter: txt(tr.querySelector('.sum-c-letter')), rank: txt(tr.querySelector('.sum-c-rank'))
+    }));
+    return { rows, letterHead: t.querySelector('thead th.sum-c-letter').textContent.replace(/\s+/g, ' ').trim() };
+  });
+}
+
+/** What the Summary should show for every student: active students by name, then the withdrawn ones
+ * (letter "W", no rank); the letter is the effective one, "—" for a student without a final letter
+ * once some final letters exist. */
+function summaryExpected() {
+  return page.evaluate(() => {
+    const c = GT.store.course(), r = GT.store.results(), d = c.settings.decimals;
+    const sorted = GT.calc.sortStudents(c, r, 'name', 'asc');
+    const anyFinal = r.letterSummary.assigned > 0;
+    return sorted.filter((s) => r.byId[s.id].active).concat(sorted.filter((s) => !r.byId[s.id].active)).map((s) => {
+      const x = r.byId[s.id];
+      return {
+        sid: s.id, wd: !x.active, no: String(s.no), total: GT.util.formatNumber(x.total, d, { fixed: true }),
+        letter: !x.active ? 'W' : anyFinal ? (s.finalLetter || '—') : x.effectiveLetter,
+        rank: x.rank === null ? '—' : String(x.rank)
+      };
+    });
+  });
+}
+
+/** Writes a letter over cells of the "Letter Grade" column of an exported .xlsx, as a spreadsheet user
+ * would: edits(ws, col, rowOf) changes the sheet, then the copy is saved as dst. */
+async function editExport(src, dst, edits) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(fs.readFileSync(src));
+  const ws = wb.getWorksheet('Grades');
+  const header = ws.getRow(1).values.slice(1);
+  const col = (name) => header.indexOf(name) + 1;
+  const rowOf = (last, first) => {
+    for (let r = 2; r <= ws.rowCount; r++) {
+      if (ws.getCell(r, col('Last Name')).value === last && ws.getCell(r, col('First Name')).value === first) return r;
+    }
+    throw new Error('no row for ' + last + ', ' + first);
+  };
+  await edits(ws, col, rowOf);
+  fs.writeFileSync(dst, Buffer.from(await wb.xlsx.writeBuffer()));
+}
+
+/** The cached text of a cell (a formula's result, or its value). */
+function cellValue(cell) {
+  const v = cell.value;
+  return v && typeof v === 'object' && 'result' in v ? v.result : v;
+}
+
 // ------------------------------------------------------------------ checks
 
 async function run() {
@@ -720,6 +832,101 @@ async function run() {
     await page.click('#btn-redo');
     assert.equal(await t2(), 55);
     assert.ok((await historyCount()) === n + 4, 'history is append-only: undo/redo add entries');
+  });
+
+  await check('course menu (C3): add a course from the SE 6362 template (graduate), rename it, duplicate it and delete it; the other courses keep their data', async () => {
+    await resetSample();
+    const before = await page.evaluate(() => GT.store.state.courses.map((c) => c.id + ':' + c.students.length + ':' + c.history.length));
+    await openMenuItem('#btn-course-menu', 'Add course');
+    let dlg = page.locator('dialog[open]', { hasText: 'Add course' });
+    await dlg.waitFor();
+    await dlg.locator('[name="template"]').selectOption('SE6362');
+    assert.equal(await dlg.locator('[name="level"]').inputValue(), 'graduate', 'the template sets its level');
+    await dlg.locator('[name="code"]').fill('SE 9999');
+    await dlg.locator('[name="title"]').fill('Smoke Course');
+    await dlg.locator('.btn-primary').click();
+    await page.waitForFunction(() => GT.store.course().code === 'SE 9999');
+    const added = await page.evaluate(() => {
+      const c = GT.store.course();
+      return { id: c.id, n: GT.store.state.courses.length, students: c.students.length, level: c.level, title: c.title,
+        letters: GT.model.scaleLetters(c).join(' '), paper: c.assessments.some((a) => a.id === 'a_paper') };
+    });
+    const { id: addedId, ...shape } = added;
+    assert.ok(addedId);
+    assert.deepEqual(shape, { n: 3, students: 0, level: 'graduate', title: 'Smoke Course', letters: 'A A- B+ B B- C+ C F', paper: true });
+    await page.locator('#view .empty-state, #view .grid-empty').first().waitFor();
+    await openMenuItem('#btn-course-menu', 'Edit course details');
+    dlg = page.locator('dialog[open]', { hasText: 'Edit course details' });
+    await dlg.waitFor();
+    await dlg.locator('[name="title"]').fill('Smoke Course Renamed');
+    await dlg.locator('.btn-primary').click();
+    await page.waitForFunction(() => GT.store.course().title === 'Smoke Course Renamed' && /Smoke Course Renamed/.test(document.querySelector('#course-select option:checked').textContent));
+    await openMenuItem('#btn-course-menu', 'Duplicate course');
+    await page.waitForFunction((id) => GT.store.state.courses.length === 4 && GT.store.course().id !== id, added.id);
+    const copy = await page.evaluate(() => ({ id: GT.store.course().id, title: GT.store.course().title }));
+    assert.equal(copy.title, 'Smoke Course Renamed');
+    // Delete the copy and the added course (typed confirmation).
+    for (const id of [copy.id, added.id]) {
+      await page.selectOption('#course-select', id);
+      await page.waitForFunction((x) => GT.store.course().id === x, id);
+      const code = await page.evaluate(() => GT.store.course().code);
+      await openMenuItem('#btn-course-menu', 'Delete course');
+      dlg = page.locator('dialog[open]', { hasText: 'Delete course' });
+      await dlg.waitFor();
+      await page.fill('#dlg-require', code);
+      await dlg.locator('.btn-primary').click();
+      await page.waitForFunction((x) => !GT.store.state.courses.some((c) => c.id === x), id);
+    }
+    assert.deepEqual(await page.evaluate(() => GT.store.state.courses.map((c) => c.id + ':' + c.students.length + ':' + c.history.length)), before);
+  });
+
+  await check('Paste roster (S3): No, Last Name, First Name and Team copied from Excel add the students and their new teams in one undoable step', async () => {
+    await resetSample();
+    const other = await page.evaluate(() => GT.store.state.courses.find((c) => c.template === 'SE6362').id);
+    await page.selectOption('#course-select', other);
+    await page.waitForFunction((id) => GT.store.course().id === id && GT.store.course().students.length === 0, other);
+    await gotoView('students');
+    await page.locator('.view-students [data-act="paste"]').first().click();
+    const dlg = page.locator('dialog[open].roster-dlg');
+    await dlg.waitFor();
+    await page.fill('#rp-text', 'No\tLast Name\tFirst Name\tTeam\r\n1\tRoster\tOne\tTeam 1\r\n2\tRoster\tTwo\tTeam 1\r\n3\tRoster\tThree\tTeam 2\r\n');
+    await page.waitForFunction(() => /^Add 3 students$/.test(document.querySelector('dialog[open] .dlg-foot .btn-primary').textContent));
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await page.waitForFunction(() => GT.store.course().students.length === 3);
+    const got = await page.evaluate(() => {
+      const c = GT.store.course();
+      return c.students.map((s) => [s.no, s.lastName, s.firstName, (GT.model.findTeam(c, s.teamId) || {}).name, s.status]);
+    });
+    assert.deepEqual(got, [[1, 'Roster', 'One', 'Team 1', 'active'], [2, 'Roster', 'Two', 'Team 1', 'active'], [3, 'Roster', 'Three', 'Team 2', 'active']]);
+    assert.equal(await page.evaluate(() => GT.store.undoLabel()), 'Paste roster');
+    await page.click('#btn-undo');
+    await page.waitForFunction(() => GT.store.course().students.length === 0 && GT.store.course().teams.length === 0);
+  });
+
+  await check('Grades search box and "Group by team" (G1, G3): the search filters the rows; grouping puts each student under a team row', async () => {
+    await resetSample();
+    await page.fill('.grid-toolbar .grid-search', 'Student 05');
+    await page.waitForFunction(() => document.querySelectorAll('.gt-grid tbody tr.gr').length === 1);
+    const hit = await page.evaluate(() => GT.model.findStudent(GT.store.course(), document.querySelector('.gt-grid tbody tr.gr').getAttribute('data-sid')).lastName);
+    assert.equal(hit, 'Student 05');
+    await page.fill('.grid-toolbar .grid-search', '');
+    await page.waitForFunction((n) => document.querySelectorAll('.gt-grid tbody tr.gr').length === n, SAMPLE_STUDENTS);
+    await page.click('.grid-toolbar [data-act="group"]');
+    await page.waitForFunction(() => document.querySelectorAll('.gt-grid tbody tr.team-row').length >= GT.store.course().teams.length);
+    const misplaced = await page.evaluate(() => {
+      const c = GT.store.course(), bad = [];
+      let team = null;
+      document.querySelectorAll('.gt-grid tbody tr').forEach((tr) => {
+        if (tr.classList.contains('team-row')) { team = tr.querySelector('.tl-name').textContent; return; }
+        const s = GT.model.findStudent(c, tr.getAttribute('data-sid'));
+        const t = s && GT.model.findTeam(c, s.teamId);
+        if ((t ? t.name : 'No team') !== team) bad.push(s ? s.lastName : tr.getAttribute('data-sid'));
+      });
+      return bad;
+    });
+    assert.deepEqual(misplaced, []);
+    await page.click('.grid-toolbar [data-act="group"]');
+    await page.waitForFunction(() => !document.querySelector('.gt-grid tbody tr.team-row'));
   });
 
   // -------------------------------------------------------------- stage 2b: drop-down cells, final letters, finalize
@@ -1200,6 +1407,68 @@ async function run() {
     await page.waitForFunction(() => !document.querySelector('.gt-grid.meeting'));
   });
 
+  await check('Meeting view at 1280 px, SE 6362 with attendance on: every column fits; with long names, Final letter and Rank stay pinned on screen', async () => {
+    // STAGE6 carry-over: the graduate course has one more item (Term Paper), so its meeting columns were
+    // 78 px too wide with the absence columns, and Final letter and Rank were off screen.
+    await resetSample();
+    const cid = await page.evaluate(() => {
+      const c = GT.store.state.courses.find((x) => x.template === 'SE6362');
+      GT.store.setActiveCourse(c.id);
+      GT.store.transact('Load sample data', (co) => GT.sample.loadInto(co, { lateWork: true }), { source: 'sample', historyMode: 'bulk', courseId: c.id });
+      GT.store.transact('Attendance on', (co) => GT.attendance.setMode(co, 'per-session'), { courseId: c.id });
+      return c.id;
+    });
+    await page.waitForFunction((id) => GT.store.course().id === id && document.querySelectorAll('.gt-grid tbody tr.gr').length === GT.store.course().students.length &&
+      document.querySelector('.gt-grid thead th.h-attUnx'), cid);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => document.querySelector('.gt-grid.meeting thead th.h-attUnx'));
+    const measure = () => page.evaluate(() => {
+      const t = document.querySelector('.gt-grid.meeting'), wrap = t.closest('.grid-wrap');
+      const wr = wrap.getBoundingClientRect();
+      const left = wr.left + wrap.clientLeft, right = left + wrap.clientWidth;
+      const box = (el) => { const b = el.getBoundingClientRect(); return { l: Math.round(b.left), r: Math.round(b.right) }; };
+      const row = t.querySelector('tbody tr.gr:not(.row-withdrawn)');
+      return {
+        left: Math.round(left), right: Math.round(right), overflow: wrap.scrollWidth - wrap.clientWidth, scrollLeft: wrap.scrollLeft,
+        final: box(t.querySelector('thead th.h-final')), rank: box(t.querySelector('thead th.h-rank')),
+        finalTd: box(row.querySelector('td.c-final')), rankTd: box(row.querySelector('td.c-rank')),
+        clipped: [...t.querySelectorAll('thead th')].filter((th) => th.scrollWidth > th.clientWidth + 1).map((th) => th.className),
+        names: [...t.querySelectorAll('tbody tr.gr:not(.row-withdrawn) td.c-last, tbody tr.gr:not(.row-withdrawn) td.c-first')]
+          .filter((td) => td.scrollWidth > td.clientWidth).map((td) => td.textContent)
+      };
+    });
+    const m = await measure();
+    assert.ok(m.overflow <= 0, 'the meeting grid scrolls sideways: ' + JSON.stringify(m));
+    for (const k of ['final', 'rank', 'finalTd', 'rankTd']) assert.ok(m[k].r <= m.right && m[k].l >= m.left, k + ' is off screen: ' + JSON.stringify(m));
+    assert.deepEqual(m.clipped, [], 'header text is clipped');
+    assert.deepEqual(m.names, [], 'names are cut off');
+    // Names longer than the meeting columns allow: the table is wider than the window again, and Final
+    // letter and Rank stay pinned on the right edge (sticky), without scrolling sideways.
+    const long = await page.evaluate(() => {
+      const s = GT.store.course().students.find((x) => x.status === 'active');
+      GT.store.transact('Long names', (c) => { const t = GT.model.findStudent(c, s.id); t.lastName = 'Abcdefghijklmnopqrstuvwxyz-Abcdefgh'; t.firstName = 'Abcdefghijklmnopqrstuvwxyz'; });
+      return s.id;
+    });
+    await page.waitForFunction(() => { const w = document.querySelector('.gt-grid.meeting').closest('.grid-wrap'); return w.scrollWidth > w.clientWidth; });
+    await page.evaluate(() => { document.querySelector('.gt-grid.meeting').closest('.grid-wrap').scrollLeft = 0; });
+    const p = await measure();
+    assert.equal(p.scrollLeft, 0);
+    for (const k of ['final', 'rank', 'finalTd', 'rankTd']) assert.ok(p[k].r <= p.right && p[k].l >= p.left, k + ' is not pinned on screen: ' + JSON.stringify(p));
+    assert.ok(p.final.r <= p.rank.l + 1, 'Final letter and Rank overlap');
+    // Moving with the keyboard to a column under the pinned ones scrolls it out from under them.
+    const totalC = await gridCol('total');
+    const sugC = await gridCol('letter');
+    await gridCell(long, totalC).click();
+    for (let i = Number(totalC); i < Number(sugC); i++) await page.keyboard.press('ArrowRight');
+    await page.waitForFunction(([id, c]) => {
+      const td = document.querySelector('.gt-grid tbody tr[data-sid="' + id + '"] td[data-c="' + c + '"]');
+      const fin = document.querySelector('.gt-grid tbody tr[data-sid="' + id + '"] td.c-final');
+      return td && td.classList.contains('is-active') && td.getBoundingClientRect().right <= fin.getBoundingClientRect().left + 1;
+    }, [long, sugC]);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => !document.querySelector('.gt-grid.meeting'));
+  });
+
   await check('Unlock scores asks first, is logged in History, and score cells are editable again', async () => {
     await resetSample();
     // Finalize from Settings → Grading status: it opens the Grades tab's Finalize dialog.
@@ -1422,7 +1691,8 @@ async function run() {
       try {
         const r0 = GT.views.grades.lastRenderMs();
         GT.store.transact('Edit Test 1', (c) => GT.model.setEntry(c.scores, sid, 'a_t1', { value: 11 }));
-        await new Promise((res) => requestAnimationFrame(() => setTimeout(res, 50)));
+        // The view re-renders on the next animation frame; a frame callback added now runs after it.
+        await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
         const render = { ...calls, rendered: GT.views.grades.lastRenderMs() !== r0 || calls.courseSummary > 0 };
         calls.summary = 0; calls.courseSummary = 0;
         const dt = new DataTransfer();
@@ -1831,6 +2101,7 @@ async function run() {
   // ---------------------------------------------------------------- stage 4: export and import
 
   let exportedCsv = null; // the CSV of the next check, imported by the one after it
+  let excelFromVendor = false; // set once an .xlsx export has loaded ExcelJS from vendor/ (checked at the end)
 
   await check('Export: the default preset downloads an .xlsx with the previous sheet\'s columns, real formulas that give the app\'s totals and letters, a frozen header and a filter (ExcelJS from file://, offline)', async () => {
     await resetSample();
@@ -1851,6 +2122,7 @@ async function run() {
     assert.ok(lib.ready, 'ExcelJS did not initialize');
     assert.deepEqual(lib.src, [new URL('vendor/exceljs.min.js', APP_URL).href], 'ExcelJS must come from the local vendor folder');
     assert.deepEqual(network.slice(net0), [], 'the export made network requests');
+    excelFromVendor = true;
 
     const { wb, ws, header } = await readXlsx(x.file);
     assert.deepEqual(header, PREVIOUS_LAYOUT);
@@ -2066,6 +2338,593 @@ async function run() {
     assert.deepEqual(added.map((e) => [e.source, e.field]), [['import', 'Final letter'], ['import', 'Final letter']]);
   });
 
+  await check('Import (review V4R3-1): a letter typed into "Letter Grade" of an "Everything" export is imported as the final letter, or reported when "Final Letter" disagrees', async () => {
+    await resetSample();
+    // X has no final letter before the export; Y has one.
+    const who = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const act = GT.calc.sortStudents(c, r, 'name', 'asc').filter((s) => s.status === 'active');
+      const x = act[0], y = act[1];
+      const yFinal = r.byId[y.id].letter === 'B' ? 'B-' : 'B';
+      GT.store.transact('Final letter', (cc) => GT.model.setFinalLetter(cc, y.id, yFinal));
+      const other = (l) => (l === 'D' ? 'C' : 'D');
+      return {
+        x: { id: x.id, last: x.lastName, first: x.firstName, typed: other(r.byId[x.id].letter) },
+        y: { id: y.id, last: y.lastName, first: y.firstName, final: yFinal, typed: other(yFinal) }
+      };
+    });
+    await gotoView('exchange');
+    await page.selectOption('#xc-preset', 'builtin:everything');
+    await page.waitForFunction(() => JSON.stringify(GT.views.exchange.exportKeys()) === JSON.stringify(GT.exporter.builtInPresets(GT.store.course())[2].columns));
+    const x = await downloadFrom('#xc-dl-xlsx', 'everything');
+    const dst = path.join(TMP, 'everything-typed.xlsx');
+    await editExport(x.file, dst, (ws, col, rowOf) => {
+      ['Letter Grade', 'Suggested Letter (cutoffs)', 'Final Letter'].forEach((h) => assert.ok(col(h) > 0, 'the "Everything" export has ' + h));
+      const cx = ws.getCell(rowOf(who.x.last, who.x.first), col('Letter Grade'));
+      const cy = ws.getCell(rowOf(who.y.last, who.y.first), col('Letter Grade'));
+      assert.match(noteText(cx.note), /^Suggestion from the cutoffs: /);
+      assert.match(noteText(cy.note), /^Final letter assigned by the instructor/);
+      cx.value = who.x.typed; // typed over a suggestion: "Final Letter" is empty for X
+      cy.value = who.y.typed; // typed over Y's final letter: "Final Letter" still has the old one
+    });
+    const h0 = await historyCount();
+    await importThroughCard(dst, {
+      atMapping: async (st) => {
+        const header = (await readXlsx(dst)).header;
+        assert.equal(st.mapping[header.indexOf('Letter Grade')], 'ignore');
+        assert.equal(st.mapping[header.indexOf('Final Letter')], 'finalLetter');
+        const notes = (await page.locator('.xc-map-notes').innerText()).replace(/\s+/g, ' ');
+        assert.match(notes, /Column [A-Z]+ \("Letter Grade"\) has 1 letter changed in the spreadsheet after the export\. It is imported as the final letter when column [A-Z]+ \("Final Letter"\) is empty for that student\./);
+      },
+      atPreview: async (st) => {
+        assert.equal(st.counts.lettersFromOtherColumn, 1);
+        assert.equal(st.counts.lettersNotImported, 1);
+        const tiles = (await page.locator('.xc-counts').innerText()).replace(/\s+/g, ' ');
+        assert.match(tiles, /1 final letter taken from another letter column/);
+        assert.match(tiles, /1 final letter not imported/);
+        const issues = await page.locator('.xc-issues').innerText();
+        assert.ok(issues.includes('gives ' + who.y.typed + ', but final letters are read from column'), 'the conflict is reported: ' + issues);
+      }
+    });
+    assert.deepEqual(await finalLetters([who.x.id, who.y.id]), [who.x.typed, who.y.final]);
+    // (Absence totals of the file are stored too: this course records attendance per session.)
+    const letters = (await historySince(h0)).filter((e) => e.field === 'Final letter');
+    assert.deepEqual(letters.map((e) => [e.source, e.studentId, e.newValue]), [['import', who.x.id, who.x.typed]]);
+  });
+
+  await check('Import (review V4R3-2): step 3 counts the letters marked as final letters and those typed in after the export apart', async () => {
+    await resetSample();
+    await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const s = GT.calc.sortStudents(c, r, 'name', 'asc').filter((x) => x.status === 'active')[10];
+      GT.store.transact('Final letter', (cc) => GT.model.setFinalLetter(cc, s.id, r.byId[s.id].letter === 'A' ? 'B' : 'A'));
+    });
+    await gotoView('exchange');
+    assert.equal(await page.inputValue('#xc-preset'), 'builtin:previous');
+    const x = await downloadFrom('#xc-dl-xlsx', 'marked');
+    const dst = path.join(TMP, 'marked-typed.xlsx');
+    await editExport(x.file, dst, (ws, col) => {
+      let typed = 0;
+      for (let r = 2; r <= ws.rowCount && typed < 2; r++) {
+        const cell = ws.getCell(r, col('Letter Grade'));
+        if (/^Final letter assigned/.test(noteText(cell.note)) || !cellValue(cell)) continue;
+        cell.value = cellValue(cell) === 'D' ? 'C' : 'D';
+        typed++;
+      }
+      assert.equal(typed, 2);
+    });
+    await page.setInputFiles('#xc-file', dst);
+    await page.locator('#xc-next-2').waitFor();
+    await page.click('#xc-next-2');
+    await page.locator('#xc-next-3').waitFor();
+    const notes = page.locator('.xc-map-notes');
+    assert.match((await notes.innerText()).replace(/\s+/g, ' '), new RegExp('Column O \\("Letter Grade"\\) comes from a Grade Tracker file: only its 1 letter marked as a final letter ' +
+      '\\(assigned by the instructor\\) and its 2 letters changed in the spreadsheet after the export are imported as final letters\\. ' +
+      'The other letters were suggestions from the cutoffs and are not stored\\.'));
+    assert.doesNotMatch(await notes.innerHTML(), /marked as <strong>final letters<\/strong>/, 'the typed letters are not called "marked"');
+    await page.click('#xc-imp-body [data-act="imp-restart"]');
+    await page.locator('#xc-pick').waitFor();
+  });
+
+  // ---------------------------------------------------------------- stage 5: statistics
+
+  await check('Statistics: the eLearning panel equals GT.stats.describe of the active totals; the 12 bins add up to Count', async () => {
+    await resetSample();
+    await gotoStats();
+    const want = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const totals = r.activeIds.map((id) => r.byId[id].total);
+      const d = GT.stats.describe(totals);
+      return {
+        d, shown: Object.fromEntries(Object.keys(d).map((k) => [k, GT.util.formatNumber(d[k], c.settings.decimals)])),
+        bins: GT.stats.bins10(totals).map((b) => b.count), labels: GT.stats.bins10(totals).map((b) => b.label),
+        status: GT.stats.statusDistribution(c, r)
+      };
+    });
+    assert.equal(want.d.count, SAMPLE_STUDENTS - 2, 'the sample has 2 withdrawn students, left out');
+    const p = await statsPanel();
+    for (const k of ['count', 'min', 'max', 'range', 'mean', 'median', 'sd', 'variance']) {
+      assert.equal(Number(p[k].v), want.d[k], k + ' (value)');
+      assert.equal(p[k].text, k === 'count' ? String(want.d.count) : want.shown[k], k + ' (as shown)');
+    }
+    assert.equal(p.bins.length, 12);
+    assert.deepEqual(p.bins, want.bins);
+    assert.equal(p.bins.reduce((a, b) => a + b, 0), want.d.count, 'the bins add up to Count');
+    assert.deepEqual(await page.$$eval('#st-overview [data-bin]', (tds) => tds.map((td) => td.closest('tr').querySelector('th').textContent.trim())), want.labels);
+    assert.deepEqual(want.labels, ['Greater than 100', '90 - 100', '80 - 89', '70 - 79', '60 - 69', '50 - 59', '40 - 49', '30 - 39', '20 - 29', '10 - 19', '0 - 9', 'Less than 0']);
+    assert.deepEqual(p.status, want.status);
+    assert.match(await page.textContent('#st-overview .st-pop'), new RegExp('Active students only \\(n = ' + want.d.count + '\\)'));
+  });
+
+  await check('Statistics: every chart is inline SVG (no library) with role="img", <title>, <desc> and a <title> per mark; "Show as table" works (ST3)', async () => {
+    await resetSample();
+    await gotoStats();
+    const charts = await page.$$eval('#view svg.st-svg', (svgs) => svgs.map((s) => ({
+      cls: s.getAttribute('class'), role: s.getAttribute('role'), title: !!s.querySelector(':scope > title'), desc: !!s.querySelector(':scope > desc'),
+      marks: s.querySelectorAll('g > title').length
+    })));
+    assert.ok(charts.length >= 5, 'charts: ' + charts.length);
+    charts.forEach((x) => {
+      assert.equal(x.role, 'img', x.cls);
+      assert.ok(x.title && x.desc, x.cls + ': <title> and <desc>');
+      assert.ok(x.marks > 0, x.cls + ': a <title> per mark');
+    });
+    // The only script outside js/ is ExcelJS from vendor/, loaded by an .xlsx export earlier in the run.
+    assert.deepEqual(await page.evaluate(() => [...document.scripts].map((sc) => sc.src).filter((src) => src && !/\/js\/[\w/.-]+\.js$/.test(src) && !/\/vendor\/exceljs\.min\.js$/.test(src))),
+      [], 'no chart library is loaded');
+    // "Show as table" on the histogram: one table row per bar (10-point bars by default).
+    const bars = await page.$$eval('#st-hist .st-mark', (g) => g.length);
+    assert.equal(bars, 10);
+    await page.click('#st-hist [data-act="table"]');
+    await page.waitForFunction((n) => document.querySelectorAll('#st-hist table tbody tr').length === n, bars);
+    await page.click('#st-hist [data-act="table"]');
+    await page.waitForFunction(() => document.querySelector('#st-hist [data-act="table"]').getAttribute('aria-pressed') === 'false' &&
+      document.querySelectorAll('#st-hist .st-mark').length === 10);
+  });
+
+  await check('Statistics: a withdrawn student\'s scores change nothing in the panel; withdrawing an active student does', async () => {
+    await resetSample();
+    await gotoStats();
+    const before = await statsPanel();
+    const wid = await page.evaluate(() => {
+      const w = GT.store.course().students.find((s) => s.status === 'withdrawn');
+      GT.store.transact('Withdrawn scores', (c) => { GT.model.setEntry(c.scores, w.id, 'a_t1', { value: 100 }); GT.model.setEntry(c.scores, w.id, 'a_t2', { value: 0 }); });
+      return w.id;
+    });
+    await page.waitForFunction((id) => GT.store.results().byId[id].items.a_t1.raw === 100, wid);
+    await rendered();
+    assert.deepEqual(await statsPanel(), before);
+    await page.evaluate(() => {
+      const s = GT.store.course().students.find((x) => x.status === 'active');
+      GT.store.transact('Withdraw', (c) => { GT.model.findStudent(c, s.id).status = 'withdrawn'; });
+    });
+    await page.waitForFunction((n) => Number(document.querySelector('#st-overview [data-stat="count"]').getAttribute('data-v')) === n, Number(before.count.v) - 1);
+    const after = await statsPanel();
+    assert.equal(after.bins.reduce((a, b) => a + b, 0), Number(after.count.v));
+    assert.equal(after.status.withdrawn, before.status.withdrawn + 1);
+  });
+
+  await check('Statistics: the what-if result chosen in the UI equals calc.neededScore (the chosen letter and the every-letter table)', async () => {
+    await resetSample();
+    await gotoStats();
+    const sid = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      return GT.calc.sortStudents(c, r, 'name', 'asc').filter((x) => x.status === 'active')[7].id;
+    });
+    await page.selectOption('#st-wi-s', sid);
+    await page.selectOption('#st-wi-a', 'a_t2');
+    await page.selectOption('#st-wi-l', 'B+');
+    const want = await page.evaluate((id) => {
+      const c = GT.store.course(), s = GT.model.findStudent(c, id);
+      const n = GT.calc.neededScore(c, s, 'a_t2', 'B+');
+      return {
+        needed: String(n.needed), kind: n.alreadyReached ? 'reached' : n.reachable ? 'needs' : 'unreachable',
+        table: GT.model.scaleLetters(c).map((l) => [l, String(GT.calc.neededScore(c, s, 'a_t2', l).needed)])
+      };
+    }, sid);
+    await page.waitForFunction(([id, w]) => {
+      const out = document.querySelector('#st-whatif [data-wi-out]');
+      return out && document.querySelector('#st-wi-s').value === id && document.querySelector('#st-wi-a').value === 'a_t2' &&
+        document.querySelector('#st-wi-l').value === 'B+' && out.getAttribute('data-needed') === w.needed;
+    }, [sid, want]);
+    assert.equal(await page.getAttribute('#st-whatif [data-wi-out]', 'data-wi-out'), want.kind);
+    assert.deepEqual(await page.$$eval('#st-whatif [data-wl]', (tds) => tds.map((td) => [td.getAttribute('data-wl'), td.getAttribute('data-needed')])), want.table);
+  });
+
+  await check('Statistics: cutoff planner sandbox edits change nothing stored until "Apply cutoffs to Settings"; Apply is one undoable step', async () => {
+    await resetSample();
+    await gotoStats();
+    const stored = () => page.evaluate(() => ({
+      scale: JSON.stringify(GT.store.course().settings.letterScale), history: GT.store.course().history.length, undo: GT.store.canUndo() && GT.store.undoLabel()
+    }));
+    const before = await stored();
+    const idx = await page.evaluate(() => GT.views.stats.sandbox().findIndex((x) => x.letter === 'B'));
+    const input = page.locator('[data-sb="' + idx + '"]');
+    await input.fill('81.5');
+    await page.waitForFunction((i) => GT.views.stats.sandbox()[i].min === 81.5, idx);
+    await input.press('ArrowUp'); // nudges by 0.5
+    await page.waitForFunction((i) => GT.views.stats.sandbox()[i].min === 82, idx);
+    // The simulated letters follow live: the list of students whose letter would change.
+    const changes = await page.evaluate(() => GT.stats.simulate(GT.store.course(), GT.store.results(), GT.views.stats.sandbox()).changes.length);
+    await page.waitForFunction((n) => new RegExp(n + ' students?').test(document.querySelector('#st-planner .st-pl-sum').textContent), changes);
+    assert.deepEqual(await stored(), before, 'typing in the sandbox stores nothing and adds no undo step');
+    await page.click('[data-act="sb-apply"]');
+    const dlg = page.locator('dialog[open]');
+    await dlg.waitFor();
+    assert.match(await dlg.innerText(), /needs confirmation/);
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await page.waitForFunction(() => GT.store.course().settings.letterScale.find((x) => x.letter === 'B').min === 82);
+    assert.equal(await page.evaluate(() => GT.store.undoLabel()), 'Apply cutoffs from the planner');
+    assert.equal(await page.evaluate(() => GT.model.isConfirmed(GT.store.course(), 'letterScale')), false, 'the cutoffs stay a placeholder until confirmed in Settings');
+    await page.evaluate(() => GT.store.undo());
+    await page.waitForFunction((s) => JSON.stringify(GT.store.course().settings.letterScale) === s, before.scale);
+  });
+
+  await check('Statistics: "Use these as final letters…" sets the final letters (students without one, by default) in ONE undoable step', async () => {
+    await resetSample();
+    await gotoStats();
+    const manual = await page.evaluate(() => {
+      const id = GT.store.results().activeIds[4];
+      GT.store.transact('Final letter', (c) => GT.model.setFinalLetter(c, id, 'F'));
+      return id;
+    });
+    await page.waitForFunction(() => /^1 of 57 final letters assigned/.test(document.querySelector('#st-letters [data-stat="assigned"]').textContent));
+    const want = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results(), sb = GT.views.stats.sandbox();
+      return { n: GT.stats.simulate(c, r, sb).finalChanges.onlyEmpty, items: GT.stats.lettersFromScale(c, r, sb, { onlyEmpty: true }) };
+    });
+    assert.equal(want.n, 56);
+    await page.click('[data-act="sb-final"]');
+    const dlg = page.locator('dialog[open]');
+    await dlg.waitFor();
+    assert.equal(await dlg.locator('input[name="st-uf"]:checked').inputValue(), 'empty', '"Only students without a final letter" is the default');
+    assert.match(await dlg.locator('.dlg-foot .btn-primary').innerText(), /Set 56 final letters/);
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await dlg.waitFor({ state: 'detached' });
+    await page.waitForFunction(() => /^57 of 57 final letters assigned/.test(document.querySelector('#st-letters [data-stat="assigned"]').textContent));
+    const after = await page.evaluate(() => {
+      const c = GT.store.course();
+      return {
+        letters: Object.fromEntries(c.students.map((s) => [s.id, s.finalLetter])),
+        withdrawn: c.students.filter((s) => s.status === 'withdrawn').map((s) => s.finalLetter), label: GT.store.undoLabel()
+      };
+    });
+    assert.equal(after.letters[manual], 'F', 'a final letter chosen by hand stays');
+    assert.deepEqual(after.withdrawn, [null, null], 'withdrawn students are skipped');
+    want.items.forEach((it) => assert.equal(after.letters[it.studentId], it.letter));
+    assert.match(after.label, /Use planner letters as final letters/);
+    // One step: Ctrl+Z takes every one of them back (only the hand-picked F stays).
+    await page.evaluate(() => document.activeElement && document.activeElement.blur());
+    await page.keyboard.press('Control+z');
+    await page.waitForFunction((id) => GT.store.course().students.filter((s) => s.finalLetter !== null).map((s) => s.id).join() === id, manual);
+  });
+
+  // ---------------------------------------------------------------- stage 6: late work, Summary tab, polish
+
+  await check('Late work (Ctrl+L): 1 week late lowers the total by weight × 10 / 100; "penalty waived" restores it; undo works; History has "late" entries', async () => {
+    await resetSample();
+    const s = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const x = GT.calc.sortStudents(c, r, 'name', 'asc').find((st) => st.status === 'active' && r.byId[st.id].items.a_t1.state === 'number' &&
+        r.byId[st.id].items.a_t1.raw >= 20 && !r.byId[st.id].items.a_t1.weeksLate);
+      return { id: x.id, total: r.byId[x.id].total, raw: r.byId[x.id].items.a_t1.raw };
+    });
+    const weight = await page.evaluate(() => GT.model.findAssessment(GT.store.course(), 'a_t1').weight);
+    const t1C = await gridCol('raw', 'Test 1');
+    const h0 = await historyCount();
+    const dlg = await openLateWork(s.id, t1C);
+    assert.match(await dlg.locator('.late-where').innerText(), /Individual score/);
+    await page.fill('#late-weeks', '1');
+    const preview = await dlg.locator('#late-preview').innerText();
+    assert.ok(preview.includes('Raw ' + s.raw + ' − 10 (1 week × 10 points) = ' + (s.raw - 10)), preview);
+    assert.match(preview, /→ weighted/);
+    await page.keyboard.press('Enter');
+    await dlg.waitFor({ state: 'detached' });
+    await page.waitForFunction((id) => GT.store.results().byId[id].items.a_t1.weeksLate === 1, s.id);
+    const late = await page.evaluate((id) => GT.store.results().byId[id].total, s.id);
+    assert.ok(Math.abs(late - (s.total - weight * 10 / 100)) < 1e-9, 'total ' + late + ' != ' + s.total + ' − ' + weight + ' × 10 / 100');
+    assert.deepEqual(await page.evaluate((n) => GT.store.course().history.slice(n).map((h) => [h.kind, h.field, h.oldValue, h.newValue]), h0),
+      [['late', 'Test 1: weeks late', '', '1']]);
+    // The cell shows the "L1" badge, and the focus is back on it.
+    await page.waitForFunction(([id, c]) => {
+      const td = document.querySelector('.gt-grid tbody tr[data-sid="' + id + '"] td[data-c="' + c + '"]');
+      return td && td.querySelector('.mk-late') && td.querySelector('.mk-late').textContent === 'L1' && document.activeElement === td;
+    }, [s.id, t1C]);
+    assert.match(await gridCell(s.id, t1C).getAttribute('title'), /1 week late: −10 points, adjusted score/);
+    // Waive it, through the cell menu this time (Shift+F10).
+    await page.keyboard.press('Shift+F10');
+    await page.locator('.menu [role="menuitem"]', { hasText: 'Late work (1 week)' }).click();
+    await dlg.waitFor();
+    await page.check('#late-waived');
+    assert.match(await dlg.locator('#late-preview').innerText(), /Penalty waived/);
+    await dlg.locator('.btn-primary').click();
+    await page.waitForFunction((id) => GT.store.results().byId[id].items.a_t1.waived === true, s.id);
+    assert.ok(Math.abs((await page.evaluate((id) => GT.store.results().byId[id].total, s.id)) - s.total) < 1e-9, 'waived restores the total');
+    await page.waitForFunction(([id, c]) => {
+      const b = document.querySelector('.gt-grid tbody tr[data-sid="' + id + '"] td[data-c="' + c + '"] .mk-late');
+      return b && b.classList.contains('is-waived') && b.textContent === 'L1✓';
+    }, [s.id, t1C]);
+    // Undo the waiver, then the late work.
+    await page.keyboard.press('Control+z');
+    await page.waitForFunction((id) => GT.store.results().byId[id].items.a_t1.waived === false, s.id);
+    assert.ok(Math.abs((await page.evaluate((id) => GT.store.results().byId[id].total, s.id)) - late) < 1e-9);
+    await page.keyboard.press('Control+z');
+    await page.waitForFunction((id) => GT.store.results().byId[id].items.a_t1.weeksLate === 0, s.id);
+    assert.ok(Math.abs((await page.evaluate((id) => GT.store.results().byId[id].total, s.id)) - s.total) < 1e-9);
+    assert.deepEqual(await page.evaluate((n) => GT.store.course().history.slice(n).map((h) => h.source + ':' + h.kind), h0),
+      ['edit:late', 'edit:late', 'undo:late', 'undo:late']);
+    // The History tab lists them as late-work changes.
+    await gotoView('history');
+    assert.match(await page.locator('.hist-table tbody tr').first().innerText(), /weeks late|waived/i);
+  });
+
+  await check('Late work: on a team-graded cell without an override it goes on the team score and reaches every member', async () => {
+    await resetSample();
+    const info = await page.evaluate(() => {
+      const c = GT.store.course(), r = GT.store.results();
+      const t = c.teams.find((tm) => GT.model.teamMembers(c, tm.id).every((m) => !(GT.model.getEntry(c.scores, m.id, 'a_p1') || {}).override));
+      return { team: t.id, name: t.name, members: GT.model.teamMembers(c, t.id).map((m) => ({ id: m.id, total: r.byId[m.id].total })) };
+    });
+    const p1C = await gridCol('raw', 'Project I');
+    const dlg = await openLateWork(info.members[0].id, p1C);
+    assert.match((await dlg.locator('.late-where').innerText()).replace(/\s+/g, ' '), new RegExp(info.name + ' team score.*whole team'));
+    await page.fill('#late-weeks', '2');
+    await dlg.locator('.btn-primary').click();
+    await page.waitForFunction((t) => (GT.model.getEntry(GT.store.course().teamScores, t, 'a_p1') || {}).weeksLate === 2, info.team);
+    const after = await page.evaluate((ids) => ids.map((id) => GT.store.results().byId[id].total), info.members.map((m) => m.id));
+    // Project I weighs 10%: 2 weeks = 20 points off the raw score = 2 points off the total.
+    info.members.forEach((m, i) => assert.ok(Math.abs(after[i] - (m.total - 2)) < 1e-9, 'member ' + i + ': ' + after[i] + ' != ' + (m.total - 2)));
+    const own = await page.evaluate((ids) => ids.map((id) => GT.model.getEntry(GT.store.course().scores, id, 'a_p1') || null), info.members.map((m) => m.id));
+    assert.ok(own.every((e) => !e || !e.weeksLate), 'no member entry gets the late info');
+  });
+
+  await check('Late work: in a finalized course the dialog opens read-only ("Unlock them to change late work")', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.transact('Finalize scores', (c) => GT.model.finalize(c, new Date().toISOString(), '')));
+    await page.locator('.gt-grid.locked').waitFor();
+    const [sid] = await activeRun(1);
+    const t1C = await gridCol('raw', 'Test 1');
+    const before = await page.evaluate((id) => JSON.stringify(GT.model.getEntry(GT.store.course().scores, id, 'a_t1') || null), sid);
+    const dlg = await openLateWork(sid, t1C);
+    assert.match(await dlg.innerText(), /Scores are finalized\. Unlock them to change late work/);
+    assert.equal(await page.isDisabled('#late-weeks'), true);
+    assert.equal(await page.isDisabled('#late-waived'), true);
+    await dlg.locator('.btn-primary').click(); // Close
+    await dlg.waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate((id) => JSON.stringify(GT.model.getEntry(GT.store.course().scores, id, 'a_t1') || null), sid), before);
+  });
+
+  await check('Summary: totals, letters and ranks equal the results; withdrawn students come last, marked W', async () => {
+    await resetSample();
+    await gotoSummary();
+    const got = await summaryTable();
+    const want = await summaryExpected();
+    assert.equal(got.rows.length, SAMPLE_STUDENTS);
+    assert.deepEqual(got.rows, want);
+    assert.equal(got.letterHead, 'Letter (suggested)', 'no final letters yet: the column holds the suggestion');
+    const nWd = want.filter((r) => r.wd).length;
+    assert.equal(nWd, 2);
+    assert.ok(got.rows.slice(-nWd).every((r) => r.wd && r.letter === 'W' && r.rank === '—'), 'withdrawn students last, marked W, not ranked');
+    assert.ok(got.rows.slice(0, -nWd).every((r) => !r.wd));
+  });
+
+  await check('Summary: the letter column says "Letter (suggested)" until final letters exist, then "Final letter" ("—" for students without one)', async () => {
+    await resetSample();
+    await gotoSummary();
+    const items = await page.evaluate(() => {
+      const act = GT.store.course().students.filter((s) => s.status === 'active').slice(0, 3);
+      const it = act.map((s, i) => ({ studentId: s.id, letter: ['A', 'B+', 'C'][i] }));
+      GT.store.transact('Final letters', (c) => GT.model.setFinalLetters(c, it));
+      return it;
+    });
+    await page.waitForFunction(() => document.querySelector('.sum-grades thead th.sum-c-letter').textContent.replace(/\s+/g, ' ').trim() === 'Final letter');
+    const got = await summaryTable();
+    assert.deepEqual(got.rows, await summaryExpected());
+    assert.equal(got.rows.filter((r) => r.letter === '—').length, SAMPLE_STUDENTS - 2 - items.length);
+    await page.evaluate((it) => GT.store.transact('Clear', (c) => GT.model.setFinalLetters(c, it.map((x) => ({ studentId: x.studentId, letter: null })))), items);
+    await page.waitForFunction(() => document.querySelector('.sum-grades thead th.sum-c-letter').textContent.replace(/\s+/g, ' ').trim() === 'Letter (suggested)');
+  });
+
+  await check('Summary: "Hide names (use No only)" removes every student name from the page', async () => {
+    await resetSample();
+    await clearToasts();
+    await gotoSummary();
+    await page.click('.sum-opts input[data-pref="hideNames"]');
+    await page.waitForFunction(() => !document.querySelector('.sum-grades .sum-c-name'));
+    const leaks = await page.evaluate(() => {
+      const html = document.documentElement.outerHTML, out = [];
+      GT.store.course().students.forEach((s) => [s.lastName, s.firstName].forEach((n) => { if (n && html.includes(n)) out.push(n); }));
+      return out;
+    });
+    assert.deepEqual(leaks, []);
+    assert.equal(await page.locator('.sum-grades tbody tr[data-sid]').count(), SAMPLE_STUDENTS, 'every row stays, by No');
+    await page.click('.sum-opts input[data-pref="hideNames"]');
+    await page.waitForFunction(() => document.querySelector('.sum-grades .sum-c-name .pii'));
+  });
+
+  await check('Summary: page.pdf (Letter, landscape) makes a PDF; print hides the options and the app chrome and never blurs names', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.setUi({ privacy: true }));
+    await gotoSummary();
+    await page.waitForFunction(() => document.body.classList.contains('privacy-on'));
+    await page.emulateMedia({ media: 'print' });
+    try {
+      const vis = await page.evaluate(() => ({
+        options: getComputedStyle(document.querySelector('.sum-options')).display,
+        chrome: getComputedStyle(document.querySelector('.app-head')).display,
+        thead: getComputedStyle(document.querySelector('.sum-grades thead')).display,
+        blur: getComputedStyle(document.querySelector('.sum-grades .pii')).filter,
+        background: getComputedStyle(document.body).backgroundColor
+      }));
+      assert.deepEqual(vis, { options: 'none', chrome: 'none', thead: 'table-header-group', blur: 'none', background: 'rgb(255, 255, 255)' });
+      const file = path.join(TMP, 'summary.pdf');
+      await page.pdf({ path: file, format: 'Letter', landscape: true, printBackground: true });
+      const pdf = fs.readFileSync(file).toString('latin1');
+      assert.ok(pdf.startsWith('%PDF-'), 'not a PDF file');
+      assert.match(pdf, /\/MediaBox\s*\[\s*0 0 792 612\s*\]/, 'Letter landscape (792 × 612 points)');
+      const pages = (pdf.match(/\/Type\s*\/Page[^s]/g) || []).length;
+      assert.ok(pages >= 1 && pages <= 6, pages + ' pages');
+    } finally {
+      await page.emulateMedia({ media: 'screen' });
+      await page.evaluate(() => GT.store.setUi({ privacy: false }));
+    }
+  });
+
+  await check('every tab renders in light and dark mode, and at 390 px, with no console error and no sideways page scrolling', async () => {
+    await resetSample({ lateWork: true });
+    const errors0 = consoleErrors.length + pageErrors.length;
+    const tabs = await page.$$eval('#tabs .tab', (els) => els.map((e) => e.getAttribute('data-view')));
+    assert.deepEqual(tabs, ['grades', 'students', 'attendance', 'stats', 'settings', 'history', 'exchange', 'summary']);
+    const sweep = async (label) => {
+      for (const id of tabs) {
+        await gotoView(id);
+        await rendered();
+        const r = await page.evaluate(() => ({
+          failed: /failed to render/.test(document.getElementById('view').textContent),
+          overflow: document.documentElement.scrollWidth - window.innerWidth
+        }));
+        assert.equal(r.failed, false, label + ': ' + id + ' failed to render');
+        assert.ok(r.overflow <= 0, label + ': ' + id + ' scrolls sideways by ' + r.overflow + ' px');
+      }
+    };
+    try {
+      for (const theme of ['light', 'dark']) {
+        await page.evaluate((t) => GT.store.setUi({ theme: t }), theme);
+        await page.waitForFunction((t) => document.documentElement.getAttribute('data-theme') === t, theme);
+        assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), theme === 'dark' ? 'rgb(15, 20, 25)' : 'rgb(246, 247, 249)');
+        await sweep(theme);
+      }
+      await page.setViewportSize({ width: 390, height: 844 });
+      await sweep('390 px, dark');
+    } finally {
+      await page.setViewportSize({ width: 1280, height: 860 });
+      await page.evaluate(() => GT.store.setUi({ theme: 'light' }));
+    }
+    assert.deepEqual(consoleErrors.concat(pageErrors).slice(errors0), [], 'errors while the tabs rendered');
+    assert.equal(consoleErrors.length + pageErrors.length, errors0);
+  });
+
+  await check('every tab shows a friendly empty state for a course without students (Attendance: also when it is off)', async () => {
+    await resetSample();
+    const other = await page.evaluate(() => GT.store.state.courses.find((c) => c.template === 'SE6362').id);
+    await page.selectOption('#course-select', other);
+    await page.waitForFunction((id) => GT.store.course().id === id && GT.store.course().students.length === 0, other);
+    const expected = {
+      grades: ['.grid-empty', /No students in SE 6362 yet/],
+      students: ['.empty-state', /No students in SE 6362 yet/],
+      attendance: ['.att-off-state', /Attendance is not tracked for SE 6362/],
+      stats: ['.st-empty', /No statistics yet/],
+      settings: ['.view-settings', /Assessments and weights/],
+      history: ['.hist-empty-host', /No changes recorded yet/],
+      exchange: ['.view-exchange', /no students yet/],
+      summary: ['.sum-empty', /No students in this course yet/]
+    };
+    for (const id of Object.keys(expected)) {
+      await gotoView(id);
+      const [sel, re] = expected[id];
+      const el = page.locator('#view ' + sel).first();
+      await el.waitFor();
+      assert.match(await el.innerText(), re, id);
+      assert.equal(/failed to render/.test(await page.locator('#view').innerText()), false, id + ' failed to render');
+    }
+    // Attendance turned on, still without students: the no-students state.
+    await gotoView('attendance');
+    await page.click('.att-off-state [data-act="turn-on"][data-mode="per-session"]');
+    await page.locator('#view .att-empty', { hasText: 'No students yet' }).waitFor();
+  });
+
+  await check('Help / About from the status bar: what the app is, offline, where the data is stored, a backup reminder, version 1.0.0 and a relative README.md link', async () => {
+    await resetSample();
+    await page.click('#statusbar [data-act="about"]');
+    const dlg = page.locator('dialog[open]', { hasText: 'About Grade Tracker' });
+    await dlg.waitFor();
+    const text = (await dlg.innerText()).replace(/\s+/g, ' ');
+    for (const re of [/Version 1\.0\.0/, /grade book for teaching assistants/, /Offline and private/, /no student data leaves this computer/,
+      /Where your data is stored/, /Only in this browser, on this computer: IndexedDB/, /clearing this browser’s site data or browsing data deletes it/,
+      /Back up regularly/, /Last backup: /, /README\.md/]) assert.match(text, re);
+    assert.equal(await page.evaluate(() => GT.app.VERSION), JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version);
+    const link = dlg.locator('a.about-readme');
+    assert.equal(await link.getAttribute('href'), 'README.md', 'a relative link');
+    const href = await link.evaluate((a) => a.href);
+    assert.equal(href, new URL('README.md', APP_URL).href);
+    assert.ok(fs.existsSync(fileURLToPath(href)), 'README.md is next to index.html');
+    await page.keyboard.press('Escape');
+    await dlg.waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => document.activeElement && document.activeElement.getAttribute('data-act')), 'about', 'the focus returns to the Help button');
+  });
+
+  await check('the shortcuts list ("?") names every shortcut that exists, and "/", Alt+↓, Space and Alt+1…8 work', async () => {
+    await resetSample();
+    const t1C = await gridCol('raw', 'Test 1');
+    const [sid] = await activeRun(1);
+    await gridCell(sid, t1C).click();
+    await page.keyboard.press('?');
+    const dlg = page.locator('dialog[open]', { hasText: 'Keyboard shortcuts' });
+    await dlg.waitFor();
+    const list = await dlg.evaluate((d) => [...d.querySelectorAll('.shortcut-h')].map((h) => {
+      const rows = [], cells = [...h.nextElementSibling.children];
+      for (let i = 0; i + 1 < cells.length; i += 2) rows.push([cells[i].textContent.replace(/\s+/g, ' ').trim(), cells[i + 1].textContent]);
+      return { group: h.textContent, rows };
+    }));
+    assert.deepEqual(list.map((g) => g.group), ['Everywhere', 'Grades grid', 'Attendance grid (per session)', 'Roll call', 'Statistics and Import / Export']);
+    const has = (group, keys, re) => {
+      const g = list.find((x) => x.group === group);
+      assert.ok(g && g.rows.some((r) => r[0] === keys && re.test(r[1])), group + ': no "' + keys + '" row matching ' + re);
+    };
+    has('Everywhere', 'Ctrl+Z / Ctrl+Y', /Undo \/ redo/);
+    has('Everywhere', 'Alt+1 … Alt+8', /Switch tabs/);
+    has('Everywhere', '/', /search box/);
+    has('Everywhere', '?', /this list/);
+    for (const k of ['Arrow keys', 'Tab / Shift+Tab', 'Enter', 'F2', 'Shift+Arrow / Shift+Click', 'Shift+Space / Ctrl+Space', 'Ctrl+A', 'Ctrl+Enter',
+      'Home / End', 'Ctrl+Home / Ctrl+End', 'PageUp / PageDown', 'Ctrl+Arrow', 'Delete / Backspace', 'Esc', 'Ctrl+C / Ctrl+V']) has('Grades grid', k, /./);
+    has('Grades grid', 'Alt+↓', /drop-down list \(Final letter, Class\/Project Participation, Team\)/);
+    has('Grades grid', 'Shift+F10 / Menu key', /Cell and column actions/);
+    has('Grades grid', 'Ctrl+L', /Late work of the active score cell/);
+    has('Attendance grid (per session)', 'P / A / E', /Present \/ Absent \(not allowed\) \/ Excused \(allowed\)/);
+    has('Attendance grid (per session)', 'Space', /Present, Absent, Excused, no mark/);
+    has('Attendance grid (per session)', 'Delete / Backspace', /Clear the mark/);
+    has('Roll call', 'P / A / E', /current student/);
+    has('Roll call', '↑ / ↓', /Previous \/ next student/);
+    has('Statistics and Import / Export', 'Alt+↑ / Alt+↓', /move the column/);
+    await page.keyboard.press('Escape');
+    await dlg.waitFor({ state: 'detached' });
+    // "/" jumps to the search box.
+    await gridCell(sid, t1C).click();
+    await page.keyboard.press('/');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.classList.contains('grid-search'));
+    // Alt+↓ opens the Final letter drop-down list; Esc closes it without a change.
+    const fC = await gridCol('final');
+    await gridCell(sid, fC).click();
+    await page.keyboard.press('Alt+ArrowDown');
+    await page.locator('select.dd-editor').waitFor();
+    await page.keyboard.press('Escape');
+    await page.locator('select.dd-editor').waitFor({ state: 'detached' });
+    assert.equal((await finalLetters([sid]))[0], null);
+    // Attendance: Delete clears a mark; Space then changes it: no mark → Present → Absent → Excused → no mark.
+    await gotoAttendanceGrid();
+    const quiet = await quietStudent();
+    const j = 2;
+    await attCell(quiet, j).click();
+    await page.keyboard.press('Delete');
+    await page.waitForFunction(([id, k]) => {
+      const c = GT.store.course(), ses = c.attendance.sessions[k];
+      return !(c.attendance.records[id] || {})[ses.id];
+    }, [quiet, j]);
+    for (const want of ['P', 'A', 'E', '']) {
+      await page.keyboard.press('Space');
+      await page.waitForFunction(([id, k, w]) => {
+        const c = GT.store.course(), ses = c.attendance.sessions[k];
+        return ((c.attendance.records[id] || {})[ses.id] || '') === w;
+      }, [quiet, j, want]);
+    }
+    // Alt+1 … Alt+8 switch tabs, in tab order.
+    const tabs = await page.$$eval('#tabs .tab', (els) => els.map((e) => e.getAttribute('data-view')));
+    for (let i = tabs.length - 1; i >= 0; i--) {
+      await page.keyboard.press('Alt+' + (i + 1));
+      await page.waitForFunction((v) => GT.store.state.ui.activeView === v, tabs[i]);
+    }
+  });
+
   await check('privacy mode blurs every student name (.pii) in the Grades, Students and Attendance views', async () => {
     await resetSample();
     await page.click('#btn-privacy');
@@ -2159,6 +3018,19 @@ async function run() {
     await page.locator('#view .gt-grid').waitFor();
   });
 
+  await check('the last-backup indicator turns into a reminder when the last backup is more than 7 days old (R5)', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.setMeta({ lastBackupAt: new Date(Date.now() - 8 * 86400000).toISOString() }));
+    await page.locator('#banners', { hasText: 'Your last backup was 8 days ago' }).waitFor();
+    assert.match(await page.getAttribute('#backup-chip', 'class'), /btn-backup-stale/);
+    assert.match(await page.getAttribute('#backup-chip', 'aria-label'), /^Backup: /);
+    await page.evaluate(() => GT.store.setMeta({ lastBackupAt: new Date(Date.now() - 6 * 86400000).toISOString() }));
+    await page.waitForFunction(() => !/Your last backup was/.test(document.getElementById('banners').textContent) &&
+      !document.getElementById('backup-chip').classList.contains('btn-backup-stale'));
+    await page.evaluate(() => GT.store.setMeta({ lastBackupAt: null }));
+    await page.locator('#banners', { hasText: 'No backup yet.' }).waitFor();
+  });
+
   await check('data persists in IndexedDB across a reload', async () => {
     await resetSample();
     const sid = (await studentsByName())[1].id;
@@ -2244,14 +3116,21 @@ async function run() {
 
   await check('keyboard focus stays on the tabs and the status bar across autosave re-renders', async () => {
     await resetSample();
-    await page.waitForTimeout(600); // let the reset autosave finish
+    // Every change autosaves after a short delay, and the 'saved' notification re-renders the shell:
+    // wait for that, then for the re-render (the change was made just before, so the phase is 'pending').
+    const afterAutosave = async () => {
+      await page.waitForFunction(() => GT.store.saveStatus().phase === 'saved');
+      await rendered();
+    };
+    await afterAutosave(); // the reset's own autosave
     const focused = () => page.evaluate(() => {
       const a = document.activeElement;
       return a ? (a.id || a.getAttribute('data-act') || a.tagName) : null;
     });
     await page.focus('#tab-grades');
     await page.keyboard.press('ArrowRight');
-    await page.waitForTimeout(1000); // navigation autosaves; the 'saved' notification re-renders the shell
+    await page.waitForFunction(() => GT.store.state.ui.activeView === 'students');
+    await afterAutosave(); // navigation autosaves
     assert.equal(await focused(), 'tab-students');
     // The tab after Students (Attendance since stage 3), read from the tab strip.
     const next = await page.evaluate(() => {
@@ -2261,12 +3140,17 @@ async function run() {
     assert.equal(next, 'attendance');
     await page.keyboard.press('ArrowRight');
     await page.waitForFunction((v) => GT.store.state.ui.activeView === v, next);
-    await page.waitForTimeout(700);
+    await afterAutosave();
     assert.equal(await focused(), 'tab-' + next);
     await page.focus('#statusbar [data-act="shortcuts"]');
     await page.evaluate(() => GT.store.transact('Title', (c) => { c.title = c.title + '.'; }));
-    await page.waitForTimeout(700);
+    await afterAutosave();
     assert.equal(await focused(), 'shortcuts');
+    // The Help button (stage 6) is written once with Shortcuts, so it keeps the focus too.
+    await page.focus('#statusbar [data-act="about"]');
+    await page.evaluate(() => GT.store.transact('Title', (c) => { c.title = c.title + '.'; }));
+    await afterAutosave();
+    assert.equal(await focused(), 'about');
     await gotoView('grades');
   });
 
@@ -2380,7 +3264,8 @@ async function run() {
     assert.deepEqual(consoleErrors, []);
   });
 
-  await check('zero network requests other than file:, data: and blob:', async () => {
+  await check('zero network requests other than file:, data: and blob: across the whole run (ExcelJS for the .xlsx export comes from vendor/)', async () => {
+    assert.ok(excelFromVendor, 'the run exported an .xlsx with ExcelJS loaded from vendor/');
     assert.deepEqual(network, []);
   });
 }

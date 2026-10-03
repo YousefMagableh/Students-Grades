@@ -71,6 +71,10 @@
       help: 'The file\'s Total is not the total the imported scores give here. Check for missing score or weeks-late columns, and the weights, curve and rounding in Settings. Each one is listed under "Values to check".' },
     { key: 'lettersAsSuggestion', label: 'letters kept as suggestions', one: 'letter kept as a suggestion', icon: 'info',
       help: 'The file comes from Grade Tracker: its letters that are only the suggestion from the cutoffs are not stored as final letters.' },
+    { key: 'lettersFromOtherColumn', label: 'final letters taken from another letter column', one: 'final letter taken from another letter column', icon: 'info',
+      help: 'The file comes from Grade Tracker and has more than one letter column. A letter changed after the export in "Letter Grade" (or "Suggested Letter (cutoffs)") is imported when the student\'s "Final Letter" cell is empty.' },
+    { key: 'lettersNotImported', label: 'final letters not imported', one: 'final letter not imported', icon: 'alert', warn: true,
+      help: 'A letter changed in the file after the export, or marked as a final letter, is not imported: it differs from the column final letters are read from, or no column is set to "Final letter". Each one is listed under "Values to check"; set the right letter in the Grades tab.' },
     { key: 'teamsCreated', label: 'new teams', one: 'new team', icon: 'users',
       help: 'Team names from the file that are not in this course ("2", "Team 02" and "Group 2" already count as "Team 2").' },
     { key: 'scoresEmptied', label: 'team scores emptied by a team move', one: 'team score emptied by a team move', icon: 'alert', warn: true,
@@ -1240,8 +1244,11 @@
     // header row, where "Total" is not a name either), else only the known ones.
     imp.headerKnown = knownHeaders(cells, course);
     if (Object.keys(imp.headerKnown).length >= 2) cells.forEach(function (c, i) { imp.headerKnown[i] = true; });
+    // editedLetterCells: a letter column with letters typed in after a Grade Tracker export is a
+    // final-letter column when no other column is (review V4R3-1; guessMapping reads only the column).
     var guess = safeCall('importer', 'guessMapping', [cells, course,
-      { formulaColumns: sheet && Array.isArray(sheet.formulaColumns) ? sheet.formulaColumns : [] }], []);
+      { formulaColumns: sheet && Array.isArray(sheet.formulaColumns) ? sheet.formulaColumns : [],
+        editedLetterCells: sheet && Array.isArray(sheet.editedLetterCells) ? sheet.editedLetterCells : null }], []);
     var valid = {};
     targetList(course).forEach(function (t) { valid[t.key] = true; });
     imp.mapping = [];
@@ -1724,6 +1731,21 @@
         out.push('Column ' + name(fl) + ' sets each student\'s <strong>final letter</strong>. If those letters were only suggestions, set it to "Do not import". Letters that are not in this course\'s scale are skipped.');
       }
     }
+    // Letters changed after the export in a letter column that is not read (the "Everything" preset has
+    // three letter columns; review V4R3-1). The importer takes each one when the Final letter column is
+    // empty for that student, and reports the rest (GT.importer.plan), so none is dropped silently.
+    var sheetE = imp.sheets[imp.sheetIndex];
+    var editedIn = {};
+    (sheetE && Array.isArray(sheetE.editedLetterCells) ? sheetE.editedLetterCells : []).forEach(function (p) {
+      if (p[0] > imp.headerIndex && p[1] !== fl && imp.mapping[p[1]] === 'ignore') editedIn[p[1]] = (editedIn[p[1]] || 0) + 1;
+    });
+    Object.keys(editedIn).forEach(function (k) {
+      var ci = Number(k), n = editedIn[k];
+      out.push('Column ' + name(ci) + ' has ' + plural(n, 'letter') + ' changed in the spreadsheet after the export. ' + (fl >= 0
+        ? (n === 1 ? 'It is' : 'Each one is') + ' imported as the <strong>final letter</strong> when column ' + name(fl) +
+          ' is empty for that student. A letter that differs from column ' + name(fl) + ' is not imported, and the preview lists it.'
+        : (n === 1 ? 'It is' : 'They are') + ' not imported: set this column to "Final letter" to import ' + (n === 1 ? 'it' : 'them') + '.'));
+    });
     var ab = colOf('absent'), at = colOf('absencesTotal');
     if (ab >= 0 && at >= 0) out.push('Column ' + name(at) + ' is skipped: unexcused absences come from column ' + name(ab) + '.');
     else if (at >= 0) {

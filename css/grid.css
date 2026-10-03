@@ -315,8 +315,8 @@
 /* Meeting view: larger text; participation and Final letter are "to fill in the meeting" */
 .gt-grid.meeting { font-size: 15px; }
 .gt-grid.meeting th, .gt-grid.meeting td { height: 36px; }
-.gt-grid.meeting .sc2 { left: 56px; }   /* WM in grid.js */
-.gt-grid.meeting .sc3 { left: 184px; }
+.gt-grid.meeting .sc2 { left: 56px; }   /* WM.no in grid.js */
+.gt-grid.meeting .sc3 { left: var(--sc3-left, 184px); }   /* No + Last Name widths, set by grid.js */
 /* Narrower headers (HEAD_PAD_MEET in grid.js), and a placeholder badge may wrap under "max 100", so the
    decision columns (Participation, Suggested, Final letter, Rank) fit at 1280 px with the absence columns. */
 .gt-grid.meeting thead th { padding-left: 6px; padding-right: 6px; }
@@ -327,6 +327,16 @@
 .gt-grid.meeting thead th.to-fill { background-color: color-mix(in srgb, var(--accent) 20%, var(--bg-sunken)); box-shadow: inset 0 3px 0 var(--accent); }
 .gt-grid thead .h-fill { color: var(--accent); font-weight: 650; }
 .gt-grid.meeting td.c-final { font-size: 16px; }
+/* Final letter and Rank are pinned on the right (pinClass in grid.js; right offsets from WM.rank), so they
+   stay on screen without sideways scrolling when the meeting columns are wider than the window. The cells
+   keep their opaque backgrounds; .pr-first draws the edge line. */
+.gt-grid.meeting .pr { position: sticky; z-index: 1; }
+.gt-grid.meeting .pr1 { right: 0; }
+.gt-grid.meeting .pr2 { right: 48px; }
+.gt-grid.meeting thead th.pr, .gt-grid.meeting tfoot .pr { z-index: 4; }
+.gt-grid.meeting .pr-first::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: -1px; width: 1px; background: var(--border-strong); pointer-events: none;
+}
 
 /* withdrawn rows */
 .gt-grid tr.row-withdrawn td,
@@ -483,6 +493,10 @@
   .gt-grid thead th.sc3, .gt-grid thead th.sc4 { position: sticky; left: auto; z-index: 3; }
   /* the Meeting view's wider offsets (above) must not pin First Name's header again */
   .gt-grid.meeting thead th.sc3, .gt-grid.meeting thead th.sc4 { left: auto; }
+  /* nor pin Final letter and Rank on the right: a phone needs the room for the scores */
+  .gt-grid.meeting .pr1, .gt-grid.meeting .pr2 { right: auto; }
+  .gt-grid.meeting tbody td.pr { position: static; }
+  .gt-grid.meeting .pr-first::after { display: none; }
   .gt-grid .sc-span { position: static; }
   .gt-grid tfoot .sc-span { position: sticky; left: auto; }
   .gt-grid .sc2 { border-right: 1px solid var(--border-strong); }
@@ -492,7 +506,8 @@
 @media print {
   .grid-toolbar, .grid-grades-bar, .grid-legend, .row-details, .dd-btn, .th-menu { display: none !important; }
   .grid-wrap { max-height: none; overflow: visible; border: 0; }
-  .gt-grid thead th, .gt-grid tfoot td, .gt-grid tfoot th, .gt-grid .sc { position: static; }
+  .gt-grid thead th, .gt-grid tfoot td, .gt-grid tfoot th, .gt-grid .sc, .gt-grid.meeting .pr { position: static; }
+  .gt-grid.meeting .pr-first::after { display: none; }
   /* !important: the screen rules for the active cell and row are more specific. */
   .gt-grid tbody td.is-active, .gt-grid tbody td.in-range, .gt-grid tbody tr.row-active td { box-shadow: none !important; background-image: none !important; }
 }

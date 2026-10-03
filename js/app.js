@@ -20,7 +20,9 @@
   ];
 
   var BACKUP_REMINDER_DAYS = 7;
+  var VERSION = '1.0.0';     // also in package.json
   var app = GT.app = {};
+  app.VERSION = VERSION;
   var viewContainer = null;
   var currentViewId = null;
   var viewParams = {};
@@ -220,8 +222,10 @@
     // The Shortcuts button is written once and kept, so autosave updates never take its focus away.
     var info = el.querySelector('.sb-info');
     if (!info) {
-      el.innerHTML = '<span class="sb-info" id="statusbar-info"></span><span class="spacer"></span>' +
-        '<button class="btn btn-ghost btn-sm" data-act="shortcuts" type="button">' + ui.icon('keyboard') + ' Shortcuts</button>';
+      el.innerHTML = '<span class="sb-info" id="statusbar-info"></span><span class="spacer"></span><span class="sb-actions">' +
+        '<button class="btn btn-ghost btn-sm" data-act="about" type="button" title="About Grade Tracker: offline use, where your data is stored, backups">' +
+        ui.icon('info') + ' Help</button>' +
+        '<button class="btn btn-ghost btn-sm" data-act="shortcuts" type="button" title="Keyboard shortcuts (?)">' + ui.icon('keyboard') + ' Shortcuts</button></span>';
       info = el.querySelector('.sb-info');
     }
     setRegionHtml(info,
@@ -381,10 +385,23 @@
       {
         name: 'level', label: 'Level', type: 'select', value: c ? c.level : 'undergraduate',
         options: [{ value: 'undergraduate', label: 'Undergraduate' }, { value: 'graduate', label: 'Graduate' }],
-        help: isNew ? 'Sets the default letter scale.' : 'Changing the level does not change the letter scale; edit cutoffs in Settings.'
+        help: isNew ? 'Sets the default letter scale. Picking a template sets its level (SE 4351: undergraduate, SE 6362: graduate).'
+          : 'Changing the level does not change the letter scale; edit cutoffs in Settings.'
       }
     );
-    return ui.dialog.form({ title: title, fields: fields, confirmText: isNew ? 'Create course' : 'Save' });
+    return ui.dialog.form({
+      title: title, fields: fields, confirmText: isNew ? 'Create course' : 'Save',
+      // A template brings its own level: "SE 6362 template (graduate defaults)" must not stay undergraduate
+      // just because Level still shows its default. The level can still be changed afterwards.
+      onMount: isNew ? function (dlg) {
+        var tpl = dlg.querySelector('[name="template"]'), level = dlg.querySelector('[name="level"]');
+        if (!tpl || !level) return;
+        tpl.addEventListener('change', function () {
+          if (tpl.value === 'SE4351') level.value = 'undergraduate';
+          else if (tpl.value === 'SE6362') level.value = 'graduate';
+        });
+      } : null
+    });
   }
 
   function doAddCourse() {
@@ -505,14 +522,27 @@
     ], { alignRight: true });
   }
 
-  function showShortcuts() {
-    var rows = [
+  /** Every keyboard shortcut, by where it works. Each entry is checked against the key handlers:
+   * app.js (everywhere), js/ui/grid.js (gridKey, editorKey), js/ui/attendance.js (gridKey, roll call),
+   * js/ui/stats.js (planner sandbox) and js/ui/exchange.js (column list). Keys joined by " / " are
+   * alternatives; "+" joins keys pressed together. */
+  var SHORTCUTS = [
+    { group: 'Everywhere', rows: [
+      ['Ctrl+Z / Ctrl+Y', 'Undo / redo (Ctrl+Shift+Z also redoes)'],
+      ['Alt+1 … Alt+8', 'Switch tabs: Grades, Students & Teams, Attendance, Statistics, Settings, History, Import / Export, Summary'],
+      ['← / →', 'Previous / next tab, when a tab has the focus (Home / End: first / last tab)'],
+      ['/', 'Jump to the search box (Grades, Students & Teams, Attendance, History)'],
+      ['?', 'Show this list'],
+      ['Esc', 'Close a dialog or menu']
+    ] },
+    { group: 'Grades grid', rows: [
       ['Arrow keys', 'Move between cells'],
-      ['Tab / Shift+Tab', 'Next / previous cell'],
-      ['Enter', 'Edit cell, or save and move down'],
-      ['F2', 'Edit cell without clearing it'],
+      ['Tab / Shift+Tab', 'Next / previous cell (Esc, then Tab, leaves the grid)'],
+      ['Enter', 'Edit the cell; while editing, save and move down (Shift+Enter: up)'],
+      ['F2', 'Edit the cell without clearing it'],
       ['Type a number', 'Start editing and replace the value'],
       ['Shift+Arrow / Shift+Click', 'Select a range of cells'],
+      ['Shift+Space / Ctrl+Space', 'Select the row / the column'],
       ['Ctrl+A', 'Select all cells'],
       ['Ctrl+Enter', 'Fill the selected cells with the typed value'],
       ['Home / End', 'First / last column'],
@@ -520,25 +550,95 @@
       ['PageUp / PageDown', 'Move 10 rows'],
       ['Ctrl+Arrow', 'Jump to the edge of the grid'],
       ['Delete / Backspace', 'Clear the selected cells'],
-      ['Alt+↓', 'Open a drop-down list (Final letter, participation, Team)'],
+      ['Alt+↓', 'Open a drop-down list (Final letter, Class/Project Participation, Team); while typing in such a cell, Alt+↓ / Alt+↑ opens the list'],
       ['Shift+Arrow, then Enter', 'Give every selected row the same final letter or list value'],
-      ['Esc', 'Cancel editing'],
+      ['Esc', 'Cancel editing, or clear the selected range'],
       ['Ctrl+C / Ctrl+V', 'Copy / paste a block (works with Excel)'],
-      ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
-      ['Shift+F10 or menu key', 'Cell and column actions (override, fill or clear a column, final letters)'],
-      ['Ctrl+L', 'Late work of the active score cell (weeks late, penalty waived)'],
-      ['/', 'Search students'],
-      ['Alt+1 … Alt+8', 'Switch tabs'],
-      ['?', 'Show this list']
-    ];
+      ['Shift+F10 / Menu key', 'Cell and column actions (Override, fill or clear a column, Late work…, final letters)'],
+      ['Ctrl+L', 'Late work of the active score cell (weeks late, penalty waived); while typing a score, it is saved first']
+    ] },
+    { group: 'Attendance grid (per session)', rows: [
+      ['P / A / E', 'Present / Absent (not allowed) / Excused (allowed); the next student is selected. With several cells selected, marks them all'],
+      ['Space', 'Change the mark of one cell: Present, Absent, Excused, no mark'],
+      ['Delete / Backspace', 'Clear the mark of the selected cells'],
+      ['Arrow keys / Tab / Enter', 'Move (Ctrl+Arrow, Home / End and PageUp / PageDown too)'],
+      ['Shift+Arrow / Shift+Click', 'Select a range of cells'],
+      ['Shift+F10 / Menu key', 'Cell actions (a mark, clear, mark everyone without a mark as Present, session options, student details)']
+    ] },
+    { group: 'Roll call', rows: [
+      ['P / A / E', 'Mark the current student and go to the next one'],
+      ['Delete / Backspace', 'Clear the current student’s mark'],
+      ['↑ / ↓', 'Previous / next student'],
+      ['← / →', 'Move between the Present, Absent and Excused buttons']
+    ] },
+    { group: 'Statistics and Import / Export', rows: [
+      ['↑ / ↓', 'In a cutoff of the planner’s sandbox: raise / lower it by 0.5 (with Shift: 0.1)'],
+      ['Alt+↑ / Alt+↓', 'In the export column list: move the column up / down']
+    ] }
+  ];
+
+  function showShortcuts() {
+    var kbds = function (keys) {
+      return keys.split(' / ').map(function (k) { return '<kbd>' + esc(k) + '</kbd>'; }).join(' / ');
+    };
     ui.dialog.open({
       title: 'Keyboard shortcuts',
-      bodyHtml: '<div class="shortcut-list">' + rows.map(function (r) {
-        return '<div>' + r[0].split(' / ').map(function (k) { return '<kbd>' + esc(k) + '</kbd>'; }).join(' / ') + '</div><div>' + esc(r[1]) + '</div>';
-      }).join('') + '</div><p class="muted small" style="margin-top:12px">On a Mac, use Cmd instead of Ctrl.</p>',
+      wide: true,
+      bodyHtml: SHORTCUTS.map(function (g) {
+        return '<h3 class="shortcut-h">' + esc(g.group) + '</h3><div class="shortcut-list">' + g.rows.map(function (r) {
+          return '<div>' + kbds(r[0]) + '</div><div>' + esc(r[1]) + '</div>';
+        }).join('') + '</div>';
+      }).join('') + '<p class="muted small" style="margin-top:12px">On a Mac, use Cmd instead of Ctrl, and Option instead of Alt. ' +
+        'Page shortcuts do not run while you type in a text field or while a dialog is open.</p>',
       buttons: [{ text: 'Close', value: true, primary: true }]
     });
   }
+  app.SHORTCUTS = SHORTCUTS;
+
+  /** Help / About (STAGE6 §3): what the app is, offline use, where the data is stored, a backup reminder,
+   * the version and a relative link to README.md (opens the local file next to index.html). */
+  function showAbout() {
+    var s = store.saveStatus();
+    var backend = s.backend === 'indexeddb' ? 'IndexedDB (the browser’s built-in database)'
+      : s.backend === 'localstorage' ? 'localStorage (the browser’s small key-value store)' : 'memory only: nothing is saved when this tab closes';
+    var last = store.state.meta.lastBackupAt;
+    var age = backupAgeDays();
+    var stale = age === null || age > BACKUP_REMINDER_DAYS;
+    ui.dialog.open({
+      title: 'About Grade Tracker',
+      wide: true,
+      bodyHtml: '<div class="about">' +
+        '<p class="about-version"><strong>Grade Tracker</strong> <span class="badge">Version ' + esc(VERSION) + '</span></p>' +
+        '<p>A grade book for teaching assistants that replaces the grading spreadsheet. For each course it keeps the students and teams, ' +
+          'scores and team scores, weighted totals and letter grades, attendance, statistics, a printable summary, an Excel export and a change history.</p>' +
+        '<h3>' + ui.icon('lock', 'icon-sm') + ' Offline and private</h3>' +
+        '<p>It runs from this folder, without a server, an account or an internet connection, and it never sends anything anywhere: ' +
+          'no student data leaves this computer.</p>' +
+        '<h3>' + ui.icon('database', 'icon-sm') + ' Where your data is stored</h3>' +
+        '<p>Only in this browser, on this computer: <strong>' + esc(backend) + '</strong>' + (persisted ? ', marked persistent' : '') + '. ' +
+          'Another browser, another browser profile or a private window does not see it, and clearing this browser’s site data or browsing data deletes it.</p>' +
+        '<h3>' + ui.icon('save', 'icon-sm') + ' Back up regularly</h3>' +
+        '<p' + (stale ? ' class="about-stale"' : '') + '>' + (last ? 'Last backup: <strong>' + esc(ui.relativeTime(last)) + '</strong> (' + esc(ui.dateTime(last)) + ').'
+          : '<strong>No backup yet.</strong>') + ' Download a backup (the Backup button at the top, or Data → Download backup) at least once a week: ' +
+          'a reminder appears after ' + BACKUP_REMINDER_DAYS + ' days. Keep backup files private, never in a shared or public folder. ' +
+          'Data → Restore from backup brings a backup back.</p>' +
+        '<h3>' + ui.icon('file', 'icon-sm') + ' More help</h3>' +
+        '<p>The <a href="README.md" target="_blank" rel="noopener" class="about-readme">README.md</a> file in this folder explains how to open the app, ' +
+          'backup and restore, how every formula works, the placeholder settings that still need confirmation, and Excel export and import. ' +
+          'Press <kbd>?</kbd> for the keyboard shortcuts.</p>' +
+        '</div>',
+      buttons: [
+        { text: 'Keyboard shortcuts', value: 'shortcuts' },
+        { text: 'Download backup', value: 'backup' },
+        { spacer: true },
+        { text: 'Close', value: true, primary: true }
+      ]
+    }).then(function (v) {
+      if (v === 'shortcuts') showShortcuts();
+      else if (v === 'backup') doBackup();
+    });
+  }
+  app.showAbout = showAbout;
   app.showShortcuts = showShortcuts;
 
   // ------------------------------------------------------------------ events
@@ -584,6 +684,7 @@
         app.navigate(a.getAttribute('data-view'), sec ? { section: sec } : undefined);
       }
       else if (act === 'shortcuts') showShortcuts();
+      else if (act === 'about') showAbout();
       else if (act === 'download-raw') {
         var src = a.getAttribute('data-src') === 'recovered' ? recovered : loadProblem;
         if (!src) return;

@@ -1027,8 +1027,14 @@
     }
     var s = d.students[wi.sid], a = model.findAssessment(c, wi.aid), letter = wi.letter;
     var r = d.results.byId[wi.sid];
-    var sOpts = students.map(function (x) {
-      return '<option value="' + esc(x.id) + '"' + sel(x.id === wi.sid) + '>' + esc((noOf(x) ? 'No ' + noOf(x) + ' · ' : '') + nameOf(x)) + '</option>';
+    // A native <select> cannot be blurred: in privacy mode its options show the student's No only
+    // (as the History tab's student filter does).
+    var privacy = !!(GT.store.state && GT.store.state.ui && GT.store.state.ui.privacy);
+    var sOpts = students.map(function (x, k) {
+      var label = privacy
+        ? (noOf(x) ? 'No ' + noOf(x) : 'Student ' + (k + 1) + ' (no No)')
+        : (noOf(x) ? 'No ' + noOf(x) + ' · ' : '') + nameOf(x);
+      return '<option value="' + esc(x.id) + '"' + sel(x.id === wi.sid) + '>' + esc(label) + '</option>';
     }).join('');
     var aOpts = wa.map(function (x) {
       var it = r && r.items ? r.items[x.id] : null;

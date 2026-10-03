@@ -189,7 +189,7 @@
     if (hasAnyData() && !dismissed.backup && (age === null || age > BACKUP_REMINDER_DAYS)) {
       var msg = age === null
         ? '<strong>No backup yet.</strong> Browser storage can be cleared (for example by clearing site data), so download a backup regularly.'
-        : '<strong>Your last backup was ' + Math.floor(age) + ' days ago.</strong> Download a new backup to protect recent changes.';
+        : '<strong>Your last backup was ' + esc(ui.relativeTime(st.meta.lastBackupAt)) + '.</strong> Download a new backup to protect recent changes.';
       out.push(banner('warn', 'save', msg,
         '<button class="btn btn-sm btn-primary" data-act="backup">Back up now</button><button class="btn btn-sm btn-ghost" data-act="dismiss" data-key="backup">Later</button>'));
     }

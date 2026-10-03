@@ -5,9 +5,8 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 - **Private by design:** there is no server, no account, and no internet use. Grades stay in this browser on this computer.
 - **No install:** open `index.html` in Chrome, Edge, Firefox, or Safari.
 
-> **Status (paused 2026-09-28):** grades, teams, final letters, attendance, and Excel/CSV export and import are done and tested.
-> Still to come: the Statistics tab, the late-work dialog, the printable Summary tab, and the full guide to formulas and placeholders.
-> See `docs/build/RESUME.md`.
+> **Status: complete (2026-10-03).** All stages are built and tested. See `docs/build/RESUME.md` for the
+> build record.
 
 ## Open the app
 
@@ -38,7 +37,9 @@ Always open the same `index.html` in the same browser: the data is saved in that
    edits, duplicates or deletes a course. Each course has its own students, scores, attendance, teams and
    settings.
 2. To try the app first, use **⋯ → Load sample data**. It creates fake students ("Student 01", "Student 02",
-   …). When you are done trying, delete the course or load your real roster over it.
+   …). When you are done trying, **remove the fake students before adding real ones**: delete
+   the course (**⋯ → Delete course…**) and add it again from its template (**⋯ → Add course…**), or use
+   **Data → Delete all data**. Paste roster and Import only *add* students; they never replace the sample ones.
 3. Add the real students in one of two ways, on your own computer:
    - **Paste roster** (Grades or Students & Teams tab): copy the name columns in Excel and paste them. A
      preview shows how each line will be read before anything is added.
@@ -74,7 +75,7 @@ The **Grades** tab works like a spreadsheet: one row per student.
 
 The letter from the cutoffs is only a **suggestion** (the "Suggested" column). The instructor picks every
 student's **Final letter** by hand, usually in bands after sorting by total. Once final letters are
-assigned, they are the grades (the export uses them, and so will the statistics, added in a later stage).
+assigned, they are the grades (the export, the Statistics tab and the Summary use them).
 
 1. Enter every score. **Class/Project Participation** is out of 5 (5 = full marks, worth 5% of the total)
    and is picked from a drop-down list: 5, 4.5, 4 … 0. Typing a value from the list also works; anything else
@@ -166,8 +167,9 @@ The **Statistics** tab updates live and counts **active students only** (withdra
 - Quartiles with a box plot, the pass rate, a histogram, the letter-grade distribution (final letters, or the
   suggestions from the cutoffs), each assessment's average / median / min / max, the top and bottom five, and a
   summary per team.
-- **What-if calculator**: pick a student, an assessment that is still empty, and a target letter. It shows the
-  score needed on that assessment (on time), with every other score left as it is.
+- **What-if calculator**: pick a student, an assessment (usually one that is still empty; a score already
+  there is replaced in the calculation) and a target letter. It shows the score needed on that assessment
+  (on time), with every other score left as it is.
 - **Cutoff planner** (for the grading meeting): every student's total is a dot on a line, with the cutoffs
   drawn over it and the largest gaps between students shaded. Change cutoffs in the *sandbox* and see who
   would change letter. Nothing is saved until you press **Apply cutoffs to Settings** (changes the suggested
@@ -246,7 +248,9 @@ Open the **Import / Export** tab. Files are made and read on this computer only;
 1. Choose a **preset**. The default, *Previous sheet layout*, has the columns of the previous TA's sheet:
    No, Last Name, First Name, the scores, the weighted scores ("Project I 10%" …), Total, Letter Grade, then
    Excused (allowed), Unexcused (not allowed), Total absences, and Status (withdrawn students are included and
-   marked). *Names, total and letter* and *Everything* are also built in.
+   marked). When the course has late work, a "*item*: weeks late" column is added after the weighted scores
+   for each item with late entries, so the late formula can be read. *Names, total and letter* and
+   *Everything* are also built in.
 2. Tick, untick or reorder columns (arrow buttons, Alt+↑/↓, or drag). Columns that do not apply, such as
    absences while attendance is off, are greyed out with the reason. **Save as preset…** keeps your choice
    for this course (Rename and Delete work on your own presets; Ctrl+Z undoes them).

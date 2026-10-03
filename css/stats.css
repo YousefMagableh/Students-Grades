@@ -9,7 +9,7 @@
   --st-mark: var(--accent);             /* the one series color (bars, dots, sandbox lines) */
   --st-mark-fail: var(--danger);        /* letters below the passing grade (status: always with a legend) */
   --st-mark-other: var(--text-faint);   /* final letters that are not in the scale */
-  --st-gap: var(--warn-bg);             /* shaded gaps in the cutoff planner */
+  --st-gap: color-mix(in srgb, var(--warn-bg) 65%, transparent); /* shaded gaps in the cutoff planner */
   --st-box: var(--accent-soft);
   gap: 16px;
 }
@@ -52,7 +52,8 @@ html[data-theme="dark"] .view-stats {
 .st-card-head { align-items: flex-start; }
 .st-card-title { min-width: 0; flex: 1 1 320px; }
 .st-card-title h2 { margin: 0; font-size: 16px; }
-.st-card-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--text-muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.st-card-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--text-muted); line-height: 1.6; }
+.st-card-sub .badge { margin-left: 2px; }
 .st-card-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .st-sub-h { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); margin: 0 0 8px; }
 .st-cap { font-size: 12px; color: var(--text-muted); margin: 10px 0 0; line-height: 1.45; }
@@ -148,6 +149,8 @@ html[data-theme="dark"] .view-stats {
 .st-tickm { stroke: var(--border-strong); stroke-width: 1; }
 .st-tick { fill: var(--text-muted); font-variant-numeric: tabular-nums; }
 .st-val { fill: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
+/* A halo in the surface color keeps value labels readable where a reference line passes behind them. */
+.st-labels text { paint-order: stroke; stroke: var(--bg-elev); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
 .st-xl { fill: var(--text); font-weight: 700; }
 .st-svg text.st-xl { font-size: 12px; }
 .st-yl { fill: var(--text); }
@@ -185,6 +188,7 @@ html[data-theme="dark"] .view-stats {
 .st-flush { padding: 0; }
 .st-noborder { border: 0; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 .st-table th.st-rh { font-weight: 600; color: var(--text); white-space: nowrap; }
+.st-table tr:last-child th { border-bottom: 0; }
 .st-table td, .st-table th { white-space: nowrap; }
 .st-table .badge { margin-left: 2px; }
 .st-mini th, .st-mini td { padding: 6px 9px; }
@@ -230,19 +234,21 @@ html[data-theme="dark"] .view-stats {
 
 /* ------------------------------------------------------------------ 9. cutoff planner */
 
-.st-pl-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); gap: 18px 28px; align-items: start; }
-.st-pl-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.st-pl-side { min-width: 0; }
+.st-pl-body { display: flex; flex-direction: column; gap: 6px; }
+.st-pl-grid { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 18px 32px; align-items: start; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.st-pl-side, .st-pl-changes, .st-pl-plot { min-width: 0; }
+.st-pl-changes .st-tall { max-height: 560px; }
 .st-pl-line { margin: 0 0 4px; font-size: 13px; }
-.st-pl-state { display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap; color: var(--text-muted); }
+.st-pl-state { display: flex; align-items: flex-start; gap: 7px; color: var(--text-muted); }
+.st-pl-state > .icon { margin-top: 2px; }
 .st-pl-state .icon { color: var(--info); }
 .st-pl-chg { color: var(--text); }
 .st-pl-chg .icon { color: var(--accent); }
 .st-pl-err { color: var(--danger); }
 .st-pl-err .icon { color: var(--danger); }
+.st-pl-empty { display: flex; align-items: flex-start; gap: 8px; margin: 0; padding: 14px; font-size: 13px; color: var(--text-muted); background: var(--bg-sunken); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+.st-pl-empty .icon { margin-top: 2px; color: var(--info); }
 .st-pl-tools { display: flex; justify-content: flex-end; }
-.st-pl-plot { min-width: 0; }
-.st-pl-changes:not(:empty) { margin-top: 14px; }
 .st-gap { fill: var(--st-gap); }
 .st-gapg:hover .st-gap { fill: color-mix(in srgb, var(--st-gap) 70%, var(--warn-border)); }
 .st-cut line { stroke: var(--text-faint); stroke-width: 1; }
@@ -288,11 +294,11 @@ input.st-within-in { width: 64px; text-align: right; }
 
 @media (max-width: 1100px) {
   .st-cols { gap: 18px 24px; }
-  .st-pl-body { grid-template-columns: minmax(0, 1fr); }
   .st-wi { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 860px) {
   .st-cols { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+  .st-pl-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 720px) {
   .view-stats { gap: 12px; }
@@ -323,8 +329,12 @@ input.st-within-in { width: 64px; text-align: right; }
   .view-stats #st-assess, .view-stats #st-teams, .view-stats #st-planner, .view-stats #st-border { break-inside: auto; page-break-inside: auto; }
   .st-jump, .st-measure, .st-card-tools .segmented, .st-tbl-btn, .st-pl-tools, .st-sb-actions, .st-link, .st-head-actions { display: none !important; }
   .st-twrap, .st-twrap.st-tall { max-height: none; overflow: visible; }
+  /* Tables must fit the paper: wrap cells, tighter padding, shorter inline bars. */
+  .st-table th, .st-table td, .view-stats .st-table thead th { white-space: normal; padding: 4px 6px; font-size: 10.5px; }
+  .st-assess-table tbody th { min-width: 0; }
+  .st-ibar { width: 36px; margin-right: 4px; }
   .st-two, .st-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .st-pl-body, .st-wi { grid-template-columns: minmax(0, 1fr); }
+  .st-pl-grid, .st-wi { grid-template-columns: minmax(0, 1fr); }
   .st-svg { max-width: 100%; }
   .st-mark:hover .st-hit, .st-dot:hover .st-hit { fill: transparent; }
   input.st-sbin { border: 0; background: transparent; padding: 0; min-height: 0; }

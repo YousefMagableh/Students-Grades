@@ -216,7 +216,7 @@
   border-color: var(--border-strong); background: var(--bg-sunken); color: var(--text-muted); font-weight: 600;
 }
 .gt-grid td.c-raw .mk-late { float: left; margin: 1px 4px 0 -3px; }
-.gt-grid td.c-raw .mk + .mk-late { margin-left: 0; }
+.gt-grid td.c-raw .mk ~ .mk-late { margin-left: 0; }
 .team-score .mk-late { margin-right: 4px; vertical-align: 1px; }
 .grid-legend .mk-late { vertical-align: 0; }
 .gt-grid tr.row-withdrawn .mk-late:not(.is-waived) { color: var(--withdrawn-text); border-color: var(--border-strong); background: var(--bg-sunken); }

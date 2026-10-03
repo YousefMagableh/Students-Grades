@@ -1111,7 +1111,7 @@
         '<div>' + esc(phNote(course, 'lateWork')) + '</div></div>';
     }
     h += '<div class="set-late-grid"><div data-ph-anchor="lateWork">' + textField('late:perWeek', 'Points deducted per week late', String(perWeek), {
-      numeric: true, badge: lateBadge, cls: 'set-in-num', suffix: 'points per week',
+      numeric: true, cls: 'set-in-num', suffix: 'points per week',
       help: 'On a 100-point score; 0 turns the late penalty off. Default 10.'
     }) + lockNoteHtml(course, 'totals') + '</div>';
     var ex = util.fix(2 * perWeek);

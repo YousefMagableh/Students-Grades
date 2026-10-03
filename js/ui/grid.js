@@ -6,6 +6,10 @@
  * score cells (assessment.choices), band assignment over a selected range, column fill menus,
  * finalize / unlock (locked score cells), a stable row order ("Order changed: re-sort"), the
  * Meeting view and the three absence columns.
+ * Stage 6 (K4): late work. "Late work…" in the cell menu and Ctrl+L (also GT.ui.openLateWork) open a
+ * dialog for weeks late and "penalty waived" (on the team entry for a team cell without an override),
+ * read-only while the scores are finalized; raw cells show an "L2" / "L2✓" badge.
+ * navigate('grades', { focus: { studentId, assessmentId } }) selects a raw score cell.
  * Browser only. See docs/DESIGN.md section 6, the stage-2 spec (section 4) and the stage-2b spec. */
 (function (root) {
   'use strict';
@@ -51,7 +55,6 @@
   var BADGE_W = 21;    // compact placeholder badge in a header (with its margin)
   var LOCKED_MSG = 'Scores are finalized. Unlock them to edit.';
   var LATE_LOCKED_MSG = 'Scores are finalized. Unlock them to change late work.';
-  var LATE_W = 30;     // extra width of a raw column that shows a late badge ("L2✓")
   var LATE_MAX = 52;   // weeks late accepted in the dialog (a year; util.parseCount accepts more)
   var NOTE_MAX = 200;        // characters of the Finalize note (the banner shows at most NOTE_SHOWN)
   var NOTE_SHOWN = 120;
@@ -494,8 +497,10 @@
     return (measure.cache[key] = Math.ceil(w));
   }
 
-  /** Assessment ids whose raw column shows a late badge in some row (any student, withdrawn included). */
-  function lateItems(course, results) {
+  /** Width (px) the cells of a raw column need for their late badges: per assessment id, the widest row
+   * with a badge (padding, the team or override marker, the "L2✓" badge and the score as shown).
+   * Columns without late work are not in the map. fontSize: the body text size (13, Meeting view 15). */
+  function lateNeeds(course, results, fontSize) {
     var out = Object.create(null);
     if (!results || !results.byId) return out;
     course.students.forEach(function (s) {
@@ -503,7 +508,12 @@
       if (!r) return;
       course.assessments.forEach(function (a) {
         var d = r.items[a.id];
-        if (d && d.weeksLate > 0) out[a.id] = true;
+        if (!d || !(d.weeksLate > 0)) return;
+        var badge = Math.max(18, textWidth('L' + d.weeksLate + (d.waived ? '✓' : ''), 700, 10.5) + 10) + 1; // css: .mk-late
+        var marker = d.source === 'team' ? 16 : d.source === 'override' ? 12 : 0; // marker plus the badge's margin after it
+        var text = d.state === 'number' ? String(d.raw) : d.state === 'invalid' ? String(d.text || '') : '–';
+        var need = 16 + 4 + marker + badge + textWidth(text, d.state === 'number' && !d.outOfRange && !d.notOnList ? 400 : 600, fontSize);
+        if (!(out[a.id] >= need)) out[a.id] = need;
       });
     });
     return out;
@@ -512,7 +522,7 @@
   function buildColumns(course, prefs, results) {
     var meet = prefs.meeting;
     var locked = isFinalized(course);
-    var late = lateItems(course, results);
+    var late = lateNeeds(course, results, meet ? 15 : 13);
     var w = meet ? WM : W;
     var pad = meet ? HEAD_PAD_MEET : HEAD_PAD;
     var cols = [
@@ -537,8 +547,9 @@
       var weightLine = Math.max(subW(num(a.weight, 4) + '%') + badgeW(weightPlaceholderKey(a)), a.teamGraded ? subW('· team') : 0);
       // Meeting view: a short name stays on one line ("Project" / "I" would read badly).
       var name = meet && String(a.name).length <= 12 ? nameW(a.name) : longestWordW(a.name);
-      // A column with late work leaves room for the "L2✓" badge next to the score.
-      return clamp(Math.max(name, maxLine, weightLine) + pad, 64, 164) + (late[a.id] ? LATE_W : 0);
+      // A column with late work makes room for the "L2✓" badge next to the score (only as much as it needs,
+      // so the Meeting view still fits at 1280 px).
+      return Math.max(clamp(Math.max(name, maxLine, weightLine) + pad, 64, 164), late[a.id] ? Math.min(Math.ceil(late[a.id]), 200) : 0);
     };
     // Weighted headers read "Project I 10%": a short name stays on one line, the weight may wrap.
     var weightedWidth = function (a) {
@@ -2493,6 +2504,7 @@
     var shim = Object.assign({}, course);
     var mapKey = t.source === 'team' ? 'teamScores' : 'scores';
     var owner = t.source === 'team' ? t.team.id : s.id;
+    if (!util.isSafeKey(owner) || !util.isSafeKey(a.id)) return calc.studentResult(course, s); // never write such keys
     shim[mapKey] = Object.assign({}, course[mapKey]);
     shim[mapKey][owner] = Object.assign({}, course[mapKey][owner] || {});
     shim[mapKey][owner][a.id] = next;
@@ -4058,6 +4070,11 @@
       (k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight')) {
       e.preventDefault();
       commitEdit(k === 'ArrowUp' ? 'up' : k === 'ArrowDown' ? 'down' : k === 'ArrowLeft' ? 'left' : 'right', {});
+    } else if (mod && !e.altKey && !e.shiftKey && (k === 'l' || k === 'L') && ed.col && ed.col.kind === 'raw') {
+      // Ctrl+L while typing a score: save it first (like Enter without moving), then "Late work…".
+      e.preventDefault();
+      var lsid = ed.sid, laid = ed.aid;
+      if (commitEdit(null, {})) openLateDialog(lsid, laid);
     } else if (ed.list && ed.kind !== 'team' && !mod && !e.altKey && k.length === 1 && k !== ' ') {
       // Type-ahead in the list: "4" picks 4 (not 4.5); "b+" picks B+.
       e.preventDefault();

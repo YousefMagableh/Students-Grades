@@ -34,6 +34,7 @@
   var BIN_RULE_FALLBACK = '"90 - 100" includes both 90 and 100. Every other row starts at its first number and stops just ' +
     'below the next ten, so 89.99 counts in "80 - 89". Values above 100 (a curve) and below 0 have their own rows.';
   var TOP_N = 5;
+  var CUT = 4;     // decimals for letter cutoffs: always shown exactly, whatever the display decimals
   var MAX_GAPS = 6;
   var SECTIONS = [
     { id: 'st-overview', label: 'Overview' },
@@ -58,6 +59,7 @@
   var wi = { sid: null, aid: null, letter: null, aidAuto: true, letterAuto: true }; // what-if choices
   var sb = null;             // planner sandbox: { courseId, base, baseKey, rows, text, err, note }
   var withinText = null;     // borderline distance typed but not valid yet
+  var scrollPos = {};        // data-scroll key -> [scrollLeft, scrollTop] of a table box
   var lastRenderMs = 0;
   var globalBound = false;
   var resizeTimer = null;
@@ -154,6 +156,7 @@
       wi = { sid: null, aid: null, letter: null, aidAuto: true, letterAuto: true };
       sb = null;
       withinText = null;
+      scrollPos = {};
     }
     if (!ready()) {
       setShell(el, 'loading', '<div class="empty-state st-loading" role="status">' + icon('chart', 'st-empty-ico') +
@@ -233,6 +236,7 @@
     el.addEventListener('input', onInput);
     el.addEventListener('keydown', onKeyDown);
     el.addEventListener('toggle', onToggle, true);
+    el.addEventListener('scroll', onScroll, true);
   }
 
   function bindGlobal() {
@@ -271,8 +275,8 @@
       '<section class="card st-card st-planner" id="st-planner" aria-labelledby="st-h-planner">' +
         '<div class="st-pl-head"></div>' +
         '<div class="card-body st-pl-body">' +
-          '<div class="st-pl-main"><div class="st-pl-sum" aria-live="polite"></div><div class="st-pl-plot"></div><div class="st-pl-changes"></div></div>' +
-          '<div class="st-pl-side"></div>' +
+          '<div class="st-pl-sum" aria-live="polite"></div><div class="st-pl-plot"></div>' +
+          '<div class="st-pl-grid"><div class="st-pl-side"></div><div class="st-pl-changes"></div></div>' +
         '</div>' +
       '</section>' +
       '<section class="card st-card" id="st-border" aria-labelledby="st-h-border"></section>';
@@ -331,10 +335,9 @@
       had.value !== had.defaultValue ? had.value : null;
     var start = null, end = null;
     try { start = had ? had.selectionStart : null; end = had ? had.selectionEnd : null; } catch (e) { start = end = null; }
-    var scrollers = keepScroll(host);
     host.innerHTML = html;
     host.__stHtml = html;
-    restoreScroll(host, scrollers);
+    restoreScroll(host);
     if (!had) return;
     var next = key ? host.querySelector(key) : null;
     if (!next) next = host.querySelector('button:not([disabled]), select, input:not([disabled])');
@@ -345,17 +348,19 @@
       try { next.setSelectionRange(start, end); } catch (e3) { /* not a text field */ }
     }
   }
-  /** Horizontal scroll of the table boxes in a host (kept across a rewrite of that host). */
-  function keepScroll(host) {
-    var out = [];
-    var list = host.querySelectorAll('[data-scroll]');
-    for (var i = 0; i < list.length; i++) if (list[i].scrollLeft || list[i].scrollTop) out.push([list[i].getAttribute('data-scroll'), list[i].scrollLeft, list[i].scrollTop]);
-    return out;
+  /** Scroll positions of the table boxes, recorded as the user scrolls them (reading them during a render
+   * would force a layout after every section write), and put back after a rewrite of their section. */
+  function onScroll(e) {
+    var t = e.target;
+    var k = t && t.getAttribute ? t.getAttribute('data-scroll') : null;
+    if (k) scrollPos[k] = [t.scrollLeft, t.scrollTop];
   }
-  function restoreScroll(host, list) {
-    list.forEach(function (x) {
-      var el = host.querySelector('[data-scroll="' + cssEsc(x[0]) + '"]');
-      if (el) { el.scrollLeft = x[1]; el.scrollTop = x[2]; }
+  function restoreScroll(host) {
+    Object.keys(scrollPos).forEach(function (k) {
+      var p = scrollPos[k];
+      if (!p[0] && !p[1]) return;
+      var el = host.querySelector('[data-scroll="' + cssEsc(k) + '"]');
+      if (el) { el.scrollLeft = p[0]; el.scrollTop = p[1]; }
     });
   }
 
@@ -717,7 +722,7 @@
 
   function histSvg(bins, d, W) {
     var D = d.D, t = d.tDesc, n = d.totals.length;
-    var H = 236, mt = 34, mr = 10, mb = 26, ml = 30;
+    var H = 246, mt = 44, mr = 10, mb = 26, ml = 30;
     var pw = W - ml - mr, ph = H - mt - mb;
     var nb = bins.length;
     var lo = bins[0].lo, hi = bins[nb - 1].hi;
@@ -737,6 +742,7 @@
         '<text class="st-tick" x="' + (ml - 6) + '" y="' + r1(y(v) + 4) + '" text-anchor="end">' + v + '</text>';
     });
     out += '</g>';
+    var labels = '';
     bins.forEach(function (b, i) {
       var cx = ml + band * i + band / 2;
       var h = b.count / ct.top * ph;
@@ -745,8 +751,8 @@
         (b.above ? ', including ' + b.above + ' above ' + fmt(b.hi, 2) : '') + (b.below ? ', including ' + b.below + ' below ' + fmt(b.lo, 2) : '');
       out += '<g class="st-mark"><title>' + esc(tip) + '</title>' +
         '<rect class="st-hit" x="' + r1(ml + band * i) + '" y="' + mt + '" width="' + r1(band) + '" height="' + ph + '"/>' +
-        (b.count ? '<path class="st-bar" d="' + colPath(cx - bw / 2, mt + ph - h, bw, h) + '"/>' +
-          '<text class="st-val" x="' + r1(cx) + '" y="' + r1(mt + ph - h - 5) + '" text-anchor="middle">' + b.count + '</text>' : '') + '</g>';
+        (b.count ? '<path class="st-bar" d="' + colPath(cx - bw / 2, mt + ph - h, bw, h) + '"/>' : '') + '</g>';
+      if (b.count) labels += '<text class="st-val" x="' + r1(cx) + '" y="' + r1(mt + ph - h - 5) + '" text-anchor="middle">' + b.count + '</text>';
     });
     // x axis: bin edges
     var every = band < 26 ? Math.ceil(26 / band) : 1;
@@ -758,21 +764,29 @@
       out += '<text class="st-tick" x="' + r1(xx) + '" y="' + (mt + ph + 16) + '" text-anchor="middle">' + esc(fmt(v, 1)) + '</text>';
     }
     out += '</g>';
-    // average and median lines, labeled on opposite sides so they never collide
+    // Average and median lines, labelled on opposite sides; when the labels would still touch (a narrow
+    // chart, a line near an edge), the median label moves up one row.
     if (finite(t.mean) && finite(t.median)) {
       var meanLeft = t.mean <= t.median;
-      out += refLine(xv(t.mean), mt, mt + ph, 'Average ' + fmt(t.mean, D), meanLeft ? 'end' : 'start', ml, ml + pw, 'st-ref st-ref-mean');
-      out += refLine(xv(t.median), mt, mt + ph, 'Median ' + fmt(t.median, D), meanLeft ? 'start' : 'end', ml, ml + pw, 'st-ref st-ref-med');
+      var a = refLabel(xv(t.mean), 'Average ' + fmt(t.mean, D), meanLeft ? 'end' : 'start', ml, ml + pw);
+      var b = refLabel(xv(t.median), 'Median ' + fmt(t.median, D), meanLeft ? 'start' : 'end', ml, ml + pw);
+      var clash = a.x1 < b.x2 + 6 && b.x1 < a.x2 + 6;
+      out += refLine(a, mt - 14, mt + ph, mt - 18, 'st-ref st-ref-mean');
+      out += refLine(b, clash ? mt - 28 : mt - 14, mt + ph, clash ? mt - 32 : mt - 18, 'st-ref st-ref-med');
     }
-    return out + '</svg>';
+    return out + '<g class="st-labels" aria-hidden="true">' + labels + '</g></svg>';
   }
-  function refLine(x, y1, y2, label, anchor, minX, maxX, cls) {
+  /** Where a reference-line label goes: beside the line on the preferred side, flipped near an edge. */
+  function refLabel(x, label, anchor, minX, maxX) {
     var w = textW(label, 11);
     if (anchor === 'end' && x - 4 - w < minX - 6) anchor = 'start';
     if (anchor === 'start' && x + 4 + w > maxX + 8) anchor = 'end';
     var tx = anchor === 'end' ? x - 4 : x + 4;
-    return '<g class="' + cls + '"><title>' + esc(label) + '</title><line x1="' + r1(x) + '" x2="' + r1(x) + '" y1="' + (y1 - 14) + '" y2="' + y2 + '"/>' +
-      '<text class="st-ref-t" x="' + r1(tx) + '" y="' + (y1 - 18) + '" text-anchor="' + anchor + '">' + esc(label) + '</text></g>';
+    return { x: x, label: label, anchor: anchor, tx: tx, x1: anchor === 'end' ? tx - w : tx, x2: anchor === 'end' ? tx : tx + w };
+  }
+  function refLine(p, yTop, yBottom, yText, cls) {
+    return '<g class="' + cls + '"><title>' + esc(p.label) + '</title><line x1="' + r1(p.x) + '" x2="' + r1(p.x) + '" y1="' + yTop + '" y2="' + yBottom + '"/>' +
+      '<text class="st-ref-t" x="' + r1(p.tx) + '" y="' + yText + '" text-anchor="' + p.anchor + '">' + esc(p.label) + '</text></g>';
   }
 
   // ------------------------------------------------------------------ 4. letter distribution
@@ -784,7 +798,9 @@
       '<button type="button" data-act="letters" data-v="suggested" aria-pressed="' + (p.letters === 'suggested') + '" data-k="letters:suggested" title="The letter from the cutoffs in Settings, for every student">Suggested (cutoffs)</button></div>';
     var assigned = finite(sum.assigned) ? sum.assigned : 0, act = finite(sum.active) ? sum.active : d.nActive;
     var sub = '<span class="st-assigned" data-stat="assigned">' + assigned + ' of ' + act + ' final letters assigned</span>' +
-      (p.letters === 'effective' ? (assigned < act ? ' · the others show their suggested letter' : '') : ' · showing the cutoff suggestions for everyone') +
+      (p.letters === 'effective'
+        ? (!assigned ? ' · none yet, so the bars show the suggested letters' : assigned < act ? ' · the others show their suggested letter' : '')
+        : ' · showing the cutoff suggestions for everyone') +
       ' ' + ui.placeholderBadge(c, 'letterScale');
     var head = cardHead('st-h-letters', 'Letter grades', sub, seg + tableToggle('letters', 'letters and counts'));
     var rows = Array.isArray(d.letters) ? d.letters : [];
@@ -794,7 +810,7 @@
     else if (tables.letters) {
       body = '<div class="table-wrap st-twrap" data-scroll="letters"><table class="table st-table"><caption class="sr-only">Students per letter</caption><thead><tr><th scope="col">Letter</th><th scope="col" class="num">Cutoff</th><th scope="col" class="num">Students</th><th scope="col" class="num">Share</th></tr></thead><tbody>' +
         rows.map(function (r) {
-          return '<tr><th scope="row" class="st-rh">' + esc(r.letter) + (r.inScale === false ? ' <span class="st-qual">(not in the scale)</span>' : '') + '</th><td class="num">' + esc(fmtOr(r.min, d.D)) + '</td><td class="num">' + r.count + '</td><td class="num">' + esc(pctOr(r.pct, 1)) + '</td></tr>';
+          return '<tr><th scope="row" class="st-rh">' + esc(r.letter) + (r.inScale === false ? ' <span class="st-qual">(not in the scale)</span>' : '') + '</th><td class="num">' + esc(fmtOr(r.min, CUT)) + '</td><td class="num">' + r.count + '</td><td class="num">' + esc(pctOr(r.pct, 1)) + '</td></tr>';
         }).join('') + '</tbody></table></div>';
     } else body = lettersSvg(rows, passIdx, d, W);
     var note = ui.placeholderBadge(c, 'letterScale') ? '<p class="st-cap st-ph-note">' + icon('alert', 'icon-sm') + ' ' + esc(model.placeholderInfo(c, 'letterScale').note) + '</p>' : '';
@@ -832,7 +848,7 @@
       var h = r.count / ct.top * ph;
       var li = d.scaleLetters.indexOf(r.letter);
       var cls = r.inScale === false || li === -1 ? 'st-bar st-bar-other' : (passIdx !== -1 && li > passIdx ? 'st-bar st-bar-fail' : 'st-bar');
-      var tip = r.letter + ': ' + plural(r.count, 'student') + ' (' + pctOr(r.pct, 1) + ')' + (finite(r.min) ? ', cutoff ' + fmt(r.min, d.D) : ', not in the scale');
+      var tip = r.letter + ': ' + plural(r.count, 'student') + ' (' + pctOr(r.pct, 1) + ')' + (finite(r.min) ? ', cutoff ' + fmt(r.min, CUT) : ', not in the scale');
       out += '<g class="st-mark"><title>' + esc(tip) + '</title>' +
         '<rect class="st-hit" x="' + r1(ml + band * i) + '" y="' + mt + '" width="' + r1(band) + '" height="' + (ph + mb) + '"/>' +
         (r.count ? '<path class="' + cls + '" d="' + colPath(cx - bw / 2, mt + ph - h, bw, h) + '"/>' +
@@ -936,13 +952,21 @@
     var x = function (v) { return lw + Math.max(0, Math.min(maxV, v)) / maxV * pw; };
     var out = svgOpen('st-team-svg', W, H, 'st-svg-teams', 'Average total per team',
       list.map(function (t) { return t.name + ' ' + fmt(t.mean, D); }).join(', ') + (finite(avg) ? '. Class average ' + fmt(avg, D) + '.' : '.') + ' The table below has the same numbers.');
-    var step = valueStep(maxV, pw, 44);
+    var step = valueStep(maxV, pw, 64);
     out += '<g class="st-grid">';
     for (var v = 0; v <= maxV + 1e-9; v += step) {
       out += '<line x1="' + r1(x(v)) + '" x2="' + r1(x(v)) + '" y1="' + mt + '" y2="' + (H - mb) + '"' + (v === 0 ? ' class="st-base"' : '') + '/>' +
         '<text class="st-tick" x="' + r1(x(v)) + '" y="' + (H - mb + 15) + '" text-anchor="middle">' + v + '</text>';
     }
     out += '</g>';
+    if (finite(avg)) {
+      var ax = x(avg);
+      var at = 'Class average ' + fmt(avg, 1);
+      var anchor = ax + textW(at, 11) / 2 > W - 2 ? 'end' : 'middle';
+      out += '<g class="st-ref st-ref-mean"><title>' + esc('Class average ' + fmt(avg, D)) + '</title><line x1="' + r1(ax) + '" x2="' + r1(ax) + '" y1="' + (mt - 6) + '" y2="' + (H - mb) + '"/>' +
+        '<text class="st-ref-t" x="' + r1(anchor === 'end' ? ax + 4 : ax) + '" y="' + (mt - 10) + '" text-anchor="' + anchor + '">' + esc(at) + '</text></g>';
+    }
+    var labels = '';
     list.forEach(function (t, i) {
       var yy = mt + i * rowH + (rowH - bh) / 2;
       var w = Math.max(1, x(t.mean) - lw);
@@ -950,15 +974,10 @@
       out += '<g class="st-mark"><title>' + esc(tip) + '</title>' +
         '<rect class="st-hit" x="0" y="' + r1(mt + i * rowH) + '" width="' + W + '" height="' + rowH + '"/>' +
         '<text class="st-yl" x="' + (lw - 8) + '" y="' + r1(yy + bh / 2 + 4) + '" text-anchor="end">' + esc(t.name) + '</text>' +
-        '<path class="st-bar" d="' + barPath(lw, yy, w, bh) + '"/>' +
-        '<text class="st-val" x="' + r1(lw + w + 5) + '" y="' + r1(yy + bh / 2 + 4) + '">' + esc(fmt(t.mean, 1)) + '</text></g>';
+        '<path class="st-bar" d="' + barPath(lw, yy, w, bh) + '"/></g>';
+      labels += '<text class="st-val" x="' + r1(lw + w + 5) + '" y="' + r1(yy + bh / 2 + 4) + '">' + esc(fmt(t.mean, 1)) + '</text>';
     });
-    if (finite(avg)) {
-      var ax = x(avg);
-      out += '<g class="st-ref st-ref-mean"><title>' + esc('Class average ' + fmt(avg, D)) + '</title><line x1="' + r1(ax) + '" x2="' + r1(ax) + '" y1="' + (mt - 6) + '" y2="' + (H - mb) + '"/>' +
-        '<text class="st-ref-t" x="' + r1(ax) + '" y="' + (mt - 10) + '" text-anchor="middle">Class average ' + esc(fmt(avg, 1)) + '</text></g>';
-    }
-    return out + '</svg>';
+    return out + '<g class="st-labels" aria-hidden="true">' + labels + '</g></svg>';
   }
 
   // ------------------------------------------------------------------ 8. what-if (ST2)
@@ -977,7 +996,10 @@
       var it = r && r.items ? r.items[list[i].id] : null;
       if (!it || it.missing) return list[i].id;
     }
-    return list.length ? list[list.length - 1].id : null;
+    // Nothing is empty: the item with the largest weight (usually the final test) is the useful what-if.
+    var best = null;
+    list.forEach(function (a) { if (!best || a.weight > best.weight) best = a; });
+    return best ? best.id : null;
   }
   function defaultLetter(d, sid) {
     var letters = d.scaleLetters, r = d.results.byId[sid];
@@ -1052,16 +1074,19 @@
         var x = calc.neededScore(c, s, a.id, l);
         var min = calc.minTotalForLetter(l, c.settings);
         var cut = (c.settings.letterScale || []).filter(function (row) { return row.letter === l; })[0];
-        var txt, cls = '';
+        var txt, cls = '', tip = '';
+        var need = x ? fmt(ceilTo(x.needed, Math.max(D, 1)), Math.max(D, 1)) : '';
         if (!x) { txt = DASH; }
-        else if (x.alreadyReached) { txt = 'Reached even with 0'; cls = 'st-ok'; }
-        else if (!x.reachable) { txt = 'Not reachable (' + fmt(ceilTo(x.needed, Math.max(D, 1)), Math.max(D, 1)) + ')'; cls = 'st-no'; }
-        else txt = fmt(ceilTo(x.needed, Math.max(D, 1)), Math.max(D, 1)) + ' / ' + fmt(a.maxScore, D);
+        else if (x.alreadyReached) { txt = 'Reached with 0'; cls = 'st-ok'; tip = 'Even a 0 on ' + a.name + ' keeps ' + l + '.'; }
+        else if (!x.reachable) { txt = need + ' (over max)'; cls = 'st-no'; tip = 'Not reachable: would need ' + need + ', more than the max of ' + fmt(a.maxScore, D) + '.'; }
+        else txt = need;
         return '<tr' + (l === letter ? ' class="st-cur"' : '') + '><th scope="row" class="st-rh"><span class="st-letter">' + esc(l) + '</span></th>' +
-          '<td class="num">' + esc(cut ? fmt(cut.min, D) : fmtOr(min, D)) + '</td><td class="num ' + cls + '" data-wl="' + esc(l) + '"' + (x ? ' data-needed="' + x.needed + '"' : '') + '>' + esc(txt) + '</td></tr>';
+          '<td class="num">' + esc(cut ? fmt(cut.min, CUT) : fmtOr(min, CUT)) + '</td><td class="num ' + cls + '" data-wl="' + esc(l) + '"' + (x ? ' data-needed="' + x.needed + '"' : '') +
+          (tip ? ' title="' + esc(tip) + '"' : '') + '>' + esc(txt) + '</td></tr>';
       }).join('');
       table = '<div class="st-wi-table"><h3 class="st-sub-h" id="st-h-wi-all">Score needed on ' + esc(a.name) + ' for every letter</h3>' +
-        '<div class="table-wrap st-twrap" data-scroll="wi"><table class="table st-table st-mini" aria-labelledby="st-h-wi-all"><thead><tr><th scope="col">Letter</th><th scope="col" class="num">Total needed</th><th scope="col" class="num">Score needed</th></tr></thead><tbody>' +
+        '<div class="table-wrap st-twrap" data-scroll="wi"><table class="table st-table st-mini" aria-labelledby="st-h-wi-all"><thead><tr><th scope="col">Letter</th>' +
+        '<th scope="col" class="num" title="The cutoff: the total that earns the letter">Total needed</th><th scope="col" class="num">Score needed <span class="st-qual">(of ' + esc(fmt(a.maxScore, D)) + ')</span></th></tr></thead><tbody>' +
         trs + '</tbody></table></div></div>';
     }
     return head + '<div class="card-body st-wi"><div class="st-wi-main">' + form + nowLine + out + assume + '</div>' + table + '</div>';
@@ -1163,8 +1188,10 @@
   function liveUpdatePlanner() {
     var course = GT.store.course(), results = GT.store.results();
     if (!course || !results || !dom || shellKind !== 'main' || !sb) return;
-    var d = compute(course, results);
     var W = dom.plPlot.clientWidth > 0 ? Math.max(220, dom.plPlot.clientWidth) : 700;
+    // Only what the planner reads (compute() would redo every section for each keystroke).
+    var d = { course: course, results: results, D: decimalsOf(course), students: {}, gaps: call('gaps', [course, results, 1], []) };
+    course.students.forEach(function (s) { d.students[s.id] = s; });
     renderPlanner(d, W);
   }
 
@@ -1179,11 +1206,11 @@
     var parts = [];
     if (sb.note) parts.push('<div class="callout st-callout">' + icon('info') + ' ' + esc(sb.note) + '</div>');
     var line;
-    if (pd.errors) line = '<span class="st-pl-state st-pl-err">' + icon('alert') + 'Fix the highlighted cutoff to see the result.</span>';
-    else if (!pd.changedCutoffs.length) line = '<span class="st-pl-state">' + icon('info') + 'The sandbox matches the cutoffs in Settings. Change a cutoff on the right to try it out.</span>';
+    if (pd.errors) line = '<span class="st-pl-state st-pl-err">' + icon('alert') + '<span>Fix the highlighted cutoff to see the result.</span></span>';
+    else if (!pd.changedCutoffs.length) line = '<span class="st-pl-state">' + icon('info') + '<span>The sandbox matches the cutoffs in Settings. Change a cutoff in the sandbox below to try it out.</span></span>';
     else {
-      line = '<span class="st-pl-state st-pl-chg">' + icon('edit') + '<strong>' + plural(pd.changedCutoffs.length, 'cutoff') + ' changed</strong> · ' +
-        '<strong data-stat="plChanges">' + plural(pd.changes.length, 'student') + '</strong> would get a different letter than now</span>';
+      line = '<span class="st-pl-state st-pl-chg">' + icon('edit') + '<span><strong>' + plural(pd.changedCutoffs.length, 'cutoff') + ' changed</strong> · ' +
+        '<strong data-stat="plChanges">' + plural(pd.changes.length, 'student') + '</strong> would get a different letter than now</span></span>';
     }
     parts.push('<p class="st-pl-line">' + line + '</p>');
     return parts.join('');
@@ -1265,32 +1292,34 @@
         '<text class="st-tick" x="' + r1(x(v)) + '" y="' + (axisY + 16) + '" text-anchor="middle">' + esc(fmt(v, 1)) + '</text>';
     }
     out += '</g>';
-    // current cutoffs (solid) with letter labels above, in two rows when they crowd
+    // current cutoffs (solid) with letter labels above, in two rows when they crowd (placed left to right)
     var ends = [-Infinity, -Infinity];
-    sb.base.forEach(function (row, i) {
-      if (i === sb.base.length - 1 || row.min < lo || row.min > hi) return;
+    sb.base.slice(0, -1).reverse().forEach(function (row) {
+      if (row.min < lo || row.min > hi) return;
       var lx = x(row.min);
       var w = textW(row.letter, 11) + 2;
       var lr = lx + 3 >= ends[0] + 3 ? 0 : (lx + 3 >= ends[1] + 3 ? 1 : -1);
       if (lr !== -1) ends[lr] = lx + 3 + w;
-      out += '<g class="st-cut"><title>' + esc(row.letter + ' starts at ' + fmt(row.min, D) + ' (cutoff in Settings)') + '</title>' +
+      out += '<g class="st-cut"><title>' + esc(row.letter + ' starts at ' + fmt(row.min, CUT) + ' (cutoff in Settings)') + '</title>' +
         '<line x1="' + r1(lx) + '" x2="' + r1(lx) + '" y1="' + (lr === 1 ? mt - 22 : mt - 10) + '" y2="' + axisY + '"/>' +
         (lr !== -1 ? '<text class="st-cut-t" x="' + r1(lx + 3) + '" y="' + (lr === 1 ? mt - 24 : mt - 12) + '">' + esc(row.letter) + '</text>' : '') + '</g>';
     });
     // sandbox cutoffs that differ (dashed), labelled under the axis
     if (hasSb) {
       var sEnd = -Infinity;
-      sb.rows.forEach(function (row, i) {
-        if (i === sb.rows.length - 1 || !sb.base[i] || row.min === sb.base[i].min || row.min < lo || row.min > hi) return;
+      // Lowest cutoff first, so the labels are placed left to right.
+      for (var si = sb.rows.length - 2; si >= 0; si--) {
+        var row = sb.rows[si];
+        if (!sb.base[si] || row.min === sb.base[si].min || row.min < lo || row.min > hi) continue;
         var lx = x(row.min);
-        var label = row.letter + ' ' + fmt(row.min, D);
+        var label = row.letter + ' ' + fmt(row.min, CUT);
         var w = textW(label, 11);
         var showL = lx - w / 2 > sEnd + 4;
         if (showL) sEnd = lx + w / 2;
-        out += '<g class="st-sbcut"><title>' + esc(row.letter + ' would start at ' + fmt(row.min, D) + ' (sandbox; now ' + fmt(sb.base[i].min, D) + ')') + '</title>' +
+        out += '<g class="st-sbcut"><title>' + esc(row.letter + ' would start at ' + fmt(row.min, CUT) + ' (sandbox; now ' + fmt(sb.base[si].min, CUT) + ')') + '</title>' +
           '<line x1="' + r1(lx) + '" x2="' + r1(lx) + '" y1="' + (mt - 4) + '" y2="' + (axisY + 22) + '"/>' +
           (showL ? '<text class="st-sbcut-t" x="' + r1(lx) + '" y="' + (axisY + 36) + '" text-anchor="middle">' + esc(label) + '</text>' : '') + '</g>';
-      });
+      }
     }
     // dots
     sorted.forEach(function (p) {
@@ -1307,16 +1336,21 @@
   }
 
   function plannerChangesHtml(d, pd) {
-    if (pd.errors) return '';
+    var hdr = '<h3 class="st-sub-h" id="st-h-plchg">Students whose letter would change' + (pd.errors ? '' : ' (' + pd.changes.length + ')') + '</h3>';
+    if (pd.errors) return hdr + '<p class="st-pl-empty">' + icon('alert') + 'Fix the highlighted cutoff first.</p>';
     var list = pd.changes;
-    if (!list.length) return '';
+    if (!list.length) {
+      return hdr + '<p class="st-pl-empty">' + icon('info') + (pd.changedCutoffs.length
+        ? 'Nobody: every student keeps the same letter with these cutoffs.'
+        : 'Change a cutoff in the sandbox: the students whose letter would change are listed here, with their letter now and in the sandbox.') + '</p>';
+    }
     var rows = list.map(function (x) {
       var s = d.students[x.studentId];
       return '<tr><td class="num">' + esc(noOf(s)) + '</td><td><span class="pii">' + esc(nameOf(s)) + '</span></td><td class="num">' + esc(fmt(x.total, d.D)) + '</td>' +
         '<td class="st-nowrap"><span class="st-letter">' + esc(x.current || DASH) + '</span>' + (x.finalLetter ? ' <span class="st-qual">final</span>' : '') +
         ' → <span class="st-letter st-letter-new">' + esc(x.simulated || DASH) + '</span></td></tr>';
     }).join('');
-    return '<h3 class="st-sub-h" id="st-h-plchg">Students whose letter would change (' + list.length + ')</h3>' +
+    return hdr +
       '<div class="table-wrap st-twrap st-tall" data-scroll="plchg"><table class="table st-table st-mini" aria-labelledby="st-h-plchg"><thead><tr><th scope="col" class="num">No</th><th scope="col">Name</th><th scope="col" class="num">Total</th><th scope="col">Now → sandbox</th></tr></thead><tbody>' +
       rows + '</tbody></table></div>';
   }
@@ -1337,7 +1371,7 @@
       var sbN = pd.errors ? null : (hasOwn(pd.sbCount, x.letter) ? pd.sbCount[x.letter] : 0);
       var delta = sbN === null ? '' : sbN - nowN;
       return '<tr' + (changed ? ' class="st-chg"' : '') + '><th scope="row" class="st-rh"><span class="st-letter">' + esc(x.letter) + '</span></th>' +
-        '<td class="num">' + esc(fmtOr(base, D)) + '</td><td class="st-sbcell">' + input + '</td>' +
+        '<td class="num">' + esc(fmtOr(base, CUT)) + '</td><td class="st-sbcell">' + input + '</td>' +
         '<td class="num st-nowrap" data-sbcnt="' + i + '">' + nowN + ' → <strong>' + (sbN === null ? '?' : sbN) + '</strong>' +
           (delta ? ' <span class="st-delta ' + (delta > 0 ? 'up' : 'down') + '">' + (delta > 0 ? '+' : MINUS) + Math.abs(delta) + '</span>' : '') + '</td></tr>';
     }).join('');
@@ -1345,7 +1379,8 @@
     var canFinal = !pd.errors && pd.students.length > 0;
     var fc = pd.finalChanges;
     return '<h3 class="st-sub-h" id="st-h-sb">Sandbox scale</h3>' +
-      '<p class="st-cap">Type a new cutoff (the lowest total for that letter). <kbd>↑</kbd>/<kbd>↓</kbd> move it by 0.5 (with <kbd>Shift</kbd>: 0.1).</p>' +
+      '<p class="st-cap">Type a new cutoff: the lowest total that earns the letter. <kbd>↑</kbd>/<kbd>↓</kbd> move it by 0.5 (with <kbd>Shift</kbd>: 0.1). ' +
+        '<strong>Now</strong> is the cutoff in Settings; <strong>Students</strong> counts who has the letter now → with the sandbox.</p>' +
       '<div class="table-wrap st-twrap" data-scroll="sb"><table class="table st-table st-sbtable" aria-labelledby="st-h-sb"><thead><tr><th scope="col">Letter</th><th scope="col" class="num">Now</th><th scope="col">Sandbox</th><th scope="col" class="num" title="Students with this letter now → with the sandbox cutoffs">Students</th></tr></thead><tbody>' +
       rows + '</tbody></table></div>' +
       '<div class="st-sb-actions no-print">' +
@@ -1474,8 +1509,8 @@
       return '<tr><td class="num">' + esc(noOf(s)) + '</td><td><span class="pii">' + esc(nameOf(s)) + '</span></td>' +
         '<td class="num">' + esc(fmt(x.total, D)) + (finite(x.totalUnrounded) && x.totalUnrounded !== x.total ? ' <span class="st-qual" title="Before rounding">(' + esc(fmt(x.totalUnrounded, 4)) + ')</span>' : '') + '</td>' +
         '<td><span class="st-letter">' + esc(x.letter || DASH) + '</span>' + (x.finalAtOrAboveNext ? ' <span class="badge badge-success" title="A final letter at or above the next letter is already set">raised</span>' : '') + '</td>' +
-        '<td><span class="st-letter">' + esc(x.nextLetter || DASH) + '</span>' + (finite(x.cutoff) ? ' <span class="st-qual">from ' + esc(fmt(x.cutoff, D)) + '</span>' : '') + '</td>' +
-        '<td class="num"><strong>+' + esc(fmt(ceilTo(x.gap, Math.max(D, 2)), Math.max(D, 2))) + '</strong></td></tr>';
+        '<td><span class="st-letter">' + esc(x.nextLetter || DASH) + '</span>' + (finite(x.cutoff) ? ' <span class="st-qual">from ' + esc(fmt(x.cutoff, CUT)) + '</span>' : '') + '</td>' +
+        '<td class="num"><strong>+' + esc(util.formatNumber(ceilTo(x.gap, Math.max(D, 2)), Math.max(D, 2), { fixed: true })) + '</strong></td></tr>';
     }).join('');
     return head + '<div class="card-body">' + err + '<div class="table-wrap st-twrap" data-scroll="border"><table class="table st-table"><caption class="sr-only">Borderline students, closest first</caption><thead><tr>' +
       '<th scope="col" class="num">No</th><th scope="col">Name</th><th scope="col" class="num">Total</th><th scope="col">Letter now</th><th scope="col">Next letter</th>' +

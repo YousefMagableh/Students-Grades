@@ -1567,7 +1567,7 @@
     if (!boundEl || !document.body.contains(boundEl)) return;
     ui.$$('.ts-input, .ts-select[data-ts-pending]', boundEl).forEach(function (c) {
       if (c.value === savedTeamValue(c)) return;
-      try { commitTeamScore(c); } catch (e) { if (root.console) console.error(e); }
+      try { commitTeamScore(c); } catch (e) { if (root.console && !(e && e.conflict)) console.error(e); } // a conflict: read-only tab, not a bug
     });
   }
 

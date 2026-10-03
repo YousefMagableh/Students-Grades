@@ -90,7 +90,9 @@
   function whole(x) { return typeof x === 'number' && isFinite(x) ? x : 0; }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
   function now() { return root.performance && root.performance.now ? root.performance.now() : Date.now(); }
-  function logErr(e) { if (root.console) console.error(e); }
+  /** Logs a program error. A save conflict (err.conflict: another tab saved newer data) is not one: the
+   * store's message is shown to the user instead. */
+  function logErr(e) { if (root.console && !(e && e.conflict)) console.error(e); }
   /** 'P' | 'A' | 'E' for a mark key, else ''. A Latin layout uses the typed letter (so AZERTY works);
    * a non-Latin layout (e.g. Arabic) types another letter on those keys, so the physical key decides. */
   function markKey(e) {
@@ -202,7 +204,8 @@
       return GT.store.transact(label, mutator, opts);
     } catch (e) {
       logErr(e);
-      ui.toast('Not saved: ' + (e && e.message ? e.message : String(e)), { type: 'error' });
+      // Another tab saved newer data (read-only tab): the message says so; it is not a program error.
+      ui.toast('Not saved: ' + (e && e.message ? e.message : String(e)), { type: e && e.conflict ? 'warn' : 'error' });
       return undefined;
     }
   }

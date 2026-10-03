@@ -478,10 +478,25 @@
     });
   }
 
+  // True when the last transact() below did not go through: the callers skip their "done" message.
+  var txFailed = false;
+  var conflictToastAt = 0;
+
   function transact(label, fn, opts) {
+    txFailed = false;
     try {
       return GT.store.transact(label, fn, opts);
     } catch (err) {
+      txFailed = true;
+      if (err && err.conflict) {
+        // Another tab saved newer data: this tab is read-only (store.js). Expected, so no console error;
+        // one message, not one per keystroke.
+        if (nowMs() - conflictToastAt > 1500) {
+          conflictToastAt = nowMs();
+          ui.toast('Not saved: ' + (err.message || 'Grade Tracker was changed in another tab. Reload to see the latest data.'), { type: 'warn', timeout: 7000 });
+        }
+        return undefined;
+      }
       if (root.console) console.error(err);
       ui.toast('Could not save the change: ' + (err && err.message ? err.message : String(err)), { type: 'error' });
       return undefined;
@@ -1491,14 +1506,11 @@
       '<button type="button" class="btn btn-sm btn-primary grid-resort" data-act="resort" hidden ' +
       'title="Rows keep their place while you edit. Click to sort them again with the new values.">' + ui.icon('sort-desc') +
       '<span>Order changed: re-sort</span></button>' +
-      // On phones the button labels (.bl) are visually hidden. The legend folds behind "Legend" at every
-      // width (gridPrefs.legend remembers whether it is open).
+      // On phones the button labels (.bl) are visually hidden.
       '<button type="button" class="btn btn-sm" data-act="group" aria-pressed="false" title="Group rows by team">' + ui.icon('layers') + '<span class="bl">Group by team</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="withdrawn" aria-pressed="true">' + ui.icon('user') + '<span class="bl">Show withdrawn</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="columns" aria-haspopup="menu" aria-expanded="false" title="Show or hide columns">' + ui.icon('grid') +
       '<span class="bl">Columns</span>' + ui.icon('chevron-down') + '</button>' +
-      '<button type="button" class="btn btn-sm grid-legend-btn" data-act="legend" aria-expanded="false" aria-controls="grid-legend" title="Show the legend">' +
-      ui.icon('info') + '<span class="bl">Legend</span></button>' +
       '<span class="spacer"></span>' +
       '<span class="grid-count muted small" aria-live="polite"></span>' +
       '<button type="button" class="btn btn-sm" data-act="paste-roster" title="Paste a roster copied from Excel">' + ui.icon('copy') + '<span class="bl">Paste roster</span></button>' +
@@ -1518,6 +1530,10 @@
       '<button type="button" class="btn btn-sm" data-act="copy-suggested" title="Fill the empty final letters of active students with the suggested (cutoff) letters">' +
       ui.icon('copy') + '<span>Copy suggested → final</span></button>' +
       '<span class="spacer"></span>' +
+      // The legend folds behind this button at every width (UX-13; gridPrefs.legend remembers it open). It sits
+      // here, right above the legend, so the main toolbar still fits on one line at 1280 px.
+      '<button type="button" class="btn btn-sm grid-legend-btn" data-act="legend" aria-expanded="false" aria-controls="grid-legend" title="Show the legend">' +
+      ui.icon('info') + '<span>Legend</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="finalize" title="Check the data, then lock the score cells (final letters stay editable)">' +
       ui.icon('lock') + '<span>Finalize scores…</span></button>' +
       '</div>';
@@ -1586,7 +1602,7 @@
       count: tb.querySelector('.grid-count'),
       meeting: bar.querySelector('[data-act="meeting"]'), lettersChip: bar.querySelector('[data-act="letters-chip"]'),
       orderChip: bar.querySelector('[data-act="order-chip"]'), copySuggested: bar.querySelector('[data-act="copy-suggested"]'),
-      finalize: bar.querySelector('[data-act="finalize"]')
+      finalize: bar.querySelector('[data-act="finalize"]'), legendBtn: bar.querySelector('[data-act="legend"]')
     };
     dom.search.value = searchText;
     dom.search.addEventListener('input', function () {
@@ -1700,7 +1716,7 @@
       dom.legend.classList.toggle('is-open', p.legend);
       queueWrapTop();
     }
-    var lb = dom.toolbar.querySelector('[data-act="legend"]');
+    var lb = dom.legendBtn;
     if (lb) {
       lb.setAttribute('aria-expanded', p.legend ? 'true' : 'false');
       lb.title = p.legend ? 'Hide the legend' : 'Show the legend: what the colors and marks mean, and the keys';
@@ -2414,6 +2430,7 @@
         transact((letter ? 'Final letter ' + letter : 'Clear final letter') + ' for ' + plural(band.sids.length, 'student'), function (c) {
           n = writeFinalLetters(c, band.sids.map(function (id) { return { studentId: id, letter: letter }; }));
         });
+        if (txFailed) return;
         var msg = (letter ? 'Final letter ' + letter + ' set for ' : 'Final letter cleared for ') + plural(band.sids.length, 'student') + '.' +
           (n < band.sids.length ? ' (' + (band.sids.length - n) + ' already had it.)' : '') +
           (ed.band.withdrawn ? ' ' + plural(ed.band.withdrawn, 'withdrawn student') + ' skipped.' : '');
@@ -2545,6 +2562,7 @@
         var st = model.findStudent(c, ed.sid);
         if (st) st.no = newNo;
       });
+      if (txFailed) return;
       // Like Excel, a duplicate No is allowed (e.g. while swapping two numbers), but say so.
       if (newNo !== null && newNo !== oldNo && course.students.some(function (o) { return o.id !== ed.sid && o.no === newNo; })) {
         ui.toast('No ' + newNo + ' is also used by another student. Students & Teams → Renumber by name fixes the numbering.', { type: 'warn', timeout: 6000 });
@@ -2771,6 +2789,7 @@
       transact('Override ' + a.name, function (c) {
         model.setOverride(c, sid, aid, model.entryFromInput(v.value, model.getEntry(c.teamScores, team.id, aid), a.maxScore));
       });
+      if (txFailed) return;
       var reason = String(v.reason || '').trim();
       if (reason && GT.store.annotateHistory) {
         (cur().history || []).slice(before).forEach(function (h) {
@@ -3163,6 +3182,7 @@
         if (info && info.kind === 'override-removed') removed.push({ sid: t.sid, aid: t.aid, tid: info.team.id, team: info.team.name });
       });
     });
+    if (txFailed) return;
     var msgs = [];
     // Say what a wide Delete did to the final letters (the rest of the message lists what it left alone).
     if (nLetters && targets.length > 1) msgs.push(plural(nLetters, 'final letter') + ' cleared.');
@@ -3519,6 +3539,7 @@
           }
         });
       }, { source: job.source });
+      if (txFailed) return; // not written (read-only tab, or an error): transact() said so
       // Select the pasted area, like Excel. (If the re-render re-sorts the rows, renderTable
       // collapses it to the active cell.)
       if (job.selA && posOf(job.selA) && posOf(job.selE)) {
@@ -3757,6 +3778,7 @@
           info.teams++;
         });
       });
+      if (txFailed) return;
       var msg = mode === 'clear' ? a.name + ' cleared for ' + plural(info.n, 'active student') + '.' :
         (mode === 'empty' ? 'Filled ' + plural(info.n, 'empty cell') : a.name + ' set to ' + text + ' for ' + plural(info.n, 'active student')) +
         (mode === 'empty' ? ' of ' + a.name + ' with ' + text : '') + '.';
@@ -3989,6 +4011,7 @@
       if (!ok) return;
       var n = 0;
       transact('Copy suggested letters', function (c) { n = copySuggested(c); });
+      if (txFailed) return;
       ui.toast(n ? plural(n, 'suggested letter') + ' copied into empty final letters.' : 'No letter was copied.', { type: n ? 'success' : 'info' });
     });
   }
@@ -4008,6 +4031,7 @@
         if (typeof model.unfinalize === 'function') model.unfinalize(c);
         else c.finalized = null;
       });
+      if (txFailed) return;
       ui.toast('Scores unlocked. Score cells can be edited again.', { type: 'success' });
     });
   }

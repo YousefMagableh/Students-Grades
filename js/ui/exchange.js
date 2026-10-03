@@ -132,7 +132,9 @@
   // ------------------------------------------------------------------ helpers
 
   function str(x) { return x === null || x === undefined ? '' : String(x); }
-  function logErr(e) { if (root.console) console.error(e); }
+  /** Logs a program error. A save conflict (err.conflict: another tab saved newer data) is not one: the
+   * store's message is shown to the user instead. */
+  function logErr(e) { if (root.console && !(e && e.conflict)) console.error(e); }
   /** A failure the page explains to the user (missing library, unreadable file): a warning, not an error. */
   function logHandled(e) { if (root.console) console.warn(errText(e)); }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
@@ -901,7 +903,8 @@
       return r === undefined ? true : r;
     } catch (e) {
       logErr(e);
-      ui.toast('Not saved: ' + errText(e), { type: 'error' });
+      // Another tab saved newer data (read-only tab): the message says so; it is not a program error.
+      ui.toast('Not saved: ' + errText(e), { type: e && e.conflict ? 'warn' : 'error' });
       return undefined;
     }
   }

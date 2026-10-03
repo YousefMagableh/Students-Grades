@@ -8,7 +8,7 @@
  *      weighted points, Total, the effective letter, Rank, and the absence columns when attendance is on.
  *      Withdrawn students come last, marked W. The letter column is "Letter (suggested)" while no final
  *      letter is assigned, else "Final letter" with "—" for students who have none yet.
- *   5. statistics of the active totals: count, mean, median, sample SD, min, max, pass rate, letter distribution
+ *   5. statistics of the active totals: count, average, median, sample standard deviation, min, max, pass rate, letter distribution
  *   6. a notes and signature area for the instructor.
  * The option bar above the page (withdrawn, raw, weighted, hide names, Print) is screen only (.no-print).
  * Preferences live in GT.store.state.ui.summaryPrefs (GT.store.setUi). css/summary.css holds the print rules

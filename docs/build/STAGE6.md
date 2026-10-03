@@ -184,3 +184,15 @@ List anything that could not be verified.
 ## Carry-over from earlier stages
 
 - Stage 3 found a minor problem in the Meeting view for SE 6362 with attendance on and a width of 1280px. The table is 57px wider than the area, so Final letter is cut off and Rank is off-screen until you scroll sideways. Make the meeting column widths fit the available width. Alternatively, pin Final letter and Rank as sticky columns on the right in the meeting view.
+
+## Addendum (2026-10-03): changes since this spec was written. These override the sections above.
+
+1. **Late work and finalized courses.** Late info is part of a score, so once scores are finalized (`model.isFinalized`) the "Late work…" dialog opens read-only. It says "Scores are finalized. Unlock them to change late work", the same as every other score edit.
+2. **Late work on drop-down items** (participation). Late penalties apply to any item, but it is unusual for participation. Allow it, without any special handling.
+3. **Summary tab.** It shows the **effective** letter. When final letters are not assigned yet, it labels the column "Letter (suggested)" and shows the suggestion. When some letters are assigned, it labels the column "Final letter" and marks students without one as "—".
+   - The tab includes the Excused, Unexcused and Total absence columns when attendance is not off.
+   - It includes participation, because the instructor sets it in the meeting.
+   - Withdrawn students are listed last, marked "W".
+   - It prints well on Letter paper in landscape.
+4. **index.html** already has the tags for `js/ui/summary.js` and `css/summary.css`, and placeholder files exist. Replace them, and do not add duplicate tags.
+5. **Verify first** the two stage-4 fixes that were never independently verified. They are listed in docs/build/RESUME.md ("Open items").

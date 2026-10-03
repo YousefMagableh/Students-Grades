@@ -119,3 +119,18 @@ Extend tests/e2e/smoke.mjs:
 - The bin counts sum to Count.
 - The what-if result for one student reached through the UI equals `calc.neededScore`.
 - Sandbox edits do not change the stored scale until "Apply" is clicked.
+
+## Addendum (2026-10-03): changes since this spec was written. These override the sections above.
+
+1. **Final letters (DECISIONS 2, docs/DESIGN.md §2.5).** Once final letters exist, they are the grades.
+   - The letter distribution, pass rate, top/bottom lists, per-team summary and borderline list use `effectiveLetter` (`calc.studentResult`). That is the final letter when one is set, otherwise the cutoff suggestion.
+   - The letter-distribution card has a small toggle: "Final letters (effective)" (default) and "Suggested (cutoffs)". It shows how many letters are manual: "n of N final letters assigned".
+2. **Cutoff planner and the meeting workflow.** The instructor draws letter bands by looking at the sorted totals. The planner therefore has two actions:
+   - **"Apply cutoffs to Settings"**: writes the sandbox scale into `course.settings.letterScale`. This changes only the *suggested* letters. It is one transaction and asks for confirmation.
+   - **"Use these as final letters…"**: writes each active student's simulated letter into `finalLetter` in ONE transaction, using `model.setFinalLetters`. Before it runs, a dialog shows the number of students whose final letter would change, and offers two choices: "Only students without a final letter" (the default) and "All active students". Ctrl+Z undoes it.
+   - The planner works from `total` (rounded by the course's rounding mode), the same value the Suggested letter uses.
+3. **Finalized courses.** Statistics are read-only and always available. The panel header shows "Scores finalized on <date>" when it applies.
+4. **Participation is out of 5** (choices step 0.5). Per-assessment stats must use each item's own max: the mean % is mean ÷ max × 100. When an assessment is the selected measure, the eLearning bins use percent of max, so participation 4.5/5 = 90% goes into '90 - 100'.
+5. **Attendance.** The per-team summary adds an "average unexcused absences" column when attendance is not off. Nothing else here depends on attendance.
+6. **Withdrawn students** are excluded everywhere in Statistics (S2). The status distribution still counts them under "Withdrawn (excluded)".
+7. **index.html** already has the tags for `js/core/stats.js`, `js/ui/stats.js` and `css/stats.css`, and placeholder files exist. Replace the placeholders, and do not add duplicate tags.

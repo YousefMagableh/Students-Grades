@@ -11,9 +11,16 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
 
 ## Open the app
 
-1. Download or clone this repository.
-2. Double-click `index.html`. It opens in your browser as a normal page. Everything in the page runs from the local files.
-3. Optional: make a desktop shortcut to `index.html` so it opens like any other program.
+1. Download the project once. On GitHub, open this repository, choose the branch that holds the app, press
+   **Code → Download ZIP**, and unzip it into a folder that stays on your computer (for example
+   `Documents\Grade Tracker`). Do not put it in a synced folder such as OneDrive or Dropbox.
+2. Double-click `index.html`. It opens in your browser (Chrome or Edge) as a normal page. Everything runs
+   from the files in that folder, with no internet connection needed.
+3. Optional, on Windows: right-click `index.html` → **Send to → Desktop (create shortcut)** (on Windows 11, choose
+   **Show more options** first). The app then opens
+   from the desktop like any other program.
+
+Always open the same `index.html` in the same browser: the data is saved in that browser.
 
 ## Back up your data
 
@@ -24,6 +31,44 @@ An offline, local-only grade book for a teaching assistant. It replaces the Exce
   - A reminder appears when the last backup is older than 7 days.
 - **Data → Restore from backup** replaces all current data with a backup file.
 - Keep backup files private. This repository's `.gitignore` excludes `*.xlsx`, `*.csv`, and backup `*.json` files so real grades are never committed by accident.
+
+## First steps
+
+1. Pick a course in the switcher at the top left (**SE 4351** or **SE 6362**). The **⋯** button next to it adds,
+   edits, duplicates or deletes a course. Each course has its own students, scores, attendance, teams and
+   settings.
+2. To try the app first, use **⋯ → Load sample data**. It creates fake students ("Student 01", "Student 02",
+   …). When you are done trying, delete the course or load your real roster over it.
+3. Add the real students in one of two ways, on your own computer:
+   - **Paste roster** (Grades or Students & Teams tab): copy the name columns in Excel and paste them. A
+     preview shows how each line will be read before anything is added.
+   - **Import / Export → Import**: read the whole previous sheet (.xlsx or .csv). See *Export and import* below.
+4. Create the teams in **Students & Teams**, then enter scores in **Grades**.
+
+Real student data never leaves your computer. Do not paste it into chats, email it to yourself, or put
+exported files inside this project folder.
+
+## Entering grades
+
+The **Grades** tab works like a spreadsheet: one row per student.
+
+- Click a cell and type: the value replaces what was there. **Enter** saves and moves down, **Tab** moves
+  right, the arrow keys move around, **Esc** cancels, **F2** edits without clearing.
+- **Paste from Excel**: copy a block of cells in Excel, click the first cell here and press **Ctrl+V**.
+- **Undo / Redo**: **Ctrl+Z** and **Ctrl+Y** (or the arrows at the top). One paste or one band of letters is
+  one step.
+- **Red** cell: the text is not a number (it counts as 0 until fixed). **Yellow** cell: the number is below
+  0 or above the item's max (it is used as typed, so check it).
+- **Search**, **Sort** (by name or by total, both directions), **Group by team**, **Show withdrawn**, and the
+  **Columns** menu are in the toolbar.
+- **Team scores**: typing in a team-graded cell (Project I or II) sets the score for the whole team. Use the
+  cell menu (right-click, or **Shift+F10**) → **Override for this student only…** for an agreed unequal split.
+- **Late work**: select a score and press **Ctrl+L** (or use the cell menu → **Late work…**). Enter the weeks
+  late and tick **Penalty waived (pre-approved)** if it was approved. The cell then shows **L2** (2 weeks
+  late, penalty applied) or **L2✓** (waived). For a team score, the late information applies to the team.
+  Points per week (10 by default) are set in **Settings → Late work**, which also lists every late entry.
+- **Withdrawn students**: **Students & Teams → Withdraw**. They are kept (greyed out), never deleted, and
+  left out of the class average, rank, percentile and statistics.
 
 ## Final grades: finalize, then assign letters
 
@@ -109,6 +154,35 @@ Where the absences show up:
   every absence by date, excused or unexcused.
 - **Attendance tab**: the summary columns at the right of the grid, and a **Warnings** list with a button that
   jumps to the student's row.
+
+## Statistics
+
+The **Statistics** tab updates live and counts **active students only** (withdrawn students are left out).
+
+- **Class statistics** in the same layout as the university eLearning panel: Count, Minimum, Maximum, Range,
+  Average, Median, Standard Deviation (sample), Variance, a status list and the grade distribution in 10-point
+  bins. **Show statistics for** switches between the Total and any single assessment.
+- **What do these words mean?** explains each term in plain words, using the class's own numbers.
+- Quartiles with a box plot, the pass rate, a histogram, the letter-grade distribution (final letters, or the
+  suggestions from the cutoffs), each assessment's average / median / min / max, the top and bottom five, and a
+  summary per team.
+- **What-if calculator**: pick a student, an assessment that is still empty, and a target letter. It shows the
+  score needed on that assessment (on time), with every other score left as it is.
+- **Cutoff planner** (for the grading meeting): every student's total is a dot on a line, with the cutoffs
+  drawn over it and the largest gaps between students shaded. Change cutoffs in the *sandbox* and see who
+  would change letter. Nothing is saved until you press **Apply cutoffs to Settings** (changes the suggested
+  letters) or **Use these as final letters…** (writes the final letters, for students without one or for all;
+  Ctrl+Z undoes it).
+- **Borderline students**: who is within one point (adjustable) of the next letter.
+
+## Printable summary
+
+The **Summary** tab is a one-page-per-section report for the grading meeting: course details, weights and
+settings (placeholders are marked †), the grade table sorted by name (withdrawn students last, marked W),
+absences, the statistics, and lines for notes and signatures. Options above it choose whether to include
+withdrawn students, raw and weighted scores, and **Hide names (use No only)** for a copy without names.
+Press **Print…** and choose *Landscape* (or *Save as PDF*). Empty scores print as blank cells so participation can be written in
+by hand during the meeting.
 
 ## How the numbers are calculated
 
@@ -216,8 +290,71 @@ same columns, values only.
 
 The import is **one step**: a single Undo (Ctrl+Z) reverts all of it, and every change is logged in History.
 
-## Development
+## Change history
 
+**History** lists every change to grades and settings, newest first: the student, the field, the old value,
+the new value and the time. It includes team scores reaching each member, overrides, late work, final
+letters, finalizing, imports and attendance. The log is **append-only**: Undo adds a new entry and never
+erases an old one.
+
+When the instructor asks for a grade change, make the change, then open **History** and use **Add note** on
+that entry (for example "per instructor email, Oct 12"). Filters (grades, students, settings, attendance,
+student, text, dates) and **Export CSV** are at the top.
+
+## Privacy
+
+- **Privacy** (top right) blurs every student name on screen; click a name to show it for 10 seconds. Use it
+  when someone can see your screen. Printing is never blurred; use *Hide names* on the Summary tab instead.
+- The page blocks all network connections (a Content-Security-Policy in `index.html`), so nothing can be
+  sent anywhere, even by mistake.
+
+## Keyboard shortcuts
+
+Press **?** in the app for the full list. The main ones:
+
+| Keys | Action |
+| --- | --- |
+| Arrows, Tab, Enter | move between cells; Enter saves and moves down |
+| F2 / Esc | edit a cell without clearing it / cancel |
+| Ctrl+C, Ctrl+V | copy and paste blocks of cells (works with Excel) |
+| Ctrl+Z, Ctrl+Y | undo, redo |
+| Shift+F10 or the menu key | cell menu (override, late work, details) |
+| Ctrl+L | late work for the selected score |
+| Alt+↓ | open the drop-down list of a cell (final letter, participation) |
+| P, A, E, Space | attendance: Present, Absent, Excused, cycle |
+| / | search students |
+| Alt+1 … Alt+8 | switch tabs |
+
+On a Mac, use Cmd instead of Ctrl.
+
+## If something goes wrong
+
+- **The app shows an empty course after I restored my computer or cleared my browser**: browser storage was
+  cleared. Use **Data → Restore from backup** with your latest backup file.
+- **A banner says saving is not possible**: the browser is in a private window or blocks storage. Open
+  `index.html` in a normal window, and download a backup before closing the tab.
+- **"Grade Tracker is also open in another tab"**: close one of them; two tabs overwrite each other's changes.
+- **Excel export says the library could not be loaded**: keep the `vendor` folder next to `index.html`.
+- **An old `.xls` file cannot be imported**: open it in Excel and use *Save As → Excel Workbook (.xlsx)*.
+
+## For developers
+
+- No build step. `index.html` loads classic scripts in order. `js/core/` holds the pure logic (model,
+  calculations, history, attendance, statistics, export and import), which also runs in Node. `js/ui/` holds
+  the views, `js/store.js` the state, undo and autosave, and `js/storage.js` IndexedDB and localStorage.
 - `npm test` runs the unit tests (Node 22, no dependencies).
-- `npm run test:e2e` runs the headless Chromium smoke test. It needs Playwright, and it fails on any network request.
-- Design notes are in `docs/DESIGN.md`, and the requirement list is in `docs/REQUIREMENTS.md`.
+- `npm run test:e2e` runs the headless Chromium smoke test against `index.html` from disk. It needs Playwright,
+  and it fails on any network request.
+- `npm install && npm run vendor` refreshes `vendor/exceljs.min.js` (ExcelJS 4.4.0, MIT).
+- `docs/DESIGN.md` is the module contract, `docs/REQUIREMENTS.md` the requirements with a traceability table,
+  and `docs/build/` the original request, the decisions made during the build and the stage specifications.
+
+## Limitations and what was not verified
+
+- The automated browser tests run in **Chromium** only. The app uses standard web features and should work in
+  current Edge, Firefox and Safari, but they were not tested here.
+- The Excel formulas were checked with two independent formula evaluators and an ExcelJS round trip, not in
+  Microsoft Excel itself. Excel recalculates them when the file opens.
+- Printing was checked by generating PDFs in Chromium; the browser's own print dialog was not tested.
+- UT Dallas's official grade scales could not be checked from the build environment. The letters come from the
+  course request and stay editable in Settings.

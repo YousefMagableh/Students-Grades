@@ -667,8 +667,8 @@
   }
 
   function headHtml(course) {
-    return '<div class="page-header set-head"><div><h1>Settings</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
-      '<div class="sub">Changes are saved automatically and can be undone (Ctrl+Z).</div></div></div>';
+    return '<div class="page-header set-head"><div><h1>Settings</h1><div class="sub">' + esc(courseLine(course)) +
+      ' · Changes are saved automatically and can be undone (Ctrl+Z).</div></div></div>';
   }
 
   function tocHtml(course) {

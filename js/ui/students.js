@@ -1070,8 +1070,8 @@
   function headerHtml(course) {
     var n = course.students.length;
     var wd = course.students.filter(isWithdrawn).length;
-    return '<div class="page-header"><div><h1>Students &amp; Teams</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
-      '<div class="sub">' + plural(n - wd, 'active student') + ' · ' + wd + ' withdrawn · ' + plural(course.teams.length, 'team') + '</div></div></div>';
+    return '<div class="page-header"><div><h1>Students &amp; Teams</h1><div class="sub">' + esc(courseLine(course)) + ' · ' +
+      plural(n - wd, 'active student') + ' · ' + wd + ' withdrawn · ' + plural(course.teams.length, 'team') + '</div></div></div>';
   }
 
   function sortTh(key, label, p, cls) {

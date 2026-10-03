@@ -387,12 +387,11 @@
     el.innerHTML =
       '<div class="page-header att-head">' +
         '<div class="att-head-text"><h1 class="att-title">Attendance</h1>' +
-        '<div class="sub att-course"></div><div class="sub att-sub"></div></div>' +
+        '<div class="sub att-sub"></div></div>' +
         '<div class="att-modes" role="group" aria-label="Attendance mode">' + modes + '</div>' +
       '</div>' +
       '<div class="att-content"></div>';
     dom = {
-      course: el.querySelector('.att-course'),
       sub: el.querySelector('.att-sub'),
       modes: el.querySelector('.att-modes'),
       content: el.querySelector('.att-content')
@@ -486,8 +485,6 @@
   // ------------------------------------------------------------------ header (course, mode)
 
   function updateTop(course, mode, cs) {
-    var line = courseLine(course);
-    if (dom.course.textContent !== line) dom.course.textContent = line;
     ui.$$('.att-mode', dom.modes).forEach(function (b) {
       b.setAttribute('aria-pressed', b.getAttribute('data-mode') === mode ? 'true' : 'false');
     });
@@ -502,7 +499,8 @@
       sub = 'Attendance is off for this course.';
     }
     var warnN = mode !== 'off' && cs && Array.isArray(cs.warnings) ? uniqueStudents(cs.warnings) : 0;
-    setHtmlKeep(dom.sub, esc(sub) + (warnN ? ' <button type="button" class="chip warn att-warn-chip" data-act="goto-warnings" title="Show the warnings list">' +
+    // The page header of every tab (UX-16): the tab name, then "<code> · <title> · <term> · …".
+    setHtmlKeep(dom.sub, esc(courseLine(course) + ' · ' + sub) + (warnN ? ' <button type="button" class="chip warn att-warn-chip" data-act="goto-warnings" title="Show the warnings list">' +
       icon('alert') + plural(warnN, 'student') + ' with warnings</button>' : ''), focusModeButton);
   }
 

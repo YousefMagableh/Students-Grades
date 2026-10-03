@@ -515,8 +515,8 @@
 
   function renderHead(course) {
     patch(dom.head, 'head',
-      '<div><h1>Import / Export</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
-      '<div class="sub">Files are made and read on this computer only; nothing is uploaded.</div></div>');
+      '<div><h1>Import / Export</h1><div class="sub">' + esc(courseLine(course)) +
+      ' \u00b7 Files are made and read on this computer only; nothing is uploaded.</div></div>');
   }
 
   // ------------------------------------------------------------------ render: export card

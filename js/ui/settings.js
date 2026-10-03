@@ -660,10 +660,15 @@
       (rightHtml ? '<div class="set-card-actions">' + rightHtml + '</div>' : '') + '</div>';
   }
 
+  /** The page subtitle of every view (UX-16): "SE 4351 · Requirements Engineering · Fall 2026". */
+  function courseLine(course) {
+    return [course.code, course.title, course.term].map(function (x) { return x === null || x === undefined ? '' : String(x).trim(); })
+      .filter(Boolean).join(' · ') || 'Course';
+  }
+
   function headHtml(course) {
-    return '<div class="page-header set-head"><div><h1>Settings</h1><div class="sub">' +
-      esc(model.courseLabel(course)) + (course.term ? ' · ' + esc(course.term) : '') +
-      ' · Changes are saved automatically and can be undone (Ctrl+Z).</div></div></div>';
+    return '<div class="page-header set-head"><div><h1>Settings</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
+      '<div class="sub">Changes are saved automatically and can be undone (Ctrl+Z).</div></div></div>';
   }
 
   function tocHtml(course) {
@@ -1151,7 +1156,8 @@
   function lettersHtml(course, results) {
     var scale = sortedScale(course);
     var n = scale.length;
-    var counts = {}, finals = {};
+    // Keyed by letter names the TA types: no prototype (a letter named "constructor" counts from 0, CODE-7).
+    var counts = Object.create(null), finals = Object.create(null);
     if (results) {
       results.activeIds.forEach(function (id) {
         var r = results.byId[id];
@@ -1202,7 +1208,8 @@
     var passBadge = badge(course, 'passingLetter');
     h += '<div class="set-form-grid set-pass">' + selectField('ls:passing', 'Passing letter (lowest letter that passes)', passing, passOpts, {
       badge: passBadge, anchor: 'passingLetter',
-      help: 'The pass rate in Statistics counts active students at or above this letter.' + (passBadge ? ' ' + esc(phNote(course, 'passingLetter')) : '')
+      // One sentence (UX-25): the placeholder note says the same "counts students at or above" again.
+      help: 'The pass rate in Statistics counts active students at or above this letter.' + (passBadge ? ' Not confirmed by the instructor yet.' : '')
     }) + '</div>';
     return h + '</div>';
   }
@@ -1290,8 +1297,25 @@
     }
   }
 
+  /** CONTRACT §2 (E2E-4): when the page is closed, reloaded or hidden, the focused field's typed value is
+   * saved the way leaving the field saves it. Synchronous; nothing happens when nothing was typed. */
+  function commitOnLeave() {
+    var t = document.activeElement;
+    if (!boundEl || !t || !document.body.contains(boundEl) || !boundEl.contains(t) || !isFieldInput(t)) return;
+    var key = t.getAttribute('data-field');
+    if (t.value === t.defaultValue && !(errors[key] && errors[key].text !== t.value)) return;
+    commitInput(t);
+  }
+  var leaveHookBound = false;
+  function bindLeaveHook() {
+    if (leaveHookBound || !(GT.app && typeof GT.app.registerLeaveHook === 'function')) return;
+    GT.app.registerLeaveHook(commitOnLeave);
+    leaveHookBound = true;
+  }
+
   function render(el, ctx) {
     ctx = ctx || {};
+    bindLeaveHook(); // app.js loads after this file
     if (el !== boundEl) {
       bind(el);
       boundEl = el;
@@ -2015,8 +2039,8 @@
     function check() {
       sync();
       var cur = GT.store.course();
-      var total = 0, err = null, badIdx = {};
-      var seen = {};
+      var total = 0, err = null, badIdx = Object.create(null);
+      var seen = Object.create(null); // part names typed by the TA (CODE-7)
       var out = parts.map(function (p, i) {
         var name = cleanText(p.name);
         var w = util.parseScoreInput(p.weight);

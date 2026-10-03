@@ -30,7 +30,6 @@
   }
 
   var fix = util.fix;
-  var hasOwn = util.hasOwn;
 
   var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
   var HEADER_FILL = 'FFBFBFBF';
@@ -50,6 +49,10 @@
   // the spreadsheet after the export, so it holds a letter the instructor chose.
   var MANUAL_LETTER_NOTE = 'Final letter assigned by the instructor';
   var SUGGESTED_LETTER_NOTE = 'Suggestion from the cutoffs: ';
+  // A withdrawn student without a final letter gets "W" in Letter Grade (a static value, never the
+  // cutoff formula), as on the Summary tab. The importer reads such a cell as "no letter".
+  var WITHDRAWN_LETTER = 'W';
+  var WITHDRAWN_LETTER_NOTE = 'Withdrawn: no letter grade';
   var ROUNDING_LABELS = { none: 'none', hundredth: 'nearest 0.01', integer: 'nearest whole number' };
   var MIN_WIDTH = 5, MAX_WIDTH = 40, NAME_MIN_WIDTH = 14;
   /** Computed number columns shown with the course's display decimals (besides the weighted ones). */
@@ -396,7 +399,8 @@
       case 'letter':
         return (ctx.staticLetters
           ? 'Final letters assigned by the instructor. Students without one show the suggestion from the cutoffs: '
-          : 'Letter from the cutoffs: ') + cutoffText(course) + '.' + placeholder;
+          : 'Letter from the cutoffs: ') + cutoffText(course) + '.' +
+          (ctx.withdrawnW ? ' W: withdrawn, no letter grade.' : '') + placeholder;
       case 'suggestedLetter':
         return 'Suggestion from the cutoffs (the instructor assigns the final letter): ' + cutoffText(course) + '.' + placeholder;
       case 'finalLetter':
@@ -471,7 +475,10 @@
 
     // Items whose weighted points go into the Total as fixed numbers (neither column exported).
     var staticList = sumRange ? [] : weightedNeeded.filter(function (a) { return !colIndex['weighted:' + a.id] && !colIndex['raw:' + a.id]; });
-    var ctx = { staticLetters: staticLetters, average: res.average, staticItems: staticList.map(function (a) { return a.name; }) };
+    var ctx = {
+      staticLetters: staticLetters, average: res.average, staticItems: staticList.map(function (a) { return a.name; }),
+      withdrawnW: (course.students || []).some(function (s) { return s.status === 'withdrawn' && model.finalLetterOf(s) === null; })
+    };
     var sortKey = o.sort === 'no' ? 'no' : 'name';
     var students = calc.sortStudents(course, res, sortKey, 'asc');
     var rows = [], rowMeta = [];
@@ -557,6 +564,11 @@
             }
             break;
           case 'letter':
+            if (withdrawn && r.finalLetter === null) {
+              cell.v = WITHDRAWN_LETTER;
+              cell.note = WITHDRAWN_LETTER_NOTE;
+              break;
+            }
             if (staticLetters || !colIndex.total) {
               cell.v = staticLetters ? r.effectiveLetter : r.letter;
               if (staticLetters && r.letterSource === 'manual') {
@@ -739,9 +751,11 @@
     rows.push(['Late work', num(latePerWeek(course)) + ' points per week late on a 100-point scale (scaled to the max score), unless waived; never below 0']);
     rows.push(['Passing letter (pass rate)', st.passingLetter || '']);
     var ls = res.letterSummary || { active: active, assigned: 0 };
-    rows.push(['Letter Grade column', hasAnyFinalLetter(course)
+    var wdNoLetter = (course.students || []).some(function (s) { return s.status === 'withdrawn' && model.finalLetterOf(s) === null; });
+    rows.push(['Letter Grade column', (hasAnyFinalLetter(course)
       ? 'Final letters assigned by the instructor (' + ls.assigned + ' of ' + ls.active + ' active students); students without one show the suggestion from the cutoffs'
-      : 'Suggestions from the cutoffs (no final letters assigned yet)']);
+      : 'Suggestions from the cutoffs (no final letters assigned yet)') +
+      (wdNoLetter ? '; W for a withdrawn student without a final letter (no letter grade)' : '')]);
     rows.push(['Scores finalized', model.isFinalized(course)
       ? 'Yes, on ' + localDate(course.finalized.at) + (course.finalized.note ? ' (' + course.finalized.note + ')' : '')
       : 'No']);
@@ -906,6 +920,8 @@
     XLSX_MIME: XLSX_MIME,
     MANUAL_LETTER_NOTE: MANUAL_LETTER_NOTE,
     SUGGESTED_LETTER_NOTE: SUGGESTED_LETTER_NOTE,
+    WITHDRAWN_LETTER: WITHDRAWN_LETTER,
+    WITHDRAWN_LETTER_NOTE: WITHDRAWN_LETTER_NOTE,
     TINTS: TINTS.slice(),
     TINT_OTHER: TINT_OTHER,
     HEADER_FILL: HEADER_FILL,

@@ -1150,3 +1150,40 @@ describe('stage 2b robustness', () => {
     assert.equal(out[0].note, '11 students; B ×11');
   });
 });
+
+describe('a roll call folded into one entry (GT.store.transact mergeKey, review CODE-6)', () => {
+  const entry = {
+    id: 'h1', ts: TS, source: 'edit', kind: 'attendance', studentId: null, studentName: null, teamId: null, teamName: null,
+    field: 'Roll call Tue Oct 6', fieldKey: 'attendance', oldValue: '', newValue: '3 marks', note: '2 students', mergeKey: 'rollcall:s:1',
+    details: [
+      { studentId: 's1', studentName: 'Student 01, A', no: 1, field: 'Attendance 2026-10-06', oldValue: '', newValue: 'Present' },
+      { studentId: 's2', studentName: 'Student 02, B', no: 2, field: 'Attendance 2026-10-06', oldValue: '', newValue: 'Absent' },
+      { studentId: 's1', studentName: 'Student 01, A', no: 1, field: 'Attendance 2026-10-06', oldValue: 'Present', newValue: 'Excused' }
+    ]
+  };
+
+  test('entryDetails keeps each item\'s own field; items without one are unchanged', () => {
+    const list = history.entryDetails(entry);
+    assert.equal(list.length, 3);
+    assert.deepEqual(list[1], { studentId: 's2', studentName: 'Student 02, B', no: 2, oldValue: '', newValue: 'Absent', field: 'Attendance 2026-10-06' });
+    assert.equal('field' in history.entryDetails({ details: [{ studentId: 's1', field: 7 }] })[0], false);
+    assert.equal('field' in history.entryDetails({ details: [{ studentId: 's1', field: '' }] })[0], false);
+  });
+
+  test('detailFor gives one change per student: the first old value and the last new value', () => {
+    assert.deepEqual(history.detailFor(entry, 's1'),
+      { studentId: 's1', studentName: 'Student 01, A', no: 1, oldValue: '', newValue: 'Excused', field: 'Attendance 2026-10-06' });
+    assert.equal(history.detailFor(entry, 's2').newValue, 'Absent');
+    assert.equal(history.detailFor(entry, 's3'), null);
+    assert.equal(history.involvesStudent(entry, 's2'), true);
+  });
+
+  test('toRows: one row per mark after the summary, with the mark\'s own field', () => {
+    const rows = history.toRows([entry]);
+    assert.equal(rows.length, 1 + 1 + 3);
+    assert.deepEqual(rows[1].slice(0, 9), [TS, 'edit', 'attendance', '', '', 'Roll call Tue Oct 6', '', '3 marks', '2 students']);
+    assert.deepEqual(rows[4], [TS, 'edit', 'attendance', 'Student 01, A', '', 'Attendance 2026-10-06', 'Present', 'Excused',
+      'Part of "Roll call Tue Oct 6: 3 marks"', '', '']);
+    assert.equal(history.toRows([entry], { studentId: 's2' }).length, 1 + 1 + 1);
+  });
+});

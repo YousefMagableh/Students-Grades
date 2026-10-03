@@ -28,7 +28,12 @@
   var viewParams = {};
   var renderQueued = false;
   var dismissed = {};
-  var otherTabOpen = false;
+  var otherTabs = Object.create(null); // ids of the other open tabs that said hello (BroadcastChannel)
+  var tabId = util.uid('tab');
+  var channel = null;
+  var leaveHooks = [];    // GT.app.registerLeaveHook: commit pending edits before the page goes away
+  var reloading = false;  // the conflict banner's Reload: no "leave the page?" prompt
+  var lastActiveTab = null;
   var loadProblem = null; // { raw, message } when saved data could not be read (saving is blocked)
   var recovered = null;   // { raw, message } when the latest autosave was unreadable and an older copy was loaded
   var regionHtml = {};    // last markup written to each shell region (see setRegionHtml)
@@ -36,8 +41,31 @@
 
   // ------------------------------------------------------------------ helpers
 
+  /** A registered view (own property only: a stored "constructor" or "toString" is never a view). */
+  function viewOf(id) {
+    return typeof id === 'string' && util.hasOwn(GT.views, id) && GT.views[id] && typeof GT.views[id].render === 'function'
+      ? GT.views[id] : null;
+  }
+
   function activeViews() {
-    return VIEW_ORDER.filter(function (v) { return GT.views[v.id]; });
+    return VIEW_ORDER.filter(function (v) { return !!viewOf(v.id); });
+  }
+
+  function otherTabOpen() { return Object.keys(otherTabs).length > 0; }
+
+  /** While another tab has saved newer data, nothing can be changed here: says so and returns true. */
+  function refuseReadOnly() {
+    if (!(store.readOnly && store.readOnly())) return false;
+    conflictToast();
+    return true;
+  }
+
+  var lastConflictToast = 0;
+  function conflictToast() {
+    var now = Date.now();
+    if (now - lastConflictToast < 1500) return;
+    lastConflictToast = now;
+    ui.toast('Not saved: Grade Tracker was changed in another tab, so this tab is read-only. Reload to see the latest data.', { type: 'warn' });
   }
 
   function hasAnyData() {
@@ -51,7 +79,7 @@
   }
 
   app.navigate = function (viewId, params) {
-    if (!GT.views[viewId]) return;
+    if (!viewOf(viewId)) return;
     viewParams = params || {};
     if (store.state.ui.activeView !== viewId) store.setUi({ activeView: viewId });
     else requestRender();
@@ -143,7 +171,7 @@
     var nav = document.getElementById('tabs');
     var active = store.state.ui.activeView;
     var views = activeViews();
-    if (!GT.views[active] && views.length) active = views[0].id;
+    if (!views.some(function (v) { return v.id === active; }) && views.length) active = views[0].id;
     var c = store.course();
     var pending = c ? model.unconfirmedPlaceholders(c).length : 0;
     setRegionHtml(nav, views.map(function (v) {
@@ -151,7 +179,21 @@
       return '<button class="tab" role="tab" type="button" id="tab-' + v.id + '" data-view="' + v.id + '" aria-controls="view" aria-selected="' +
         (v.id === active ? 'true' : 'false') + '" tabindex="' + (v.id === active ? '0' : '-1') + '">' + ui.icon(v.icon) + '<span>' + esc(v.title) + '</span>' + count + '</button>';
     }).join(''));
+    if (active !== lastActiveTab) {
+      lastActiveTab = active;
+      revealActiveTab(nav);
+    }
     return active;
+  }
+
+  /** On a narrow screen the tab strip scrolls sideways: keep the active tab fully in view. Only the strip
+   * scrolls (never the page, as scrollIntoView could). */
+  function revealActiveTab(nav) {
+    var t = nav.querySelector('.tab[aria-selected="true"]');
+    if (!t || nav.scrollWidth <= nav.clientWidth) return;
+    var nr = nav.getBoundingClientRect(), tr = t.getBoundingClientRect();
+    if (tr.left < nr.left) nav.scrollLeft -= Math.ceil(nr.left - tr.left) + 8;
+    else if (tr.right > nr.right) nav.scrollLeft += Math.ceil(tr.right - nr.right) + 8;
   }
 
   // ------------------------------------------------------------------ banners
@@ -163,9 +205,17 @@
     var status = store.saveStatus();
     var c = store.course();
 
+    if (status.phase === 'conflict') {
+      out.push(banner('danger', 'alert',
+        '<strong>Grade Tracker was changed in another tab.</strong> This tab is out of date, so it is read-only and nothing here is saved. ' +
+        'Reload to see the latest data (download a backup of this tab first if you want to keep its changes).',
+        '<button class="btn btn-sm btn-primary" data-act="reload">Reload</button>' +
+        '<button class="btn btn-sm" data-act="backup" title="Downloads a backup file of the data this tab shows">Download this tab\u2019s data</button>'));
+    }
     if (loadProblem) {
       out.push(banner('danger', 'alert',
-        '<strong>Saved data could not be read</strong> (' + esc(loadProblem.message) + '). Nothing has been overwritten. Download it, then restore it or start fresh.',
+        '<strong>Saved data could not be read</strong> (' + esc(loadProblem.message) + '). Nothing has been overwritten, and changes you make now are not saved. ' +
+        'Download it, then restore it or start fresh.',
         '<button class="btn btn-sm" data-act="download-raw">Download saved data</button><button class="btn btn-sm btn-danger" data-act="start-fresh">Start fresh</button>'));
     }
     if (recovered && !dismissed.recovered) {
@@ -177,12 +227,13 @@
       out.push(banner('danger', 'alert',
         '<strong>This browser does not allow saving here.</strong> Changes are kept only until this tab closes. Download a backup to keep your work.',
         '<button class="btn btn-sm" data-act="backup">Download backup</button>'));
-    } else if (status.phase === 'error') {
+    } else if (status.phase === 'error' && !loadProblem) {
       out.push(banner('danger', 'alert', '<strong>Could not save to browser storage:</strong> ' + esc(status.error || 'unknown error') + '. Download a backup now.',
         '<button class="btn btn-sm" data-act="backup">Download backup</button>'));
     }
-    if (otherTabOpen && !dismissed.tabs) {
-      out.push(banner('warn', 'info', 'Grade Tracker is also open in another tab or window. Edits in two tabs overwrite each other, so close one of them.',
+    if (otherTabOpen() && !dismissed.tabs && status.phase !== 'conflict') {
+      out.push(banner('warn', 'info', 'Grade Tracker is also open in another tab or window. Work in one of them: once the other tab saves a change, ' +
+        'this one becomes read-only until you reload it.',
         '<button class="btn btn-sm btn-ghost" data-act="dismiss" data-key="tabs">Dismiss</button>'));
     }
     var age = backupAgeDays();
@@ -215,10 +266,13 @@
     var el = document.getElementById('statusbar');
     var s = store.saveStatus();
     var backendLabel = s.backend === 'indexeddb' ? 'IndexedDB' : s.backend === 'localstorage' ? 'localStorage' : 'memory only (not saved)';
-    var dot = s.phase === 'error' || s.backend === 'memory' ? 'error' : (s.phase === 'pending' || s.phase === 'saving') ? 'warn' : '';
-    var saved = s.phase === 'saving' || s.phase === 'pending' ? 'Saving…'
-      : s.phase === 'error' ? 'Save failed'
-        : s.at ? 'Autosaved ' + new Date(s.at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Autosave on';
+    var dot = s.phase === 'error' || s.phase === 'conflict' || s.backend === 'memory' || loadProblem ? 'error'
+      : (s.phase === 'pending' || s.phase === 'saving') ? 'warn' : '';
+    var saved = s.phase === 'conflict' ? 'Read-only: changed in another tab'
+      : loadProblem ? 'Saving paused'
+        : s.phase === 'saving' || s.phase === 'pending' ? 'Saving…'
+          : s.phase === 'error' ? 'Save failed'
+            : s.at ? 'Autosaved ' + new Date(s.at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }) : 'Autosave on';
     // The Shortcuts button is written once and kept, so autosave updates never take its focus away.
     var info = el.querySelector('.sb-info');
     if (!info) {
@@ -238,7 +292,7 @@
 
   function renderView(activeId) {
     var host = document.getElementById('view');
-    var view = GT.views[activeId];
+    var view = viewOf(activeId);
     if (!view) {
       host.innerHTML = '<div class="empty-state"><h2>Nothing here yet</h2></div>';
       currentViewId = null;
@@ -246,8 +300,9 @@
     }
     var switched = activeId !== currentViewId || !viewContainer || !host.contains(viewContainer);
     if (switched) {
-      if (currentViewId && GT.views[currentViewId] && GT.views[currentViewId].destroy) {
-        try { GT.views[currentViewId].destroy(); } catch (e) { console.error(e); }
+      var prevView = currentViewId ? viewOf(currentViewId) : null;
+      if (prevView && typeof prevView.destroy === 'function') {
+        try { prevView.destroy(); } catch (e) { console.error(e); }
       }
       host.innerHTML = '';
       viewContainer = document.createElement('div');
@@ -292,6 +347,7 @@
   }
 
   function doRestore() {
+    if (refuseReadOnly()) return;
     ui.pickFile('.json,application/json').then(function (file) {
       if (!file) return null;
       return ui.readText(file).then(function (text) {
@@ -315,6 +371,7 @@
           ]
         }).then(function (choice) {
           if (!choice) return;
+          if (refuseReadOnly()) return;
           if (choice.backupFirst) doBackup();
           var st = res.state;
           var ts = new Date().toISOString();
@@ -337,6 +394,7 @@
   }
 
   function doDeleteAll() {
+    if (refuseReadOnly()) return;
     ui.dialog.open({
       title: 'Delete all data?',
       bodyHtml: '<p>This permanently deletes <strong>every course, student, score, attendance record and change history</strong> stored by Grade Tracker in this browser.</p>' +
@@ -355,12 +413,18 @@
     }).then(function (v) {
       if (v === 'backup') { doBackup(); return; }
       if (v !== 'delete') return;
-      GT.storage.clear().then(function () {
-        var fresh = model.createDefaultState();
-        fresh.ui.theme = store.state.ui.theme;
+      if (refuseReadOnly()) return;
+      var fresh = model.createDefaultState();
+      fresh.ui.theme = store.state.ui.theme;
+      // Deletes every stored copy and stores a new save stamp: another open tab that still shows the old
+      // data becomes read-only on its next save instead of bringing it back.
+      store.clearAll(fresh, 'delete-all').then(function () {
         loadProblem = null;
-        store.replaceState(fresh, 'delete-all');
+        requestRender();
         ui.toast('All data deleted. Two empty courses were created.', { type: 'success' });
+      }, function (err) {
+        if (err && err.conflict) conflictToast();
+        else ui.toast('Could not delete the data: ' + (err && err.message ? err.message : String(err)), { type: 'error' });
       });
     });
   }
@@ -405,8 +469,9 @@
   }
 
   function doAddCourse() {
+    if (refuseReadOnly()) return;
     courseForm('Add course', null, true).then(function (v) {
-      if (!v) return;
+      if (!v || refuseReadOnly()) return;
       var tpl = v.template || 'custom';
       var overrides = { code: v.code.trim(), title: v.title.trim(), term: v.term.trim() };
       if (tpl === 'custom') overrides.level = v.level;
@@ -423,9 +488,9 @@
 
   function doEditCourse() {
     var c = store.course();
-    if (!c) return;
+    if (!c || refuseReadOnly()) return;
     courseForm('Edit course details', c, false).then(function (v) {
-      if (!v) return;
+      if (!v || refuseReadOnly()) return;
       store.transact('Edit course details', function (co) {
         co.code = v.code.trim();
         co.title = v.title.trim();
@@ -437,7 +502,7 @@
 
   function doDuplicateCourse() {
     var c = store.course();
-    if (!c) return;
+    if (!c || refuseReadOnly()) return;
     var copy = model.duplicateCourse(c, new Date().toISOString());
     store.addCourse(copy);
     ui.toast('Duplicated as ' + copy.code + '. You are now viewing the copy.', { type: 'success' });
@@ -445,14 +510,14 @@
 
   function doDeleteCourse() {
     var c = store.course();
-    if (!c) return;
+    if (!c || refuseReadOnly()) return;
     ui.dialog.confirm({
       title: 'Delete course ' + c.code + '?',
       messageHtml: '<p>This permanently deletes the course <strong>' + esc(model.courseLabel(c)) + '</strong> with its ' + c.students.length +
         ' students, scores, attendance and change history. Other courses are not affected.</p><p>Download a backup first if you might need it again.</p>',
       confirmText: 'Delete course', danger: true, requireText: c.code
     }).then(function (ok) {
-      if (!ok) return;
+      if (!ok || refuseReadOnly()) return;
       store.deleteCourse(c.id);
       ui.toast('Course deleted.', { type: 'success' });
     });
@@ -460,7 +525,7 @@
 
   function doLoadSample() {
     var c = store.course();
-    if (!c || !GT.sample) return;
+    if (!c || !GT.sample || refuseReadOnly()) return;
     var prof = GT.sample.profileFor(c);
     var hasData = c.students.length > 0;
     ui.dialog.confirm({
@@ -470,7 +535,7 @@
         (hasData ? '<div class="callout callout-warn"><strong>This replaces the ' + c.students.length + ' students, teams, scores and attendance records in this course.</strong> Settings and weights are kept. You can undo it (Ctrl+Z).</div>' : '<p class="muted">Settings and weights are kept.</p>'),
       confirmText: hasData ? 'Replace with sample data' : 'Load sample data', danger: hasData
     }).then(function (ok) {
-      if (!ok) return;
+      if (!ok || refuseReadOnly()) return;
       store.transact('Load sample data', function (co) { GT.sample.loadInto(co, { lateWork: true }); },
         { source: 'sample', historyMode: 'bulk', note: 'Replaced students, teams, scores and attendance with fake sample data' });
       ui.toast('Sample data loaded.', { type: 'success' });
@@ -505,7 +570,7 @@
     var last = store.state.meta.lastBackupAt;
     ui.menu(anchor, [
       { heading: last ? 'Last backup ' + ui.relativeTime(last) : 'No backup yet' },
-      { label: 'Download backup (JSON)', icon: 'download', onSelect: doBackup },
+      { label: 'Download backup', icon: 'download', onSelect: doBackup },
       { label: 'Restore from backup…', icon: 'upload', onSelect: doRestore },
       { separator: true },
       { label: 'Delete all data…', icon: 'trash', onSelect: doDeleteAll, danger: true }
@@ -515,11 +580,12 @@
   function openThemeMenu(anchor) {
     function set(t) { return function () { store.setUi({ theme: t }); }; }
     var cur = store.state.ui.theme;
+    // One choice of three: menuitemradio items with aria-checked (the current theme shows a check icon).
     ui.menu(anchor, [
-      { label: 'System' + (cur === 'system' ? '  ✓' : ''), icon: 'monitor', onSelect: set('system') },
-      { label: 'Light' + (cur === 'light' ? '  ✓' : ''), icon: 'sun', onSelect: set('light') },
-      { label: 'Dark' + (cur === 'dark' ? '  ✓' : ''), icon: 'moon', onSelect: set('dark') }
-    ], { alignRight: true });
+      { label: 'System', icon: 'monitor', checked: cur === 'system', onSelect: set('system') },
+      { label: 'Light', icon: 'sun', checked: cur === 'light', onSelect: set('light') },
+      { label: 'Dark', icon: 'moon', checked: cur === 'dark', onSelect: set('dark') }
+    ], { alignRight: true, label: 'Theme' });
   }
 
   /** Every keyboard shortcut, by where it works. Each entry is checked against the key handlers:
@@ -654,8 +720,8 @@
     document.getElementById('btn-privacy').addEventListener('click', function () {
       store.setUi({ privacy: !store.state.ui.privacy });
     });
-    document.getElementById('btn-undo').addEventListener('click', function () { store.undo(); });
-    document.getElementById('btn-redo').addEventListener('click', function () { store.redo(); });
+    document.getElementById('btn-undo').addEventListener('click', function () { if (!refuseReadOnly()) store.undo(); });
+    document.getElementById('btn-redo').addEventListener('click', function () { if (!refuseReadOnly()) store.redo(); });
 
     var tabs = document.getElementById('tabs');
     tabs.addEventListener('click', function (e) {
@@ -678,6 +744,7 @@
       if (!a || !(a.closest('#banners') || a.closest('#statusbar'))) return;
       var act = a.getAttribute('data-act');
       if (act === 'backup') doBackup();
+      else if (act === 'reload') { reloading = true; root.location.reload(); }
       else if (act === 'dismiss') { dismissed[a.getAttribute('data-key')] = true; requestRender(); }
       else if (act === 'goto') {
         var sec = a.getAttribute('data-section');
@@ -696,7 +763,7 @@
           title: 'Start fresh?', message: 'The unreadable saved data will be overwritten. Download it first if you have not.',
           confirmText: 'Start fresh', danger: true, requireText: 'DELETE'
         }).then(function (ok) {
-          if (!ok) return;
+          if (!ok || refuseReadOnly()) return;
           loadProblem = null;
           store.replaceState(model.createDefaultState(), 'start-fresh');
         });
@@ -709,8 +776,8 @@
       var mod = e.ctrlKey || e.metaKey;
       if (mod && !e.altKey && !typing) {
         var k = e.key.toLowerCase();
-        if (k === 'z' && !e.shiftKey) { e.preventDefault(); store.undo(); return; }
-        if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); store.redo(); return; }
+        if (k === 'z' && !e.shiftKey) { e.preventDefault(); if (!refuseReadOnly()) store.undo(); return; }
+        if ((k === 'z' && e.shiftKey) || k === 'y') { e.preventDefault(); if (!refuseReadOnly()) store.redo(); return; }
       }
       if (e.altKey && !mod && /^Digit[1-8]$/.test(e.code)) {
         var views = activeViews();
@@ -721,36 +788,103 @@
       if (!typing && !mod && !e.altKey && e.key === '?') { e.preventDefault(); showShortcuts(); }
     });
 
-    // Leaving the page (reload, close, navigate, switch tab): an IndexedDB save started now may not commit
-    // before the page unloads, so flushOnLeave() also writes unsaved changes synchronously (store.js).
+    // Leaving the page (reload, close, navigate, switch tab): first the views commit what is being typed
+    // (leave hooks: an open grid editor, a focused Settings input), then flushOnLeave() saves; an IndexedDB
+    // save started now may not commit before the page unloads, so it also writes unsaved changes
+    // synchronously (store.js).
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'hidden') store.flushOnLeave();
+      if (document.visibilityState === 'hidden') leave();
+      else store.checkConflict(); // a message from another tab may have been missed meanwhile
     });
-    root.addEventListener('pagehide', function () { store.flushOnLeave(); });
+    root.addEventListener('pagehide', function () {
+      leave();
+      post('goodbye');
+    });
+    root.addEventListener('pageshow', function (e) {
+      if (!e.persisted) return;
+      // Back from the browser's page cache: other tabs may have saved meanwhile.
+      post('hello');
+      store.checkConflict();
+    });
     root.addEventListener('beforeunload', function (e) {
-      var s = store.saveStatus();
-      if (s.backend === 'memory' && hasAnyData()) {
-        e.preventDefault();
-        e.returnValue = '';
-      }
+      leave();
+      if (reloading || !leaveWouldLoseData()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
+
+    // A conflict error that a view did not catch (it calls store.transact directly) becomes a toast.
+    root.addEventListener('error', function (e) {
+      if (e && e.error && e.error.conflict) { conflictToast(); e.preventDefault(); }
+    });
+    root.addEventListener('unhandledrejection', function (e) {
+      if (e && e.reason && e.reason.conflict) { conflictToast(); e.preventDefault(); }
     });
 
     // Relative times ("5 min ago") refresh once a minute.
     setInterval(function () { renderHeader(); }, 60000);
   }
 
+  // ------------------------------------------------------------------ leaving the page
+
+  /** Registers fn() to run when the page is hidden, closed, reloaded or left, before the save: it commits
+   * an edit that is still being typed (synchronously). Registering the same function again does nothing. */
+  app.registerLeaveHook = function (fn) {
+    if (typeof fn === 'function' && leaveHooks.indexOf(fn) === -1) leaveHooks.push(fn);
+  };
+
+  function runLeaveHooks() {
+    leaveHooks.slice().forEach(function (fn) {
+      try { fn(); } catch (e) { if (!(e && e.conflict)) console.error(e); }
+    });
+  }
+
+  function leave() {
+    runLeaveHooks();
+    store.flushOnLeave();
+  }
+
+  /** True when closing now would lose changes: the memory backend (nothing is stored) with data, or
+   * course data that is neither saved nor kept by the emergency copy (a failed save, saving paused while
+   * the saved data is unreadable, or this tab is read-only after another tab saved). */
+  function leaveWouldLoseData() {
+    if (store.saveStatus().backend === 'memory') return hasAnyData();
+    return store.hasUnsavedData();
+  }
+
+  // ------------------------------------------------------------------ other tabs (BroadcastChannel)
+  // Messages: { type: 'hello' | 'here' | 'goodbye' | 'saved', id, stamp }. 'saved' carries the new save
+  // stamp: a tab whose data is older checks storage and becomes read-only. 'goodbye' (on pagehide) removes
+  // the tab from the "also open in another tab" banner.
+
+  function post(type, extra) {
+    if (!channel) return;
+    var msg = { type: type, id: tabId };
+    if (extra) Object.keys(extra).forEach(function (k) { msg[k] = extra[k]; });
+    try { channel.postMessage(msg); } catch (e) { /* closed */ }
+  }
+
   function watchOtherTabs() {
+    store.subscribe(function (info) {
+      if (info && info.type === 'saved' && info.ok) post('saved', { stamp: info.stamp });
+    });
     if (!root.BroadcastChannel) return;
     try {
-      var ch = new BroadcastChannel('grade-tracker');
-      ch.onmessage = function (ev) {
-        if (ev.data === 'hello') ch.postMessage('here');
-        if (ev.data === 'hello' || ev.data === 'here') {
-          if (!otherTabOpen) { otherTabOpen = true; requestRender(); }
+      channel = new BroadcastChannel('grade-tracker');
+      channel.onmessage = function (ev) {
+        var m = ev.data;
+        if (!m || typeof m !== 'object' || typeof m.type !== 'string' || typeof m.id !== 'string' || m.id === tabId) return;
+        var had = otherTabOpen();
+        if (m.type === 'goodbye') delete otherTabs[m.id];
+        else otherTabs[m.id] = true;
+        if (m.type === 'hello') post('here');
+        if (m.type === 'saved' && (typeof m.stamp !== 'string' || m.stamp !== (GT.storage.stamp ? GT.storage.stamp() : null))) {
+          store.checkConflict();
         }
+        if (had !== otherTabOpen()) requestRender();
       };
-      ch.postMessage('hello');
-    } catch (e) { /* not supported on this origin */ }
+      post('hello');
+    } catch (e) { channel = null; /* not supported on this origin */ }
   }
 
   // ------------------------------------------------------------------ sticky header height
@@ -798,9 +932,15 @@
         recovered = GT.storage.loadNote ? GT.storage.loadNote() : null;
         store.init(state, info.backend);
         if (loadProblem) {
-          // Do not overwrite unreadable saved data: keep it until the user decides.
+          // Do not overwrite unreadable saved data: keep it until the user decides. A save fails (the
+          // status says "Saving paused"), so nothing claims to be saved and leaving the page warns.
           GT.storage.save = (function (orig) {
-            return function (st) { return loadProblem ? Promise.resolve() : orig(st); };
+            return function (st) {
+              if (!loadProblem) return orig(st);
+              var err = new Error('Saving is paused until you download the unreadable data and restore it or start fresh');
+              err.paused = true;
+              return Promise.reject(err);
+            };
           })(GT.storage.save);
           if (GT.storage.saveSync) {
             GT.storage.saveSync = (function (orig) {

@@ -412,3 +412,370 @@ describe('annotateHistory and autosave', () => {
     assert.equal(store.saveStatus().backend, 'memory');
   });
 });
+
+// ================================================================ two tabs: conflict (read-only) mode
+
+/** Swaps GT.storage functions for one test (restored by the returned function). */
+function stubStorage(patch) {
+  const prev = {};
+  Object.keys(patch).forEach((k) => { prev[k] = globalThis.GT.storage[k]; globalThis.GT.storage[k] = patch[k]; });
+  return () => Object.keys(prev).forEach((k) => {
+    if (prev[k] === undefined) delete globalThis.GT.storage[k]; else globalThis.GT.storage[k] = prev[k];
+  });
+}
+function conflictErr() { const e = new Error('changed in another tab'); e.conflict = true; return e; }
+
+describe('a save that finds newer data from another tab (compare-and-swap conflict)', () => {
+  test('the store goes read-only: phase conflict, autosave stops, transact throws and changes nothing', async () => {
+    const { c, alpha } = setup();
+    let calls = 0;
+    const restore = stubStorage({ save: () => { calls++; return Promise.reject(conflictErr()); } });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '88'));
+      await store.flush();
+      assert.equal(calls, 1);
+      assert.equal(store.saveStatus().phase, 'conflict');
+      assert.equal(store.readOnly(), true);
+      assert.ok(events.some((e) => e.type === 'conflict'));
+      assert.ok(events.some((e) => e.type === 'saved' && e.ok === false));
+      // Every data change is refused before anything changes.
+      const before = dataOf(c);
+      const n = c.history.length;
+      assert.throws(() => store.transact('Edit again', setT1(alpha, '1')), (e) => e.conflict === true && /another tab/.test(e.message));
+      assert.deepEqual(dataOf(c), before);
+      assert.equal(c.history.length, n);
+      assert.throws(() => store.addCourse(model.createCourse('custom', { code: 'X' })), (e) => e.conflict === true);
+      assert.throws(() => store.deleteCourse(c.id), (e) => e.conflict === true);
+      assert.throws(() => store.moveCourse(c.id, 1), (e) => e.conflict === true);
+      assert.throws(() => store.replaceState(model.createDefaultState(), 'restore'), (e) => e.conflict === true);
+      assert.equal(store.canUndo(), false);
+      assert.equal(store.undo(), false, 'undo changes nothing while read-only');
+      assert.equal(t1Score(c, alpha), 88);
+      assert.equal(store.annotateHistory(c.history[c.history.length - 1].id, 'note'), false);
+      // UI-only settings change on screen but are never saved (no save is even attempted).
+      store.setUi({ theme: 'dark' });
+      store.setActiveCourse(store.state.courses[1].id);
+      assert.equal(store.state.ui.theme, 'dark');
+      await store.flush();
+      await new Promise((r) => setTimeout(r, 450));
+      assert.equal(calls, 1, 'no save after the conflict');
+      assert.equal(store.saveStatus().phase, 'conflict');
+      assert.equal(store.flushOnLeave(), false);
+      // The edit made before the conflict was never stored: leaving would lose it.
+      assert.equal(store.hasUnsavedData(), true);
+    } finally {
+      restore();
+    }
+    // A new boot (reload) starts writable again.
+    setup();
+    assert.equal(store.readOnly(), false);
+    assert.equal(store.saveStatus().phase, 'idle');
+  });
+
+  test('a UI-only click in a stale tab fails into the conflict too (it never writes the old data back)', async () => {
+    setup();
+    const written = [];
+    const restore = stubStorage({ save: (st) => { written.push(st); return Promise.reject(conflictErr()); } });
+    try {
+      store.setUi({ privacy: true });
+      await store.flush();
+      assert.equal(written.length, 1, 'the click is saved through the same compare-and-swap');
+      assert.equal(store.saveStatus().phase, 'conflict');
+      assert.equal(store.hasUnsavedData(), false, 'only a UI setting was not saved: nothing to warn about');
+    } finally {
+      restore();
+    }
+  });
+
+  test('checkConflict: a stale tab (another tab said it saved) goes read-only without saving; an up-to-date one does not', async () => {
+    setup();
+    let stale = false;
+    let saves = 0;
+    const restore = stubStorage({ isStale: () => Promise.resolve(stale), save: () => { saves++; return Promise.resolve(); } });
+    try {
+      assert.equal(await store.checkConflict(), false);
+      assert.equal(store.readOnly(), false);
+      stale = true;
+      assert.equal(await store.checkConflict(), true);
+      assert.equal(store.readOnly(), true);
+      assert.equal(store.saveStatus().phase, 'conflict');
+      assert.equal(saves, 0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('another failure is an error, not a conflict: the store stays writable and retries on flush', async () => {
+    const { alpha } = setup();
+    let fail = true;
+    const realError = console.error;
+    console.error = () => {};
+    const restore = stubStorage({ save: () => (fail ? Promise.reject(new Error('QuotaExceededError')) : Promise.resolve()) });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '70'));
+      await store.flush();
+      assert.equal(store.saveStatus().phase, 'error');
+      assert.equal(store.readOnly(), false);
+      assert.equal(store.hasUnsavedData(), true, 'a failed save warns before the page closes');
+      fail = false;
+      await store.flush();
+      assert.equal(store.saveStatus().phase, 'saved');
+      assert.equal(store.hasUnsavedData(), false);
+    } finally {
+      restore();
+      console.error = realError;
+    }
+  });
+
+  test('a paused save (err.paused, unreadable saved data) is an error that is not logged as a failure', async () => {
+    const { alpha } = setup();
+    const logged = [];
+    const realError = console.error;
+    console.error = (...a) => logged.push(a);
+    const restore = stubStorage({ save: () => { const e = new Error('Saving is paused'); e.paused = true; return Promise.reject(e); } });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '71'));
+      await store.flush();
+      assert.equal(store.saveStatus().phase, 'error');
+      assert.match(store.saveStatus().error, /paused/);
+      assert.equal(logged.length, 0);
+      assert.equal(store.hasUnsavedData(), true);
+    } finally {
+      restore();
+      console.error = realError;
+    }
+    await store.flush();
+  });
+
+  test('clearAll deletes through storage.clear first, then replaces the state; it is refused while read-only', async () => {
+    const { alpha } = setup();
+    const order = [];
+    const restore = stubStorage({ clear: () => { order.push('clear'); return Promise.resolve(); } });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '72')); // a pending autosave is cancelled, not written after the clear
+      const fresh = model.createDefaultState();
+      saved.length = 0;
+      await store.clearAll(fresh, 'delete-all');
+      order.push('replaced');
+      assert.deepEqual(order, ['clear', 'replaced']);
+      assert.equal(store.state, fresh);
+      assert.ok(events.some((e) => e.type === 'replace' && e.source === 'delete-all'));
+      await store.flush();
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].courses[0].students.length, 0, 'only the fresh state was saved after the clear');
+    } finally {
+      restore();
+    }
+    setup();
+    const restore2 = stubStorage({ save: () => Promise.reject(conflictErr()) });
+    try {
+      store.setUi({ theme: 'light' });
+      await store.flush();
+      assert.throws(() => store.clearAll(model.createDefaultState()), (e) => e.conflict === true);
+    } finally {
+      restore2();
+    }
+  });
+});
+
+describe('leaving the page (flushOnLeave) and unsaved data', () => {
+  test('IndexedDB: an emergency copy keeps the change; UI-only changes are not unsaved data', async () => {
+    const { alpha } = setup();
+    let copies = 0;
+    let saves = 0;
+    const restore = stubStorage({
+      saveSync: () => { copies++; return true; },
+      backend: () => 'indexeddb',
+      save: () => { saves++; return new Promise(() => {}); } // dies with the page
+    });
+    try {
+      store.setUi({ privacy: true });
+      assert.equal(store.hasUnsavedData(), false, 'a UI setting is not course data');
+      store.transact('Edit Test 1', setT1(alpha, '73'));
+      assert.equal(store.hasUnsavedData(), true);
+      assert.equal(store.flushOnLeave(), true);
+      assert.equal(copies, 1);
+      assert.equal(saves, 1, 'the normal save starts too');
+      assert.equal(store.hasUnsavedData(), false, 'the emergency copy keeps it');
+      assert.equal(store.flushOnLeave(), false, 'nothing new: no second copy');
+      assert.equal(copies, 1);
+    } finally {
+      restore();
+    }
+    setup(); // the never-ending save above is abandoned with the "page"
+  });
+
+  test('IndexedDB without room for the emergency copy: the change is still unsaved (the page warns)', () => {
+    const { alpha } = setup();
+    const restore = stubStorage({ saveSync: () => false, backend: () => 'indexeddb', save: () => new Promise(() => {}) });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '74'));
+      assert.equal(store.flushOnLeave(), false);
+      assert.equal(store.hasUnsavedData(), true);
+    } finally {
+      restore();
+    }
+    setup();
+  });
+
+  test('localStorage: saveSync is a complete save, so nothing is pending afterwards', async () => {
+    const { alpha } = setup();
+    let saves = 0;
+    const restore = stubStorage({ saveSync: () => true, backend: () => 'localstorage', save: () => { saves++; return Promise.resolve(); } });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '75'));
+      assert.equal(store.flushOnLeave(), true);
+      assert.equal(store.saveStatus().phase, 'saved');
+      assert.equal(store.hasUnsavedData(), false);
+      await store.flush();
+      assert.equal(saves, 0, 'not saved twice');
+      assert.ok(events.some((e) => e.type === 'saved' && e.ok === true));
+    } finally {
+      restore();
+    }
+  });
+
+  test('a conflict found by saveSync makes the store read-only', () => {
+    const { alpha } = setup();
+    const restore = stubStorage({ saveSync: () => { throw conflictErr(); }, backend: () => 'localstorage' });
+    try {
+      store.transact('Edit Test 1', setT1(alpha, '76'));
+      assert.equal(store.flushOnLeave(), false);
+      assert.equal(store.saveStatus().phase, 'conflict');
+    } finally {
+      restore();
+    }
+    setup();
+  });
+});
+
+// ================================================================ undo step ids, merged roll-call entries
+
+describe('undoStepId', () => {
+  test('every pushed step gets a new id, even with the same label', () => {
+    const { alpha } = setup();
+    assert.equal(store.undoStepId(), null);
+    store.transact('Same', setT1(alpha, '1'));
+    const a = store.undoStepId();
+    store.transact('Same', setT1(alpha, '2'));
+    const b = store.undoStepId();
+    assert.ok(a && b && a !== b);
+    store.undo();
+    assert.equal(store.undoStepId(), a);
+    store.redo();
+    assert.notEqual(store.undoStepId(), b, 'a redone step is a new step');
+  });
+});
+
+describe('transact mergeKey (roll call: one history entry per roll call)', () => {
+  function addSession(c) {
+    const ses = { id: 'ses_1', date: '2026-10-06', label: 'Tue Oct 6' };
+    c.attendance.sessions.push(ses);
+    return ses;
+  }
+  function mark(sid, m) {
+    return (co) => { co.attendance.records[sid] = co.attendance.records[sid] || {}; co.attendance.records[sid].ses_1 = m; };
+  }
+  const KEY = 'rollcall:ses_1:1000';
+
+  test('the first mark is a normal entry with the key; the next ones fold into ONE summary entry with every change', () => {
+    const { c, alpha, bravo, charlie } = setup();
+    addSession(c);
+    const n = c.history.length;
+    store.transact('Roll call Tue Oct 6', mark(alpha.id, 'P'), { mergeKey: KEY });
+    assert.equal(c.history.length, n + 1);
+    const first = c.history[n];
+    assert.equal(first.kind, 'attendance');
+    assert.equal(first.studentId, alpha.id);
+    assert.equal(first.mergeKey, KEY);
+    store.transact('Roll call Tue Oct 6', mark(bravo.id, 'A'), { mergeKey: KEY });
+    assert.equal(c.history.length, n + 1, 'merged, not appended');
+    let e = c.history[n];
+    assert.notEqual(e.id, first.id);
+    assert.equal(e.kind, 'attendance');
+    assert.equal(e.field, 'Roll call Tue Oct 6');
+    assert.equal(e.fieldKey, 'attendance');
+    assert.equal(e.newValue, '2 marks');
+    assert.equal(e.studentId, null);
+    assert.equal(e.mergeKey, KEY);
+    assert.equal(e.source, 'edit');
+    // Each change as the per-mark entry described it (the mark labels come from GT.history).
+    assert.deepEqual(e.details.map((d) => [d.studentId, d.studentName, d.no, d.field, d.oldValue]), [
+      [alpha.id, 'Student 01, Alpha', 1, 'Attendance 2026-10-06', first.oldValue],
+      [bravo.id, 'Student 02, Bravo', 2, 'Attendance 2026-10-06', first.oldValue]
+    ]);
+    assert.equal(e.details[0].newValue, first.newValue);
+    assert.notEqual(e.details[1].newValue, first.newValue, 'Absent, not Present');
+    store.transact('Roll call Tue Oct 6', mark(charlie.id, 'E'), { mergeKey: KEY });
+    store.transact('Roll call Tue Oct 6', mark(alpha.id, 'A'), { mergeKey: KEY }); // marked again: listed again
+    assert.equal(c.history.length, n + 1);
+    e = c.history[n];
+    assert.equal(e.newValue, '4 marks');
+    assert.equal(e.note, '3 students');
+    assert.deepEqual(e.details.map((d) => d.studentId), [alpha.id, bravo.id, charlie.id, alpha.id]);
+    // The History helpers read the details: the student filter, one student's own change, the CSV rows.
+    assert.equal(history.involvesStudent(e, charlie.id), true);
+    const own = history.detailFor(e, alpha.id);
+    assert.equal(own.oldValue, '');
+    assert.equal(own.newValue, e.details[3].newValue, 'first old value, last new value');
+    const rows = history.toRows([e]);
+    assert.equal(rows.length, 1 + 1 + 4);
+    assert.equal(rows[2][5], 'Attendance 2026-10-06');
+    assert.equal(rows[2][8], 'Part of "Roll call Tue Oct 6: 4 marks"');
+  });
+
+  test('undo and redo stay per mark; after an undo the next mark starts a new entry', () => {
+    const { c, alpha, bravo, charlie } = setup();
+    addSession(c);
+    store.transact('Roll call', mark(alpha.id, 'P'), { mergeKey: KEY });
+    store.transact('Roll call', mark(bravo.id, 'P'), { mergeKey: KEY });
+    const n = c.history.length;
+    assert.equal(store.undo(), true);
+    assert.equal((c.attendance.records[bravo.id] || {}).ses_1, undefined, 'only the last mark is undone');
+    assert.equal(c.attendance.records[alpha.id].ses_1, 'P');
+    assert.equal(c.history.length, n + 1);
+    assert.equal(c.history[n].source, 'undo');
+    assert.equal(store.redo(), true);
+    assert.equal(c.attendance.records[bravo.id].ses_1, 'P');
+    const m = c.history.length;
+    store.transact('Roll call', mark(charlie.id, 'P'), { mergeKey: KEY });
+    assert.equal(c.history.length, m + 1, 'the last entry is the redo: appended, not merged into it');
+    assert.equal(c.history[m].studentId, charlie.id);
+  });
+
+  test('no merge for another key, an entry older than 30 minutes, or an entry the TA annotated', () => {
+    const { c, alpha, bravo, charlie, zulu } = setup();
+    addSession(c);
+    store.transact('Roll call', mark(alpha.id, 'P'), { mergeKey: KEY });
+    let n = c.history.length;
+    store.transact('Roll call', mark(bravo.id, 'P'), { mergeKey: 'rollcall:ses_1:2000' });
+    assert.equal(c.history.length, n + 1, 'another roll call');
+    c.history[c.history.length - 1].ts = new Date(Date.now() - 31 * 60000).toISOString();
+    n = c.history.length;
+    store.transact('Roll call', mark(charlie.id, 'P'), { mergeKey: 'rollcall:ses_1:2000' });
+    assert.equal(c.history.length, n + 1, 'too old');
+    store.annotateHistory(c.history[c.history.length - 1].id, 'came late');
+    n = c.history.length;
+    store.transact('Roll call', mark(charlie.id, 'A'), { mergeKey: 'rollcall:ses_1:2000' });
+    assert.equal(c.history.length, n + 1, 'an annotated entry is kept as it is');
+    // A transaction without the key never merges.
+    n = c.history.length;
+    store.transact('Mark', mark(alpha.id, 'E'));
+    assert.equal(c.history.length, n + 1);
+    assert.equal(c.history[n].mergeKey, undefined);
+    assert.ok(zulu);
+  });
+
+  test('a merge changes the undo mark (history length stays, the last entry id changes)', () => {
+    const { c, alpha, bravo } = setup();
+    addSession(c);
+    store.transact('Roll call', mark(alpha.id, 'P'), { mergeKey: KEY });
+    const id1 = c.history[c.history.length - 1].id;
+    const len = c.history.length;
+    const step1 = store.undoStepId();
+    store.transact('Roll call', mark(bravo.id, 'P'), { mergeKey: KEY });
+    assert.equal(c.history.length, len);
+    assert.notEqual(c.history[c.history.length - 1].id, id1);
+    assert.notEqual(store.undoStepId(), step1);
+  });
+});

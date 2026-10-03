@@ -6,7 +6,6 @@
 /* ------------------------------------------------------------------ header, toolbar, legend */
 
 .grid-head h1 { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.grid-head .grid-title { font-weight: 500; color: var(--text-muted); font-size: 16px; }
 .grid-head .sub { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
 .grid-weights .icon { width: 13px; height: 13px; }
 
@@ -17,9 +16,12 @@
 .grid-sort select { min-height: 26px; padding: 3px 8px; font-size: 12.5px; }
 .grid-count { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .grid-toolbar [hidden] { display: none; }
-.grid-legend-btn { display: none; } /* phones and the Meeting view (see below) */
-.grid-toolbar.meeting-mode .grid-legend-btn { display: inline-flex; }
-.grid-legend.meeting-mode:not(.is-open) { display: none; }
+/* The legend folds behind its button at every width (grid.js: gridPrefs.legend remembers it open), so
+ * more rows fit on the screen. */
+.grid-legend:not(.is-open) { display: none; }
+/* Meeting view: no new students in the meeting, so the toolbar stays on one line at 1280 px. */
+.grid-toolbar.meeting-mode [data-act="add-student"],
+.grid-toolbar.meeting-mode [data-act="paste-roster"] { display: none; }
 .grid-toolbar .grid-resort[hidden] { display: none; }
 
 /* "Final grades" bar: Meeting view, letter summary, copy suggested, finalize */
@@ -124,6 +126,11 @@
 }
 .gt-grid .num { text-align: right; font-variant-numeric: tabular-nums; }
 .gt-grid td { cursor: cell; }
+/* Each body row is its own paint layer (position without z-index: no stacking context, so the sticky
+ * cells, header, footer and open lists stay above as before). A change in one row then repaints that row
+ * only, instead of every cell of the table: at 300 students a selection move or an edit paints in a few
+ * ms instead of 15 to 50 (E2E-7). */
+.gt-grid tbody tr { position: relative; }
 .gt-grid td[aria-readonly="true"] { cursor: default; }
 .gt-grid td:focus { outline: none; }
 
@@ -447,7 +454,10 @@
   font-weight: 650; font-size: 12.5px; color: var(--text-muted);
 }
 .gt-grid tfoot td.g { background-color: color-mix(in srgb, var(--g) 50%, var(--bg-sunken)); }
+/* The label cells sit over the pinned identity columns (grid.js footRowHtml): "Class average" over No and
+ * Last Name, "(active)" over First Name and Team, pinned like the body cells under them. */
 .gt-grid tfoot .avg-label { z-index: 4; text-align: left; color: var(--text); }
+.gt-grid tfoot .avg-b { font-weight: 500; }
 .gt-grid tfoot td.f-total { color: var(--text); font-weight: 700; }
 .gt-grid tfoot td.f-letter, .gt-grid tfoot td.f-final { text-align: center; }
 
@@ -484,8 +494,6 @@
     overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
   .grid-toolbar .btn { gap: 2px; }
-  .grid-legend-btn { display: inline-flex; }
-  .grid-legend:not(.is-open) { display: none; }
   .grid-legend .lg-hint { display: none; }
   /* Only No and Last Name stay pinned, so the scores keep some room. */
   .gt-grid .sc3, .gt-grid .sc4 { position: static; }
@@ -498,7 +506,10 @@
   .gt-grid.meeting tbody td.pr { position: static; }
   .gt-grid.meeting .pr-first::after { display: none; }
   .gt-grid .sc-span { position: static; }
-  .gt-grid tfoot .sc-span { position: sticky; left: auto; }
+  /* Footer: "Class average" stays pinned over No and Last Name, and the cell over First Name and Team
+   * scrolls with the scores like the body cells above it (it still sticks to the bottom). */
+  .gt-grid tfoot th.avg-a { border-right: 1px solid var(--border-strong); }
+  .gt-grid tfoot td.avg-b, .gt-grid.meeting tfoot td.avg-b { position: sticky; left: auto; z-index: 3; }
   .gt-grid .sc2 { border-right: 1px solid var(--border-strong); }
   .grid-wrap { max-height: max(300px, calc(100vh - 200px)); }
 }

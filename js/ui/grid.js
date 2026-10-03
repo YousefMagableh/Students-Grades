@@ -64,6 +64,9 @@
   var NOTE_MAX = 200;        // characters of the Finalize note (the banner shows at most NOTE_SHOWN)
   var NOTE_SHOWN = 120;
   var LETTERS_CONFIRM = 10;  // clearing more final letters than this at once asks first
+  var WITHDRAWN_LETTER_TIP = 'Withdrawn: no letter';
+  // Classes paintSelection() and placeDropButton() put on body cells; a patched cell keeps them.
+  var PAINT_CLASSES = ['is-active', 'in-range', 'has-dd', 'is-editing', 'has-popup'];
 
   // Team-score marker: one masked span (css/grid.css) instead of an inline SVG per cell, to keep the
   // 59-row table cheap to lay out.
@@ -105,11 +108,24 @@
   var ddToastAt = 0;
   var bandToastShown = false;
   var ddBtn = null;          // the ▾ button shown in the active drop-down cell
-  // Stable row order (DECISIONS 7): the student ids in the order of the last sort. Edits never
-  // reorder rows; the snapshot is taken again only when the sort, search, filter, grouping, Meeting
-  // view or the set of students changes, or when the user clicks "Order changed: re-sort".
-  var order = { courseId: null, sig: null, idsKey: null, ids: null };
+  // Stable row order (DECISIONS 7): per course id, the student ids in the order of the last sort
+  // ({ sig, ids }). Edits never reorder rows. The snapshot is taken again only when the sort, the
+  // grouping or the Meeting view changes, after "Finalize scores", or when the user clicks "Order
+  // changed: re-sort". A search or the withdrawn filter only hides rows of the snapshot, a course
+  // switch keeps each course's own snapshot, new students are appended at the end and removed ones
+  // dropped.
+  var orders = Object.create(null);
   var forceResort = false;
+  // End of the list (E2E-2): a value committed with Enter or Down on the last row (Up on the first) cannot
+  // move on, so the next typed key would silently replace it. { sid, key } of that cell: typed keys and
+  // Enter there are ignored (with a message) until the user moves, clicks or edits it explicitly (F2).
+  var endHold = null;
+  var endHoldToastAt = 0;
+  // The table as last built, so a data change patches only the cells whose markup changed (CODE-5):
+  // { table, sig, items: [{ sid, tr, parts } | { team: true, tr, html }], foot }. sig: the header markup
+  // and the row keys in order; any other change (columns, order, grouping, filter) rebuilds the table.
+  var built = null;
+  var leaveHooked = false;
 
   // Any store change except autosave/annotation invalidates the table.
   if (GT.store && GT.store.subscribe) {
@@ -180,6 +196,7 @@
       showWithdrawn: p.showWithdrawn !== false,
       meeting: p.meeting === true,
       meetingPrev: typeof p.meetingPrev === 'string' ? p.meetingPrev : '',
+      legend: p.legend === true,  // the legend is folded behind its button unless opened (UX-13)
       cols: {}
     };
     // Grouping by team is off in the Meeting view (it lists everyone by total, without the Team column).
@@ -637,7 +654,12 @@
       if (prefs.cols.diff) cols.push(simple('diff', 'diff', '±Avg', W.diff, { ro: true, num: true }));
       cols = cols.concat(att);
     }
-    cols.forEach(function (c, i) { c.index = i; });
+    var maxPin = 0;
+    cols.forEach(function (c) { if (c.pinR > maxPin) maxPin = c.pinR; });
+    cols.forEach(function (c, i) {
+      c.index = i;
+      c.pinCls = c.pinR ? ' pr pr' + c.pinR + (c.pinR === maxPin ? ' pr-first' : '') : '';
+    });
     return cols;
   }
 
@@ -681,8 +703,28 @@
     return { items: items, students: students, shown: visible.length };
   }
 
+  /** What the row-order snapshot depends on. The search and the withdrawn filter are not part of it:
+   * arrange() filters the snapshot, so clearing a search shows the rows in their old places (E2E-3). */
   function orderSig(prefs) {
-    return [prefs.sort, prefs.dir, prefs.grouped, prefs.meeting, prefs.showWithdrawn, searchText.trim().toLowerCase()].join('|');
+    return [prefs.sort, prefs.dir, prefs.grouped, prefs.meeting].join('|');
+  }
+
+  /** The course's row-order snapshot (DECISIONS 7), as student ids: a fresh sort when there is none yet,
+   * the sort, grouping or Meeting view changed, or on "re-sort"; otherwise the old order, without the
+   * students that are gone and with new students appended at the end (in the fresh order). */
+  function orderIds(course, fresh, prefs) {
+    var sig = orderSig(prefs);
+    var snap = orders[course.id];
+    if (forceResort || !snap || snap.sig !== sig) {
+      snap = orders[course.id] = { sig: sig, ids: fresh.map(function (s) { return s.id; }) };
+      return snap.ids;
+    }
+    var have = Object.create(null), seen = Object.create(null);
+    course.students.forEach(function (s) { have[s.id] = true; });
+    var ids = snap.ids.filter(function (id) { return have[id] === true && (seen[id] = true); });
+    fresh.forEach(function (s) { if (!seen[s.id]) ids.push(s.id); });
+    snap.ids = ids;
+    return ids;
   }
 
   function buildLayout(course, results, prefs) {
@@ -690,17 +732,11 @@
     var teamById = Object.create(null);
     course.teams.forEach(function (t) { teamById[t.id] = t; });
     var fresh = calc.sortStudents(course, results, prefs.sort, prefs.dir);
-    // The row order is a snapshot (DECISIONS 7): take a new one only when the sort, search, filter,
-    // grouping or Meeting view changed, students were added or removed, or on "re-sort".
-    var sig = orderSig(prefs);
-    var idsKey = course.students.map(function (s) { return s.id; }).sort().join('\n');
-    if (forceResort || !order.ids || order.courseId !== course.id || order.sig !== sig || order.idsKey !== idsKey) {
-      order = { courseId: course.id, sig: sig, idsKey: idsKey, ids: fresh.map(function (s) { return s.id; }) };
-    }
+    var ids = orderIds(course, fresh, prefs);
     forceResort = false;
     var byId = Object.create(null);
     course.students.forEach(function (s) { byId[s.id] = s; });
-    var snap = order.ids.map(function (id) { return byId[id]; }).filter(Boolean);
+    var snap = ids.map(function (id) { return byId[id]; }).filter(Boolean);
     var got = arrange(course, snap, prefs, teamById);
     var want = arrange(course, fresh, prefs, teamById);
     var stale = got.students.length !== want.students.length || got.students.some(function (s, i) { return s !== want.students[i]; });
@@ -849,6 +885,8 @@
   function focusCell(td) {
     if (!td) return;
     if (!td.hasAttribute('tabindex')) td.setAttribute('tabindex', '-1');
+    // Already focused: focus() would still bring style and layout up to date first (E2E-7).
+    if (document.activeElement === td) return;
     try { td.focus({ preventScroll: true }); } catch (e) { td.focus(); }
   }
 
@@ -949,10 +987,13 @@
     c = clamp(c, 0, layout.cols.length - 1);
     if (extend) {
       sel.end = refAt(r, c);
+      endHold = null;
     } else {
       sel.active = refAt(r, c);
       sel.end = sel.active;
       if (sel.active.sid !== newRowSid) newRowSid = null;
+      // A move to another cell ends the hold; a key that cannot move (Down on the last row) keeps it.
+      if (endHold && !heldAt(sel.active)) endHold = null;
     }
     paintSelection();
     focusActive();
@@ -1002,10 +1043,7 @@
   /** Classes of a column pinned on the right (Meeting view): ' pr pr<n>', plus ' pr-first' on the
    * leftmost one, which draws the edge line. '' for every other column. */
   function pinClass(col) {
-    if (!col.pinR) return '';
-    var maxPin = 0;
-    layout.cols.forEach(function (c) { if (c.pinR > maxPin) maxPin = c.pinR; });
-    return ' pr pr' + col.pinR + (col.pinR === maxPin ? ' pr-first' : '');
+    return col.pinCls || '';
   }
 
   function headHtml(ctx) {
@@ -1069,7 +1107,7 @@
           title = 'Letter from the cutoffs: only a suggestion. The Final letter is the grade that counts.';
           break;
         case 'final':
-          inner = '<span class="h-name">Final letter</span>' + (col.toFill ? fillTag : '<span class="h-sub">drop-down</span>');
+          inner = '<span class="h-name">Final letter</span>' + (col.toFill ? fillTag : '<span class="h-sub">your choice</span>');
           title = 'The final letter grade, chosen by hand (Enter or Alt+Down opens the list; type a letter such as b+). ' +
             'Select several rows first to give them all the same letter.';
           break;
@@ -1142,13 +1180,15 @@
     return { cls: cls, body: body, title: title };
   }
 
-  function studentRowHtml(ctx, s, r, ariaRow) {
+  /** One student row as parts: { cls: the row's classes, cells: [{ c: classes, ro, t: title (plain text),
+   * b: inner HTML }] }. renderTable() writes them as markup (studentRowHtml) or patches only the cells
+   * whose parts changed since the last render. */
+  function studentRowParts(ctx, s) {
     var course = ctx.course, cols = ctx.cols, dec = ctx.dec;
     var rs = ctx.results.byId[s.id];
     var wd = s.status === 'withdrawn';
     var team = s.teamId ? ctx.teamById[s.teamId] : null;
-    var h = '<tr role="row" class="gr' + (wd ? ' row-withdrawn' : '') + (ctx.bandEnd[s.id] ? ' band-end' : '') + '" data-r="' + r +
-      '" data-sid="' + esc(s.id) + '" aria-rowindex="' + ariaRow + '">';
+    var out = { cls: 'gr' + (wd ? ' row-withdrawn' : '') + (ctx.bandEnd[s.id] ? ' band-end' : ''), cells: new Array(cols.length) };
     for (var i = 0; i < cols.length; i++) {
       var col = cols[i];
       var cls, body = '', title = '', ro = !!col.ro || (ctx.locked && !!col.edit && col.kind !== 'final');
@@ -1261,8 +1301,9 @@
           break;
         case 'letter':
           cls = 'c-letter ro' + (wd ? ' muted' : '');
-          body = esc(rs.letter);
-          title = 'Suggested by the cutoffs';
+          // Withdrawn: "W", as on the Summary, not a cutoff letter (UX-8).
+          body = wd ? 'W' : esc(rs.letter);
+          title = wd ? WITHDRAWN_LETTER_TIP : 'Suggested by the cutoffs';
           break;
         case 'final': {
           var fi = finalInfo(s, rs, ctx.letterSet);
@@ -1326,10 +1367,42 @@
       }
       if (col.sticky && col.sticky === ctx.nId) cls += ' sc-last';
       cls += pinClass(col);
-      h += '<td role="gridcell" data-c="' + i + '" class="' + cls + '"' + (ro ? ' aria-readonly="true"' : '') +
-        (title ? ' title="' + esc(title) + '"' : '') + '>' + body + '</td>';
+      out.cells[i] = { c: cls, ro: ro, t: title, b: body };
     }
+    return out;
+  }
+
+  function cellHtml(cell, i) {
+    return '<td role="gridcell" data-c="' + i + '" class="' + cell.c + '"' + (cell.ro ? ' aria-readonly="true"' : '') +
+      (cell.t ? ' title="' + esc(cell.t) + '"' : '') + '>' + cell.b + '</td>';
+  }
+
+  function studentRowHtml(parts, s, r, ariaRow) {
+    var h = '<tr role="row" class="' + parts.cls + '" data-r="' + r + '" data-sid="' + esc(s.id) + '" aria-rowindex="' + ariaRow + '">';
+    for (var i = 0; i < parts.cells.length; i++) h += cellHtml(parts.cells[i], i);
     return h + '</tr>';
+  }
+
+  /** Brings a cell from its old parts to its new ones in place: the element (focus, tabindex, the ▾
+   * button) stays, and the selection classes paintSelection() added are kept. */
+  function patchCell(td, a, b) {
+    if (a.c !== b.c) {
+      var cl = td.classList, keep = '';
+      for (var k = 0; k < PAINT_CLASSES.length; k++) if (cl.contains(PAINT_CLASSES[k])) keep += ' ' + PAINT_CLASSES[k];
+      td.className = a.c + keep;
+    }
+    if (a.ro !== b.ro) {
+      if (a.ro) td.setAttribute('aria-readonly', 'true'); else td.removeAttribute('aria-readonly');
+    }
+    if (a.t !== b.t) {
+      if (a.t) td.setAttribute('title', a.t); else td.removeAttribute('title');
+    }
+    if (a.b !== b.b) {
+      var hadBtn = !!ddBtn && ddBtn.parentNode === td;
+      // Plain text (most changes: ±Avg, rank, totals) skips the HTML parser.
+      if (/[<&]/.test(a.b)) td.innerHTML = a.b; else td.textContent = a.b;
+      if (hadBtn) td.appendChild(ddBtn);
+    }
   }
 
   function teamRowHtml(ctx, team, ariaRow) {
@@ -1343,9 +1416,14 @@
       if (r && typeof r.total === 'number' && isFinite(r.total)) totals.push(r.total);
     });
     var avg = totals.length ? num(util.fix(util.sum(totals) / totals.length), ctx.dec) : '—';
-    var h = '<tr role="row" class="team-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="' + ctx.nId + '" class="sc sc-span team-label">' +
-      ui.icon('users', 'icon-sm') + ' <span class="tl-name">' + esc(team ? team.name : 'No team') + '</span><span class="tl-meta"> · ' +
-      plural(all.length, 'member') + (wd ? ' (' + wd + ' withdrawn)' : '') + ' · team average ' + avg + '</span></th>';
+    var name = team ? team.name : 'No team';
+    var members = plural(all.length, 'member') + (wd ? ' (' + wd + ' withdrawn)' : '');
+    // Short enough for the identity columns ("· avg 78.91", UX-15); the whole line is in the tooltip.
+    var full = name + ': ' + members + ' · ' + (team ? 'team average ' : 'average ') + avg + ' (active members)';
+    var h = '<tr role="row" class="team-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="' + ctx.nId +
+      '" class="sc sc-span team-label" title="' + esc(full) + '">' +
+      ui.icon('users', 'icon-sm') + ' <span class="tl-name">' + esc(name) + '</span><span class="tl-meta"> · ' +
+      esc(members) + ' · avg ' + avg + '</span></th>';
     for (var i = ctx.nId; i < cols.length; i++) {
       var col = cols[i], inner = '', cls = 'tr-cell' + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '') + pinClass(col);
       if (team && col.kind === 'raw' && col.a.teamGraded) {
@@ -1365,11 +1443,16 @@
     return h + '</tr>';
   }
 
-  function footHtml(ctx, ariaRow) {
+  /** The class-average row (the <tr> inside <tfoot>). Its label cells line up with the pinned body
+   * columns (UX-6): "Class average" over No and Last Name (pinned at every width), and a cell over First
+   * Name (and Team) pinned like them, which css/grid.css leaves unpinned on phones, as the body cells are. */
+  function footRowHtml(ctx, ariaRow) {
     var course = ctx.course, cols = ctx.cols, dec = ctx.dec, results = ctx.results;
     var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; });
-    var h = '<tfoot><tr role="row" class="avg-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="' + ctx.nId + '" class="sc sc-span avg-label">' +
-      'Class average <span class="muted">(active)</span></th>';
+    var tip = 'Class average of the active students (withdrawn students are left out)';
+    var h = '<tr role="row" class="avg-row" aria-rowindex="' + ariaRow + '"><th role="rowheader" scope="row" colspan="2" class="sc sc1 avg-label avg-a" title="' +
+      esc(tip) + '">Class average</th><td role="gridcell" aria-readonly="true" colspan="' + (ctx.nId - 2) + '" class="sc sc3 avg-label avg-b sc-last" title="' +
+      esc(tip) + '"><span class="muted">(active)</span></td>';
     for (var i = ctx.nId; i < cols.length; i++) {
       var col = cols[i], v = '', title = '';
       var cls = 'f-' + col.kind + (col.group ? ' g g' + col.group : '') + (col.num ? ' num' : '') + pinClass(col);
@@ -1394,7 +1477,7 @@
       }
       h += '<td role="gridcell" aria-readonly="true" class="' + cls + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + v + '</td>';
     }
-    return h + '</tr></tfoot>';
+    return h + '</tr>';
   }
 
   // ------------------------------------------------------------------ rendering
@@ -1408,7 +1491,8 @@
       '<button type="button" class="btn btn-sm btn-primary grid-resort" data-act="resort" hidden ' +
       'title="Rows keep their place while you edit. Click to sort them again with the new values.">' + ui.icon('sort-desc') +
       '<span>Order changed: re-sort</span></button>' +
-      // On phones the button labels (.bl) are visually hidden and the legend folds behind "Legend".
+      // On phones the button labels (.bl) are visually hidden. The legend folds behind "Legend" at every
+      // width (gridPrefs.legend remembers whether it is open).
       '<button type="button" class="btn btn-sm" data-act="group" aria-pressed="false" title="Group rows by team">' + ui.icon('layers') + '<span class="bl">Group by team</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="withdrawn" aria-pressed="true">' + ui.icon('user') + '<span class="bl">Show withdrawn</span></button>' +
       '<button type="button" class="btn btn-sm" data-act="columns" aria-haspopup="menu" aria-expanded="false" title="Show or hide columns">' + ui.icon('grid') +
@@ -1463,6 +1547,7 @@
     head.className = 'page-header grid-head';
     el.appendChild(head);
     layout = null;
+    built = null;
     rowEls = [];
     painted = { range: [], active: null, head: null, row: null };
     if (which !== 'grid') {
@@ -1506,6 +1591,7 @@
     dom.search.value = searchText;
     dom.search.addEventListener('input', function () {
       searchText = dom.search.value;
+      endHold = null;
       renderTable();
     });
     dom.search.addEventListener('keydown', function (e) {
@@ -1527,16 +1613,22 @@
     });
   }
 
+  /** "SE 4351 · Requirements Engineering · Fall 2026": the course line under every page title (UX-16). */
+  function courseLine(course) {
+    return [course.code, course.title, course.term].filter(function (x) { return typeof x === 'string' && x.trim() !== ''; }).join(' · ');
+  }
+
   function renderHead(course, results) {
     var active = 0, wd = 0;
     course.students.forEach(function (s) { if (s.status === 'withdrawn') wd++; else active++; });
     var dec = decimalsOf(course);
-    var h = '<div><h1>' + esc(course.code) + ' <span class="grid-title">' + esc(course.title) + '</span></h1><div class="sub">';
+    // The shared page header: the tab name as the title, the course and the counts under it.
+    var h = '<div><h1>Grades</h1><div class="sub"><span>' + esc(courseLine(course)) + ' · ';
     if (!course.students.length) {
-      h += 'No students yet';
+      h += 'No students yet</span>';
     } else {
       var avg = results && results.average !== null ? num(results.average, dec) : '—';
-      h += esc(active + ' active · ' + wd + ' withdrawn · class average ' + avg + ' (active students)');
+      h += esc(active + ' active · ' + wd + ' withdrawn · class average ' + avg + ' (active students)') + '</span>';
     }
     var w = results ? results.weights : calc.weightStatus(course);
     if (!w.ok) {
@@ -1544,7 +1636,7 @@
         (GT.views.settings ? 'Open Settings to fix the weights' : 'Weights should add up to 100%') + '">' +
         ui.icon('alert', 'icon-sm') + 'Weights sum to ' + esc(num(w.sum, 2)) + '%</button>';
     }
-    dom.head.innerHTML = h + '</div></div>';
+    setHtml(dom.head, h + '</div></div>');
   }
 
   function renderEmpty(course) {
@@ -1555,15 +1647,17 @@
     // are refused, so the banner with its Unlock button is shown here too.
     var banner = isFinalized(course) ? '<div class="callout grid-lock-banner grid-empty-lock" role="status">' + lockBannerHtml(course, null) + '</div>' : '';
     var lockAttr = banner ? ' aria-disabled="true" title="Scores are finalized. Unlock them to add students."' : '';
-    dom.empty.innerHTML = banner + '<div class="empty-state">' + ui.icon('users', 'empty-ico') +
+    // Paste roster is the main way in (as on Students & Teams); the fake sample data comes last (UX-7).
+    // Without the roster dialog, Add student takes the lead.
+    setHtml(dom.empty, banner + '<div class="empty-state">' + ui.icon('users', 'empty-ico') +
       '<h2>No students in ' + esc(course.code) + ' yet</h2>' +
-      '<p>Add students one by one, paste a roster copied from Excel, or load fake sample data to try the app. ' +
+      '<p>Paste a roster copied from Excel, add students one by one, or import a file. To try the app first, load fake sample data. ' +
       'Everything stays in this browser.</p><div class="actions">' +
-      (canSample ? '<button type="button" class="btn btn-primary" data-act="load-sample">' + ui.icon('layers') + 'Load sample data</button>' : '') +
-      (canRoster ? '<button type="button" class="btn" data-act="paste-roster"' + lockAttr + '>' + ui.icon('copy') + 'Paste roster</button>' : '') +
-      '<button type="button" class="btn" data-act="add-student"' + lockAttr + '>' + ui.icon('plus') + 'Add student</button>' +
+      (canRoster ? '<button type="button" class="btn btn-primary" data-act="paste-roster"' + lockAttr + '>' + ui.icon('copy') + 'Paste roster</button>' : '') +
+      '<button type="button" class="btn' + (canRoster ? '' : ' btn-primary') + '" data-act="add-student"' + lockAttr + '>' + ui.icon('plus') + 'Add student</button>' +
       (canImport ? '<button type="button" class="btn" data-act="import">' + ui.icon('upload') + 'Import from Excel/CSV</button>' : '') +
-      '</div></div>';
+      (canSample ? '<button type="button" class="btn" data-act="load-sample">' + ui.icon('layers') + 'Load sample data</button>' : '') +
+      '</div></div>');
   }
 
   /** Sets innerHTML only when it changed (keeps focus on a button that stays the same). */
@@ -1596,11 +1690,20 @@
     dom.add.title = locked ? 'Scores are finalized. Unlock them to add students.' : 'Add a student';
     if (dom.search.value !== searchText && document.activeElement !== dom.search) dom.search.value = searchText;
     dom.meeting.setAttribute('aria-pressed', p.meeting ? 'true' : 'false');
-    // Meeting view: the legend folds behind its button, so more rows fit on the screen.
-    if (dom.legend.classList.contains('meeting-mode') !== p.meeting) {
-      dom.legend.classList.toggle('meeting-mode', p.meeting);
+    // Meeting view: Add student and Paste roster are hidden, so the toolbar stays on one line (css).
+    if (dom.toolbar.classList.contains('meeting-mode') !== p.meeting) {
       dom.toolbar.classList.toggle('meeting-mode', p.meeting);
       queueWrapTop();
+    }
+    // The legend is folded behind its button unless the user opened it (remembered in gridPrefs).
+    if (dom.legend.classList.contains('is-open') !== p.legend) {
+      dom.legend.classList.toggle('is-open', p.legend);
+      queueWrapTop();
+    }
+    var lb = dom.toolbar.querySelector('[data-act="legend"]');
+    if (lb) {
+      lb.setAttribute('aria-expanded', p.legend ? 'true' : 'false');
+      lb.title = p.legend ? 'Hide the legend' : 'Show the legend: what the colors and marks mean, and the keys';
     }
     dom.finalize.hidden = locked;
     setHtml(dom.lockBanner, lockBannerHtml(course, results));
@@ -1646,6 +1749,67 @@
       '</span><button type="button" class="btn btn-sm" data-act="unlock">' + ui.icon('lock') + 'Unlock scores…</button>';
   }
 
+  function setAttr(el, name, value) {
+    if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+  }
+
+  /** Writes the whole table (new columns, row order, grouping or filter) and remembers its rows. */
+  function buildTable(table, sig, head, items, noRows, foot) {
+    var html = [head, '<tbody>'];
+    for (var i = 0; i < items.length; i++) {
+      var x = items[i];
+      html.push(x.team ? x.html : studentRowHtml(x.parts, x.s, x.r, x.aria));
+    }
+    html.push(noRows, '</tbody><tfoot>', foot, '</tfoot>');
+    table.innerHTML = html.join('');
+    var trs = table.tBodies[0].rows, recs = [];
+    rowEls = [];
+    for (var k = 0; k < items.length; k++) {
+      var it = items[k];
+      if (it.team) {
+        recs.push({ team: true, tr: trs[k], html: it.html });
+      } else {
+        recs.push({ sid: it.sid, tr: trs[k], parts: it.parts });
+        rowEls[it.r] = trs[k];
+      }
+    }
+    built = { table: table, sig: sig, items: recs, foot: foot };
+    painted = { range: [], active: null, head: null, row: null };
+  }
+
+  /** Same structure as the last build: updates only the cells, team rows and footer whose markup changed,
+   * in place. The cells keep their elements, so focus, the selection and the ▾ button stay, and the
+   * browser lays out only what changed (a full rebuild made focus() lay out all 300 rows: E2E-7). */
+  function patchTable(table, items, foot) {
+    var recs = built.items;
+    for (var k = 0; k < items.length; k++) {
+      var x = items[k], rec = recs[k];
+      if (x.team) {
+        if (rec.html !== x.html) {
+          var tmp = document.createElement('tbody');
+          tmp.innerHTML = x.html;
+          var fresh = tmp.firstElementChild;
+          rec.tr.parentNode.replaceChild(fresh, rec.tr);
+          rec.tr = fresh;
+          rec.html = x.html;
+        }
+        continue;
+      }
+      var a = x.parts, b = rec.parts, tr = rec.tr;
+      if (a.cls !== b.cls) tr.className = a.cls + (tr.classList.contains('row-active') ? ' row-active' : '');
+      var cells = tr.cells;
+      for (var c = 0; c < a.cells.length; c++) {
+        var na = a.cells[c], ob = b.cells[c];
+        if (na.c !== ob.c || na.ro !== ob.ro || na.t !== ob.t || na.b !== ob.b) patchCell(cells[c], na, ob);
+      }
+      rec.parts = a;
+    }
+    if (built.foot !== foot && table.tFoot) {
+      table.tFoot.innerHTML = foot;
+      built.foot = foot;
+    }
+  }
+
   function renderTable() {
     if (!dom || !dom.table) return;
     var t0 = root.performance ? root.performance.now() : 0;
@@ -1689,48 +1853,55 @@
         prevRow = idx;
       });
     }
-    var parts = [headHtml(ctx), '<tbody>'];
+    // Every row as parts (strings only). The DOM is then patched cell by cell when the structure (the
+    // header markup and the rows in order) is the same as last time, else rebuilt (CODE-5, E2E-7).
+    var head = headHtml(ctx);
+    var items = [], keys = [];
     var ariaRow = 2;
     for (var i = 0; i < layout.items.length; i++) {
       var it = layout.items[i];
-      parts.push(it.type === 'team' ? teamRowHtml(ctx, it.team, ariaRow) : studentRowHtml(ctx, it.s, it.r, ariaRow));
+      if (it.type === 'team') {
+        items.push({ team: true, html: teamRowHtml(ctx, it.team, ariaRow) });
+        keys.push('#' + (it.team ? it.team.id : ''));
+      } else {
+        items.push({ sid: it.s.id, s: it.s, r: it.r, aria: ariaRow, parts: studentRowParts(ctx, it.s) });
+        keys.push(it.s.id);
+      }
       ariaRow++;
     }
+    var noRows = '';
     if (!layout.students.length) {
-      parts.push('<tr class="no-rows"><td colspan="' + layout.cols.length + '"><div class="no-rows-msg">' +
+      noRows = '<tr class="no-rows"><td colspan="' + layout.cols.length + '"><div class="no-rows-msg">' +
         (searchText.trim() ? 'No students match “' + esc(searchText.trim()) + '”.' : 'No students to show. Withdrawn students are hidden.') +
-        '</div></td></tr>');
+        '</div></td></tr>';
       ariaRow++;
     }
-    parts.push('</tbody>', footHtml(ctx, ariaRow));
+    var foot = footRowHtml(ctx, ariaRow);
     var table = dom.table;
-    table.innerHTML = parts.join('');
+    var sig = head + '\u0002' + keys.join('\n') + '\u0002' + noRows;
+    if (built && built.table === table && built.sig === sig && !editing) patchTable(table, items, foot);
+    else buildTable(table, sig, head, items, noRows, foot);
     var width = 0;
     layout.cols.forEach(function (c) { width += c.width; });
-    table.style.width = width + 'px';
-    table.setAttribute('aria-rowcount', String(ariaRow));
-    table.setAttribute('aria-colcount', String(layout.cols.length));
-    table.setAttribute('aria-label', 'Grades for ' + course.code);
+    if (table.style.width !== width + 'px') table.style.width = width + 'px';
+    setAttr(table, 'aria-rowcount', String(ariaRow));
+    setAttr(table, 'aria-colcount', String(layout.cols.length));
+    setAttr(table, 'aria-label', 'Grades for ' + course.code);
     table.classList.toggle('grouped', layout.prefs.grouped);
     table.classList.toggle('meeting', layout.prefs.meeting);
     // Meeting view: First Name is pinned right after No and Last Name, whose width fits the names.
-    if (layout.prefs.meeting) table.style.setProperty('--sc3-left', (layout.cols[0].width + layout.cols[1].width) + 'px');
-    else table.style.removeProperty('--sc3-left');
+    var sc3 = layout.prefs.meeting ? (layout.cols[0].width + layout.cols[1].width) + 'px' : '';
+    if (table.style.getPropertyValue('--sc3-left') !== sc3) {
+      if (sc3) table.style.setProperty('--sc3-left', sc3); else table.style.removeProperty('--sc3-left');
+    }
     table.classList.toggle('locked', ctx.locked);
     if (dom.resort && dom.resort.hidden !== !layout.stale) {
       dom.resort.hidden = !layout.stale;
       queueWrapTop();
     }
-    rowEls = [];
-    var trs = table.tBodies[0].rows;
-    for (var k = 0; k < trs.length; k++) {
-      var ri = trs[k].getAttribute('data-r');
-      if (ri !== null) rowEls[+ri] = trs[k];
-    }
-    painted = { range: [], active: null, head: null, row: null };
     paintSelection();
-    dom.count.textContent = layout.shown === layout.total ? plural(layout.total, 'student') :
-      'Showing ' + layout.shown + ' of ' + layout.total;
+    var count = layout.shown === layout.total ? plural(layout.total, 'student') : 'Showing ' + layout.shown + ' of ' + layout.total;
+    if (dom.count.textContent !== count) dom.count.textContent = count;
     dataDirty = false;
     tableDirty = false;
     if (hadFocus) focusActive();
@@ -1765,6 +1936,7 @@
       drag = null;
     }
     bindGlobal();
+    ensureLeaveHook();
     var course = ctx.course;
     if (!course) {
       el.innerHTML = '<div class="empty-state"><h2>No course</h2><p>Add a course from the course menu.</p></div>';
@@ -1779,6 +1951,7 @@
       editing = null;
       newRowSid = null;
       tabStartKey = null;
+      endHold = null;
     }
     var params = ctx.params && ctx.params !== lastParams ? ctx.params : null;
     if (params) lastParams = params;
@@ -1813,6 +1986,25 @@
     if (editing) { tableDirty = true; return; }
     if (!rebuilt && !dataDirty && !switchedCourse && !ctx.switched && layout) return;
     renderTable();
+  }
+
+  /** Leave hook (CONTRACT §2, E2E-4): the page is being hidden, reloaded or closed. A score or name being
+   * typed is saved as a click elsewhere would save it (an open drop-down list closes without a choice),
+   * before app.js flushes the store. The cell keeps the focus for when the user comes back. */
+  function commitOnLeave() {
+    if (!editing) return;
+    var had = document.activeElement === editing.input;
+    leaveEditor();
+    if (had && isActiveView() && !editing) focusActive();
+  }
+
+  /** app.js loads after this file: register the leave hook on the first render, once. */
+  function ensureLeaveHook() {
+    if (leaveHooked) return;
+    if (GT.app && typeof GT.app.registerLeaveHook === 'function') {
+      GT.app.registerLeaveHook(commitOnLeave);
+      leaveHooked = true;
+    }
   }
 
   function destroy() {
@@ -1879,6 +2071,8 @@
     if (editing || !layout) return;
     var p = posOf(sel.active);
     if (!p) return;
+    // F2, a double-click, Alt+Down or a menu item edits the held cell on purpose: the hold ends.
+    endHold = null;
     var col = layout.cols[p.c];
     if (!col.edit) return;
     var course = cur();
@@ -2083,6 +2277,11 @@
     var ed = editing;
     if (!ed) return;
     editing = null;
+    removeEditor(ed, refocus);
+  }
+
+  /** Takes a closed editor (editing already null) out of its cell. */
+  function removeEditor(ed, refocus) {
     if (ed.input.parentNode) ed.input.parentNode.removeChild(ed.input);
     if (ed.hint && ed.hint.parentNode) ed.hint.parentNode.removeChild(ed.hint);
     ed.td.classList.remove('is-editing', 'has-popup');
@@ -2135,6 +2334,13 @@
         ed.input.select();
         return false;
       }
+      if (move && !o.soft && !ed.band) {
+        // One cell: move on first, then write (see moveFirst).
+        moveFirst(ed, move, false);
+        applyDropValue(ed, m, null, o);
+        keepGridFocus(ed);
+        return true;
+      }
       closeEditor(!o.soft);
       applyDropValue(ed, m, move, o);
       return true;
@@ -2153,10 +2359,36 @@
       }
     }
     var wasNew = ed.sid === newRowSid;
+    if (move && !o.soft) {
+      moveFirst(ed, move, wasNew);
+      if (value !== ed.original) applyEdit(ed, value);
+      keepGridFocus(ed);
+      return true;
+    }
     closeEditor(!o.soft);
     if (value !== ed.original) applyEdit(ed, value);
     if (move) moveAfterCommit(ed, move, wasNew);
     return true;
+  }
+
+  /** A commit that moves on (Enter, Tab, an arrow): the next cell takes the focus while the table is still
+   * laid out, and only then does the editor leave its cell. Focusing after the removal made focus() lay
+   * out the whole table again on every committed edit (E2E-7: about 10 ms at 300 students). The rows
+   * do not move in between (the order is a snapshot; the table re-renders on the next frame). */
+  function moveFirst(ed, move, wasNew) {
+    editing = null; // the editor's focusout and change events are ignored from here on
+    moveAfterCommit(ed, move, wasNew);
+    removeEditor(ed, false);
+  }
+
+  /** After a commit that moved on: the cell moved to has the focus. When nothing took it (the row is gone)
+   * the grid keeps it; focus that went somewhere on purpose (a dialog) stays there. */
+  function keepGridFocus(ed) {
+    if (!dom || !dom.table) return;
+    var ae = document.activeElement;
+    if (ae && ae !== document.body) return;
+    if (posOf(sel.active)) focusActive();
+    else if (ed.td.isConnected) focusCell(ed.td);
   }
 
   /** Stores a value chosen (or typed) in a drop-down cell: for the one student, or for every student of
@@ -2215,9 +2447,14 @@
       var nR = layout.students.length;
       if (!p) return;
       tabStartKey = null;
-      if (!move || move === 'enter' || move === 'down') moveTo(Math.min(ed.band.r2 + 1, nR - 1), p.c, false);
-      else if (move === 'up') moveTo(Math.max(ed.band.r1 - 1, 0), p.c, false);
-      else moveAfterCommit(ed, move, false);
+      // A band that reaches the end of the list leaves the cursor in it: hold that cell (E2E-2).
+      if (!move || move === 'enter' || move === 'down') {
+        moveTo(Math.min(ed.band.r2 + 1, nR - 1), p.c, false);
+        if (ed.band.r2 + 1 > nR - 1) holdAtEdge('last');
+      } else if (move === 'up') {
+        moveTo(Math.max(ed.band.r1 - 1, 0), p.c, false);
+        if (ed.band.r1 - 1 < 0) holdAtEdge('first');
+      } else moveAfterCommit(ed, move, false);
     } else if (move) {
       moveAfterCommit(ed, move, false);
     }
@@ -2232,7 +2469,7 @@
     if (move === 'enter') {
       if (tabStartKey !== null && layout.colOfKey[tabStartKey] !== undefined) c = layout.colOfKey[tabStartKey];
       tabStartKey = null;
-      r = Math.min(r + 1, nR - 1);
+      r++;
     } else if (move === 'up') { r--; tabStartKey = null; }
     else if (move === 'down') { r++; tabStartKey = null; }
     else if (move === 'left') { c--; tabStartKey = null; }
@@ -2243,7 +2480,33 @@
       if (tabStartKey === null) tabStartKey = ed.key;
       r = t.r; c = t.c;
     }
+    var edge = (move === 'enter' || move === 'down') && r > nR - 1 ? 'last' : move === 'up' && r < 0 ? 'first' : null;
     moveTo(clamp(r, 0, nR - 1), clamp(c, 0, nC - 1), false);
+    if (edge) holdAtEdge(edge);
+  }
+
+  /** True when `ref` is the cell held at the end of the list. */
+  function heldAt(ref) {
+    return !!endHold && !!ref && endHold.sid === ref.sid && endHold.key === ref.key;
+  }
+
+  /** A value was committed with Enter or Down on the last row (Up on the first): the cursor cannot move
+   * on, so hold this cell. The next typed keys would otherwise replace the value just entered, silently
+   * (E2E-2; the Attendance grid does the same). */
+  function holdAtEdge(edge) {
+    if (!sel.active) return;
+    endHold = { sid: sel.active.sid, key: sel.active.key };
+    endHoldToastAt = 0;
+    ui.toast('That was the ' + edge + ' student in the list.', { type: 'info', timeout: 3500 });
+  }
+
+  /** A typed key (or Enter) on the held cell: not used. Says so (at most every few seconds while a quick
+   * typist keeps going) and how to go on. */
+  function endHoldKey() {
+    if (nowMs() - endHoldToastAt < 4000) return;
+    endHoldToastAt = nowMs();
+    ui.toast('End of the list: that key was not used, so the value just entered is not replaced by accident. ' +
+      'Move to a cell first (or press F2 to edit this one).', { type: 'warn', timeout: 6000 });
   }
 
   /** Writes a typed score following the K5 rules. Returns what was written. */
@@ -2764,6 +3027,7 @@
   function clearCells() {
     var rc = rectOf();
     if (!rc) return;
+    endHold = null;
     var course = cur();
     var locked = isFinalized(course);
     // No is cleared only when the selection stays inside the No column (a wider Delete is about scores).
@@ -2950,7 +3214,7 @@
       case 'raw': return detailText(rs.items[col.aid]);
       case 'weighted': return num(rs.items[col.aid] ? rs.items[col.aid].weighted : 0, dec);
       case 'total': return num(rs.total, dec);
-      case 'letter': return rs.letter || '';
+      case 'letter': return wd ? 'W' : rs.letter || '';
       case 'final': return storedFinal(s) || '';
       case 'rank': return wd || rs.rank === null ? '' : String(rs.rank);
       case 'pct': return wd || rs.percentile === null ? '' : num(rs.percentile, 0);
@@ -3051,6 +3315,7 @@
     if (!layout || !layout.students.length || !block || !block.length) return;
     var a = posOf(sel.active), rc = rectOf();
     if (!a || !rc) return;
+    endHold = null;
     var single = block.length === 1 && block[0].length === 1;
     var isRange = rc.r1 !== rc.r2 || rc.c1 !== rc.c2;
     var fill = single && isRange;
@@ -3160,6 +3425,22 @@
   function runBlock(job, keep) {
     var ops = job.ops, fill = job.fill;
     var sum = { cells: 0, overrides: 0, moved: 0, unteamed: 0, kept: 0, badNo: 0, newTeams: 0, propagated: 0 };
+    // Junk in pasted scores (E2E-5) is stored as typed (red: not a number, counted as 0; yellow: outside
+    // 0 to max), like a typed value: the message says how many, so a green "Pasted 60 cells." never
+    // hides them. Drop-down columns only ever take list values (checked in applyBlock).
+    var junk = { nan: 0, range: 0, maxes: [] };
+    var course0 = cur();
+    ops.forEach(function (op) {
+      if (op.kind !== 'raw') return;
+      var asmt = model.findAssessment(course0, op.aid);
+      if (!asmt) return;
+      var ps = util.parseScoreInput(op.text, asmt.maxScore);
+      if (ps.kind === 'invalid') junk.nan++;
+      else if (ps.kind === 'number' && (ps.value < 0 || ps.value > asmt.maxScore)) {
+        junk.range++;
+        if (junk.maxes.indexOf(asmt.maxScore) === -1) junk.maxes.push(asmt.maxScore);
+      }
+    });
     if (ops.length) {
       var label = (fill ? 'Fill ' : 'Paste ') + plural(ops.length, 'cell');
       focusUntil = nowMs() + 1500;
@@ -3250,6 +3531,13 @@
     var msg = [], jb = job.bad || { letters: 0, list: 0, listRanges: [], locked: 0 };
     if (ops.length) msg.push(job.doneMsg || ((fill ? 'Filled ' : 'Pasted ') + plural(sum.cells, 'cell') + '.'));
     else msg.push('Nothing was pasted.');
+    if (ops.length && junk.nan) {
+      msg.push(plural(junk.nan, 'value') + (junk.nan === 1 ? ' is not a number' : ' are not numbers') + ' (shown in red, counted as 0).');
+    }
+    if (ops.length && junk.range) {
+      msg.push(plural(junk.range, 'value') + (junk.range === 1 ? ' is' : ' are') + ' outside ' +
+        (junk.maxes.length === 1 ? '0–' + num(junk.maxes[0], 4) : '0 to the column\'s max') + ' (shown in yellow).');
+    }
     if (jb.letters) {
       msg.push(plural(jb.letters, 'value') + ' in Final letter ' + (jb.letters === 1 ? 'was not a letter' : 'were not letters') +
         ' of this course (' + scaleLetters(cur()).join(', ') + ') and ' + (jb.letters === 1 ? 'was' : 'were') + ' skipped.');
@@ -3279,7 +3567,8 @@
     } else if (keep === false && sum.moved) {
       msg.push('Students who changed team now use their new team\'s scores.');
     }
-    var warn = job.droppedRows || job.droppedCols || sum.badNo || !ops.length || jb.letters || jb.list || jb.locked;
+    var warn = job.droppedRows || job.droppedCols || sum.badNo || !ops.length || jb.letters || jb.list || jb.locked ||
+      (ops.length && (junk.nan || junk.range));
     (job.doneMsg ? gridToast : ui.toast)(msg.join(' '), { type: warn ? 'warn' : 'success', timeout: warn || sum.overrides || sum.kept ? 9000 : 4000 });
   }
 
@@ -3778,6 +4067,7 @@
 
   function resort() {
     forceResort = true;
+    endHold = null;
     revealActive = true;
     focusUntil = nowMs() + 1500;
     renderTable();
@@ -3913,6 +4203,7 @@
     dom.legend.classList.toggle('is-open', open);
     b.setAttribute('aria-expanded', open ? 'true' : 'false');
     queueWrapTop();
+    setPrefs({ legend: open });
   }
 
   function focusSearch() {
@@ -3953,6 +4244,7 @@
     }
     if (!hit) return;
     tabExit = false;
+    endHold = null;
     if (e.target.closest('button')) return;
     if (e.button === 2) {
       if (!inRect(hit.r, hit.c)) {
@@ -4212,6 +4504,8 @@
     }
     if (k === 'Enter' && !mod && !e.altKey) {
       e.preventDefault();
+      // The cell held at the end of the list: Enter is part of the typing that ran past the last row.
+      if (heldAt(sel.active)) { endHoldKey(); return; }
       if (editableAt(a)) { startEdit('edit'); return; }
       // A locked score (finalized) says why it does not open, like F2 and typing; Enter still moves on.
       if (lockedCol(cur(), layout.cols[a.c])) notifyLocked();
@@ -4278,6 +4572,7 @@
       if (k === '?') return; // app shortcut list
       e.preventDefault();
       e.stopPropagation();
+      if (heldAt(sel.active)) { endHoldKey(); return; }
       if (!editableAt(a)) {
         if (lockedCol(cur(), layout.cols[a.c])) notifyLocked(); else notifyReadOnly();
         return;

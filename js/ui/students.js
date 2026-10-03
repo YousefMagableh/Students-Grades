@@ -286,8 +286,13 @@
   }
 
   /** Toast "Undo" button. Call it right after the transact: it undoes that change only while it is still
-   * the latest undo step of its course, never a newer change that has the same label. */
+   * the latest undo step of its course, never a newer change that has the same label. The shared helper
+   * (GT.ui.undoAction in widgets.js) does this; the local copy below is the fallback without it. */
   function undoAction(courseId, label) {
+    if (typeof ui.undoAction === 'function' && ui.undoAction !== undoAction) return ui.undoAction(courseId, label);
+    return localUndoAction(courseId, label);
+  }
+  function localUndoAction(courseId, label) {
     var mark = undoMark(courseId);
     return {
       label: 'Undo',
@@ -449,8 +454,8 @@
         'No, name and team are locked; the notes stay editable. Unlock the scores (Grades tab or Settings › Grading status) to change them.</span></div>' : '') +
       '<div class="sf-grid">' +
       fieldHtml('sf-no', 'No', '<input id="sf-no" type="text" inputmode="numeric" autocomplete="off" value="' + esc(no === null || no === undefined ? '' : no) + '"' + ro + '>', 'sf-no-field') +
-      fieldHtml('sf-last', 'Last name', '<input id="sf-last" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.lastName : '') + '"' + ro + '>') +
-      fieldHtml('sf-first', 'First name', '<input id="sf-first" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.firstName : '') + '"' + ro + '>') +
+      fieldHtml('sf-last', 'Last Name', '<input id="sf-last" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.lastName : '') + '"' + ro + '>') +
+      fieldHtml('sf-first', 'First Name', '<input id="sf-first" type="text" class="pii" autocomplete="off" spellcheck="false" value="' + esc(s ? s.firstName : '') + '"' + ro + '>') +
       '</div>' +
       fieldHtml('sf-team', 'Team', '<select id="sf-team"' + (locked ? ' disabled title="' + esc(LOCKED_MSG) + '"' : '') + '>' + options + '</select>' +
         (s && !locked && teamGraded(course).length ? '<div class="help">Changing the team asks whether to keep this student’s current team-graded scores.</div>' : '')) +
@@ -882,10 +887,6 @@
   var TS_BROWSE_KEYS = { ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1, Home: 1, End: 1, PageUp: 1, PageDown: 1 };
   var tsKbdSel = null; // the team-score drop-down whose last value change came from keyboard browsing
 
-  function isTeamControl(t) {
-    return !!t && !!t.classList && (t.classList.contains('ts-input') || t.classList.contains('ts-select'));
-  }
-
   function isTeamSelect(t) {
     return !!t && t.tagName === 'SELECT' && !!t.classList && t.classList.contains('ts-select');
   }
@@ -1060,11 +1061,17 @@
     return list;
   }
 
+  /** The page subtitle of every view (UX-16): "SE 4351 · Requirements Engineering · Fall 2026". */
+  function courseLine(course) {
+    return [course.code, course.title, course.term].map(function (x) { return x === null || x === undefined ? '' : String(x).trim(); })
+      .filter(Boolean).join(' · ') || 'Course';
+  }
+
   function headerHtml(course) {
     var n = course.students.length;
     var wd = course.students.filter(isWithdrawn).length;
-    return '<div class="page-header"><div><h1>Students &amp; Teams</h1><div class="sub">' + esc(model.courseLabel(course)) + ' · ' +
-      plural(n - wd, 'active student') + ' · ' + wd + ' withdrawn · ' + plural(course.teams.length, 'team') + '</div></div></div>';
+    return '<div class="page-header"><div><h1>Students &amp; Teams</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
+      '<div class="sub">' + plural(n - wd, 'active student') + ' · ' + wd + ' withdrawn · ' + plural(course.teams.length, 'team') + '</div></div></div>';
   }
 
   function sortTh(key, label, p, cls) {
@@ -1168,7 +1175,7 @@
     }
 
     h += '<div class="table-wrap st-table-wrap"><table class="table st-table"><thead><tr>' +
-      sortTh('no', 'No', p, 'num') + sortTh('name', 'Last name', p) + '<th scope="col">First name</th>' +
+      sortTh('no', 'No', p, 'num') + sortTh('name', 'Last Name', p) + '<th scope="col">First Name</th>' +
       sortTh('team', 'Team', p) + sortTh('status', 'Status', p) +
       '<th scope="col" class="st-final-h" title="Assigned in the Grades tab or in the student details">Final letter</th>' +
       '<th scope="col" class="st-late-h" title="Weeks late and the penalty of each late score. Set in the Grades tab: right-click a score → Late work…, or Ctrl+L">Late work</th>' +
@@ -1353,7 +1360,13 @@
       'Each change is logged in History for every member it reaches.</p></div></section>';
   }
 
+  var leaveHookBound = false;
   function render(el, ctx) {
+    if (!leaveHookBound && GT.app && typeof GT.app.registerLeaveHook === 'function') {
+      // The page is closed, reloaded or hidden while a team score is typed: save it, like leaving the field (E2E-4).
+      GT.app.registerLeaveHook(commitPendingTeamScores);
+      leaveHookBound = true;
+    }
     if (el !== boundEl) { bindView(el); boundEl = el; }
     var course = ctx && ctx.course ? ctx.course : GT.store.course();
     var focus = captureFocus(el);
@@ -1545,19 +1558,22 @@
       if (ui.closeMenu) ui.closeMenu();
       // Leaving the view (e.g. Alt+2) removes it before a focusout or change can save: save a team score
       // that was typed, or browsed to in a drop-down, now, like leaving the field does.
-      if (boundEl && document.body.contains(boundEl)) {
-        ui.$$('.ts-input, .ts-select[data-ts-pending]', boundEl).forEach(function (c) {
-          if (c.value === savedTeamValue(c)) return;
-          try { commitTeamScore(c); } catch (e) { if (root.console) console.error(e); }
-        });
-      }
+      commitPendingTeamScores();
       tsKbdSel = null;
     }
   };
 
+  function commitPendingTeamScores() {
+    if (!boundEl || !document.body.contains(boundEl)) return;
+    ui.$$('.ts-input, .ts-select[data-ts-pending]', boundEl).forEach(function (c) {
+      if (c.value === savedTeamValue(c)) return;
+      try { commitTeamScore(c); } catch (e) { if (root.console) console.error(e); }
+    });
+  }
+
   // ------------------------------------------------------------------ roster paste (S3)
 
-  var ROLE_LABELS = { no: 'No', last: 'Last name', first: 'First name', full: 'Full name (Last, First or First Last)', team: 'Team', ignore: 'Ignore' };
+  var ROLE_LABELS = { no: 'No', last: 'Last Name', first: 'First Name', full: 'Full Name (Last, First or First Last)', team: 'Team', ignore: 'Ignore' };
   var ROLE_ORDER = ['no', 'last', 'first', 'full', 'team', 'ignore'];
   var HEADER_RE = /(^| )(last|first|name|names|no|nr|number|surname|lastname|firstname|fullname|givenname|studentname|forename)( |$)|^#$/;
 
@@ -1743,7 +1759,7 @@
     return '<div class="rp-map-head"><span class="section-label">Columns</span>' +
       '<label class="check rp-header"><input type="checkbox" id="rp-header" data-fk="header"' + (state.headerOn ? ' checked' : '') + '> First row is a header (skipped)</label></div>' +
       '<div class="rp-cols">' + cols + '</div>' +
-      (hasName ? '' : '<div class="callout callout-warn">Map at least one column to Last name, First name or Full name.</div>');
+      (hasName ? '' : '<div class="callout callout-warn">Map at least one column to Last Name, First Name or Full Name.</div>');
   }
 
   function previewHtml(plan, hasText) {
@@ -1773,7 +1789,7 @@
     }).join('');
     return '<div class="rp-summary" role="status">' + chips + '</div>' +
       '<div class="table-wrap rp-table-wrap"><table class="table rp-table"><thead><tr><th scope="col" class="num">Row</th><th scope="col" class="num">No</th>' +
-      '<th scope="col">Last name</th><th scope="col">First name</th><th scope="col">Team</th><th scope="col">Status</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<th scope="col">Last Name</th><th scope="col">First Name</th><th scope="col">Team</th><th scope="col">Status</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
       (plan.items.length > shown.length ? '<p class="muted small">Showing the first ' + shown.length + ' of ' + plan.items.length + ' rows.</p>' : '');
   }
 
@@ -1787,8 +1803,8 @@
     var state = { rows: [], ncols: 0, mapping: ['full'], mappingAuto: true, headerIdx: -1, headerAuto: true, headerOn: false };
     var body = ui.el('<div class="rp">' +
       '<div class="field"><label for="rp-text">Paste names copied from Excel (one student per row)</label>' +
-      '<textarea id="rp-text" class="pii rp-text" rows="8" spellcheck="false" autocomplete="off" placeholder="Student 01, Alpha&#10;Student 02, Bravo&#10;… or copy the No, Last name, First name and Team columns from Excel"></textarea>' +
-      '<div class="help">One column (“Last, First” or “First Last”), two columns (Last name, First name), or No / Last / First / Team. ' +
+      '<textarea id="rp-text" class="pii rp-text" rows="8" spellcheck="false" autocomplete="off" placeholder="Student 01, Alpha&#10;Student 02, Bravo&#10;… or copy the No, Last Name, First Name and Team columns from Excel"></textarea>' +
+      '<div class="help">One column (“Last, First” or “First Last”), two columns (Last Name, First Name), or No / Last / First / Team. ' +
       'A header row is detected and skipped. Names already in the course are skipped; new team names are created.</div></div>' +
       '<div class="rp-detect muted small" aria-live="polite"></div>' +
       '<div class="rp-map"></div>' +

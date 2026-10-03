@@ -160,6 +160,46 @@
     return dismiss;
   };
 
+  // ------------------------------------------------------------------ undo from a toast
+
+  /** Identifies the current latest undo step of the active course (null if courseId is not active).
+   * Labels repeat ("Edit team score", "Withdraw student"), so the mark also holds the step's unique id
+   * (GT.store.undoStepId), the course's history length and its last entry id: every later change, undo or
+   * redo pushes a new step and appends (or replaces) history entries, so the mark changes. */
+  ui.undoMark = function (courseId) {
+    var store = GT.store;
+    var c = store && store.course ? store.course() : null;
+    if (!c || c.id !== courseId) return null;
+    var hist = Array.isArray(c.history) ? c.history : [];
+    var last = hist.length ? hist[hist.length - 1] : null;
+    return JSON.stringify([
+      store.undoLabel(),
+      typeof store.undoStepId === 'function' ? store.undoStepId() : null,
+      hist.length,
+      last && last.id ? last.id : null
+    ]);
+  };
+
+  /** The "Undo" action for a toast ({ label: 'Undo', fn }). Call it right after the GT.store.transact():
+   * it undoes that change only while it is still the latest undo step of its course (the course is still
+   * active and nothing came after it, not even a newer change with the same label); otherwise it explains
+   * why nothing was undone. */
+  ui.undoAction = function (courseId, label) {
+    var mark = ui.undoMark(courseId);
+    return {
+      label: 'Undo',
+      fn: function () {
+        var store = GT.store;
+        if (store.readOnly && store.readOnly()) {
+          ui.toast('Not undone: Grade Tracker was changed in another tab, so this tab is read-only. Reload to see the latest data.', { type: 'warn' });
+          return;
+        }
+        if (mark && ui.undoMark(courseId) === mark && (!label || store.undoLabel() === label)) store.undo();
+        else ui.toast('Not undone: it was already undone, or newer changes came after it. Use Undo (Ctrl+Z) step by step.', { type: 'warn' });
+      }
+    };
+  };
+
   // ------------------------------------------------------------------ dialogs (native <dialog>)
 
   var dialog = ui.dialog = {};
@@ -360,24 +400,30 @@
   ui.closeMenu = closeMenu;
 
   /** Opens a menu next to an anchor element, or at { x, y } (context menus).
-   *  items: [{ label, icon, onSelect, danger, disabled, hint } | { separator: true } | { heading: 'Text' }]. */
+   *  items: [{ label, icon, onSelect, danger, disabled, hint, checked } | { separator: true } | { heading: 'Text' }].
+   *  An item with `checked` (true or false) is one choice of a group (role "menuitemradio", aria-checked,
+   *  a check icon when chosen), e.g. the theme menu. opts: { alignRight, returnFocus, label (aria-label) }. */
   ui.menu = function (anchor, items, opts) {
     closeMenu();
     var o = opts || {};
     var el = document.createElement('div');
     el.className = 'menu';
     el.setAttribute('role', 'menu');
+    if (o.label) el.setAttribute('aria-label', o.label);
     items.forEach(function (it) {
       if (!it) return;
       if (it.separator) { el.appendChild(ui.el('<div class="menu-sep" role="separator"></div>')); return; }
       if (it.heading) { var h = ui.el('<div class="menu-label"></div>'); h.textContent = it.heading; el.appendChild(h); return; }
+      var radio = typeof it.checked === 'boolean';
       var b = document.createElement('button');
       b.type = 'button';
-      b.setAttribute('role', 'menuitem');
+      b.setAttribute('role', radio ? 'menuitemradio' : 'menuitem');
+      if (radio) b.setAttribute('aria-checked', it.checked ? 'true' : 'false');
       b.tabIndex = -1;
       if (it.danger) b.className = 'danger';
       if (it.disabled) b.setAttribute('aria-disabled', 'true');
-      b.innerHTML = (it.icon ? ui.icon(it.icon) : '') + '<span></span>' + (it.hint ? '<span class="menu-hint"></span>' : '');
+      b.innerHTML = (it.icon ? ui.icon(it.icon) : '') + '<span></span>' + (it.hint ? '<span class="menu-hint"></span>' : '') +
+        (radio ? '<span class="menu-check">' + ui.icon('check') + '</span>' : '');
       b.querySelector('span').textContent = it.label;
       if (it.hint) b.querySelector('.menu-hint').textContent = it.hint;
       b.addEventListener('click', function () {
@@ -404,7 +450,7 @@
     el.style.left = x + 'px';
     el.style.top = y + 'px';
 
-    var entries = ui.$$('[role="menuitem"]', el);
+    var entries = ui.$$('[role="menuitem"], [role="menuitemradio"]', el);
     el.addEventListener('keydown', function (e) {
       var i = entries.indexOf(document.activeElement);
       if (e.key === 'ArrowDown') { e.preventDefault(); entries[(i + 1) % entries.length].focus(); }
@@ -421,11 +467,16 @@
     };
     openMenu = state;
     setTimeout(function () {
+      // Closed already (Escape right after opening): adding the listeners now would leave them behind,
+      // and they would close the NEXT menu on its first click.
+      if (openMenu !== state) return;
       document.addEventListener('mousedown', state.onDoc, true);
       window.addEventListener('resize', state.onClose);
       window.addEventListener('scroll', state.onClose, true);
     }, 0);
-    var first = entries.filter(function (b) { return b.getAttribute('aria-disabled') !== 'true'; })[0] || entries[0];
+    // Focus the chosen item of a radio menu, else the first enabled item.
+    var first = entries.filter(function (b) { return b.getAttribute('aria-checked') === 'true'; })[0] ||
+      entries.filter(function (b) { return b.getAttribute('aria-disabled') !== 'true'; })[0] || entries[0];
     if (first) first.focus();
     return closeMenu;
   };

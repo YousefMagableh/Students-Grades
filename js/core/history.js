@@ -5,6 +5,8 @@
  *                  oldValue, newValue, note }, plus userNote / userNoteAt once the TA annotates it.
  * - The "Final letters: n changed" summary also carries details: [{ studentId, studentName, no,
  *   oldValue, newValue }], every student it changed (read them with entryDetails / involvesStudent).
+ *   So does a roll call folded into one "<n> marks" entry by GT.store.transact (opts.mergeKey): its
+ *   items also name their field ("Attendance 2026-10-06"), and the entry keeps its mergeKey.
  * - Values are display strings ('' = empty). Scores show as entered ("88.5"), invalid text as
  *   '"abc" (not a number)', booleans as 'yes' / 'no'.
  * - Names are snapshots ('Last, First'), so the log stays readable after renames and deletions.
@@ -1008,33 +1010,42 @@
   /** Field shown for one student's change inside a summary entry, by the summary's fieldKey. */
   var DETAIL_FIELDS = { finalLetters: 'Final letter' };
 
-  /** The per-student changes a summary entry keeps in `details` (today: "Final letters: n changed"),
-   * as [{ studentId, studentName, no (number|null), oldValue, newValue }] in the stored order (name
-   * order). Read defensively (the log comes from saved files): malformed items are skipped, and any
-   * entry without details gives []. */
+  /** The per-student changes a summary entry keeps in `details` ("Final letters: n changed", and a
+   * roll call folded into one entry by GT.store.transact's mergeKey), as [{ studentId, studentName,
+   * no (number|null), oldValue, newValue }] in the stored order (name order for final letters, the order
+   * of the marks for a roll call). An item that names its own field (a roll call's "Attendance
+   * 2026-10-06") also has `field`. Read defensively (the log comes from saved files): malformed items
+   * are skipped, and any entry without details gives []. */
   function entryDetails(e) {
     if (!isObj(e) || !Array.isArray(e.details)) return [];
     var out = [];
     e.details.forEach(function (d) {
       if (!isObj(d) || typeof d.studentId !== 'string' || d.studentId === '') return;
-      out.push({
+      var item = {
         studentId: d.studentId,
         studentName: str(d.studentName),
         no: typeof d.no === 'number' && isFinite(d.no) ? d.no : null,
         oldValue: str(d.oldValue),
         newValue: str(d.newValue)
-      });
+      };
+      if (typeof d.field === 'string' && d.field !== '') item.field = d.field;
+      out.push(item);
     });
     return out;
   }
 
   /** One student's change inside a summary entry ({ studentId, studentName, no, oldValue, newValue }),
-   * or null when the entry has no details for that student. */
+   * or null when the entry has no details for that student. A student listed more than once (marked
+   * again in the same roll call) gives one change: the first old value and the last new value. */
   function detailFor(e, studentId) {
     if (typeof studentId !== 'string' || studentId === '') return null;
-    var list = entryDetails(e);
-    for (var i = 0; i < list.length; i++) if (list[i].studentId === studentId) return list[i];
-    return null;
+    var list = entryDetails(e).filter(function (d) { return d.studentId === studentId; });
+    if (!list.length) return null;
+    if (list.length === 1) return list[0];
+    var out = {};
+    Object.keys(list[0]).forEach(function (k) { out[k] = list[0][k]; });
+    out.newValue = list[list.length - 1].newValue;
+    return out;
   }
 
   /** True when the entry concerns the student: its own studentId, or one of its summary details (a
@@ -1071,7 +1082,7 @@
       var part = 'Part of "' + str(e.field) + (str(e.newValue) ? ': ' + str(e.newValue) : '') + '"';
       details.forEach(function (d) {
         if (only && d.studentId !== only) return;
-        rows.push([str(e.ts), str(e.source), str(e.kind), d.studentName, '', field, d.oldValue, d.newValue, part, '', '']);
+        rows.push([str(e.ts), str(e.source), str(e.kind), d.studentName, '', d.field || field, d.oldValue, d.newValue, part, '', '']);
       });
     });
     return rows;

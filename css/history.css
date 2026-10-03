@@ -80,6 +80,7 @@
 .hist-dl-who { overflow-wrap: anywhere; }
 .hist-dl-name { font-weight: 600; }
 .hist-dl-no { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hist-dl-field { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
 .hist-dl-change { white-space: nowrap; }
 .hist-dl-change .hist-arrow { margin: 0 4px; }
 /* Filtered to one student, a band entry shows only that student's part of it. */

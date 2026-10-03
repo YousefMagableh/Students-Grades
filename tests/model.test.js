@@ -2109,3 +2109,27 @@ describe('parseChoiceInput: strict drop-down entry (DECISIONS 8)', () => {
     assert.deepEqual(model.parseChoiceInput(t1, ''), { kind: 'empty' });
   });
 });
+
+describe('ui.activeView from a saved file or backup (review CODE-8)', () => {
+  function withView(v) {
+    const st = model.createDefaultState();
+    st.ui.activeView = v;
+    return model.normalizeState(JSON.parse(JSON.stringify(st))).ui.activeView;
+  }
+
+  test('a tab id (lowercase letters) is kept', () => {
+    ['grades', 'students', 'attendance', 'stats', 'settings', 'history', 'exchange', 'summary', 'someday'].forEach((v) => {
+      assert.equal(withView(v), v);
+    });
+  });
+
+  test('Object.prototype names and anything that is not lowercase letters fall back to grades', () => {
+    ['constructor', 'toString', 'valueOf', '__proto__', 'hasOwnProperty', 'Grades', 'grades ', '', 'stats-2', 'a.b'].forEach((v) => {
+      assert.equal(withView(v), 'grades', JSON.stringify(v));
+    });
+    [null, 5, true, {}, ['grades']].forEach((v) => assert.equal(withView(v), 'grades'));
+    const raw = model.wrapBackup(model.createDefaultState(), '2026-10-01T00:00:00.000Z');
+    raw.state.ui.activeView = 'constructor';
+    assert.equal(model.readBackup(JSON.parse(JSON.stringify(raw))).state.ui.activeView, 'grades');
+  });
+});

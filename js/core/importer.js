@@ -101,6 +101,10 @@
   // Notes of the static Letter Grade cells of a Grade Tracker export (exporter.js, DESIGN 8.2).
   var MANUAL_LETTER_NOTE = 'Final letter assigned by the instructor';
   var SUGGESTED_LETTER_NOTE = 'Suggestion from the cutoffs: ';
+  // A withdrawn student without a final letter is exported with "W" and this note (exporter.js): "no
+  // letter", never a final letter (unless another letter was typed over it after the export).
+  var WITHDRAWN_LETTER = 'W';
+  var WITHDRAWN_LETTER_NOTE = 'Withdrawn: no letter grade';
 
   function noteText(n) {
     if (typeof n === 'string') return n;
@@ -147,8 +151,9 @@
    * finalLetterCells are the cells whose note starts with "Final letter assigned by the instructor".
    * editedLetterCells are the letters changed after a Grade Tracker export (meaningful for such a file
    * only; readWorkbook): a cell whose text no longer matches its "Suggestion from the cutoffs: <letter>"
-   * note, and a plain value below row 1 in a column of letter formulas or of such notes (typed or pasted
-   * over the formula or the noted cell).
+   * note (or no longer says "W" under its "Withdrawn: no letter grade" note), and a plain value below
+   * row 1 in a column of letter formulas or of such notes (typed or pasted over the formula or the
+   * noted cell).
    * A merged range gives its value to its first column only: the other cells of a horizontal span
    * (a title merged over A1:P1, a label over several score columns) read as '', as they look in
    * Excel; the cells below the first one of a vertical span keep the value (a team score merged
@@ -192,6 +197,11 @@
           continue;
         }
         if (manual) continue;
+        if (note.indexOf(WITHDRAWN_LETTER_NOTE) === 0) {
+          // Not proof that the column's other cells are suggestions (they may have been pasted as values).
+          if (text.trim() !== '' && letterKey(text) !== WITHDRAWN_LETTER) out.editedLetterCells.push([r - 1, c - 1]);
+          continue;
+        }
         var noted = suggestedLetterOfNote(note);
         if (noted !== null) {
           letterInfo[c - 1] = true;
@@ -680,7 +690,7 @@
    *   oldValue, newValue, blocked?, reason?, notOnList?, outOfRange?, invalid?, override?,
    *   emptiedByMove? }], issues: [{ field, value, message }] }], counts: { update, new, skip, changes,
    *   overrides, invalid, blocked, notOnList, lettersSkipped, lettersAsSuggestion, lettersFromOtherColumn,
-   *   lettersNotImported, duplicateNos, teamsCreated, scoresEmptied, kept, unchanged, propagated,
+   *   lettersNotImported, lettersWithdrawn, duplicateNos, teamsCreated, scoresEmptied, kept, unchanged, propagated,
    *   totalsDiffer }, propagated: [{ studentId, name,
    *   changes }], notes: [string], errors: [string], options, finalized }. */
   function plan(course, rows, headerIndex, mapping, options) {
@@ -784,8 +794,8 @@
     if (o.matchBy === 'name' && !nameMapped) errors.push('Map the name columns (Last name and First name, or Full name) to match students by name.');
 
     var counts = { update: 0, 'new': 0, skip: 0, changes: 0, overrides: 0, invalid: 0, blocked: 0, notOnList: 0, lettersSkipped: 0,
-      lettersAsSuggestion: 0, lettersFromOtherColumn: 0, lettersNotImported: 0, duplicateNos: 0, teamsCreated: 0, scoresEmptied: 0, kept: 0,
-      unchanged: 0, propagated: 0, totalsDiffer: 0 };
+      lettersAsSuggestion: 0, lettersFromOtherColumn: 0, lettersNotImported: 0, lettersWithdrawn: 0, duplicateNos: 0, teamsCreated: 0,
+      scoresEmptied: 0, kept: 0, unchanged: 0, propagated: 0, totalsDiffer: 0 };
     var items = [];
 
     // Indexes of the course's students.
@@ -986,6 +996,14 @@
       });
     }
 
+    /** Whether a row is a withdrawn student's: its Status cell says so or, without a Status column, the
+     * matched student is withdrawn. */
+    function rowWithdrawn(row, student) {
+      var st = cell(row, 'status');
+      if (st !== undefined) return parseStatus(st).value === 'withdrawn';
+      return !!student && student.status === 'withdrawn';
+    }
+
     /** What to write for one row (after the overwrite / empty-cell rules). `student` is null for a new one. */
     function rowOps(item, row, n, student, noText, noVal) {
       var isNew = !student;
@@ -1061,6 +1079,12 @@
       var curL = isNew ? null : model.finalLetterOf(student);
       if (lt !== undefined) {
         var ltText = lt.trim();
+        // "W" in a Grade Tracker "Letter Grade" column, on a withdrawn student's row: the export's mark for
+        // "withdrawn, no letter grade" (not typed over after the export), so it reads as an empty cell.
+        if (letterMixed && !notedLetter[item.rowIndex] && letterKey(ltText) === WITHDRAWN_LETTER && rowWithdrawn(row, student)) {
+          ltText = '';
+          counts.lettersWithdrawn++;
+        }
         var letter = ltText === '' ? null : model.matchLetter(course, ltText);
         if (ltText !== '' && letter === null) {
           issue(item, 'Final letter', ltText, '"' + ltText.slice(0, 20) + '" is not a letter of this course\'s scale (' + scaleList(course) + '); skipped');
@@ -1329,6 +1353,11 @@
         : 'Column ' + colName(cols.finalLetter) + ' looks like a file from Grade Tracker: it holds the final letters and, for students without one, ' +
           'the suggestion from the cutoffs. ' + (nl === 1 ? '1 letter equals' : nl + ' letters equal') +
           ' the suggestion, so ' + (nl === 1 ? 'it is' : 'they are') + ' not stored as final letters (the instructor assigns those in the Grades tab).');
+    }
+    if (counts.lettersWithdrawn) {
+      var nw = counts.lettersWithdrawn;
+      notes.push('Column ' + colName(cols.finalLetter) + ': "W" marks ' + (nw === 1 ? 'a withdrawn student' : nw + ' withdrawn students') +
+        ' without a letter grade, so ' + (nw === 1 ? 'it is' : 'they are') + ' read as empty (no final letter).');
     }
     Object.keys(otherTally).map(Number).sort(function (a, b) { return a - b; }).forEach(function (ci) {
       var t = otherTally[ci];

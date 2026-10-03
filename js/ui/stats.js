@@ -55,11 +55,11 @@
   var lastCourseId = null;
   var lastParams = null;
   var measure = 'total';     // 'total' or an assessment id (panel measure selector)
-  var tables = {};           // chart id -> true while "Show as table" is on
+  var tables = Object.create(null);    // chart id -> true while "Show as table" is on
   var wi = { sid: null, aid: null, letter: null, aidAuto: true, letterAuto: true }; // what-if choices
   var sb = null;             // planner sandbox: { courseId, base, baseKey, rows, text, err, note }
   var withinText = null;     // borderline distance typed but not valid yet
-  var scrollPos = {};        // data-scroll key -> [scrollLeft, scrollTop] of a table box
+  var scrollPos = Object.create(null); // data-scroll key -> [scrollLeft, scrollTop] of a table box
   var lastRenderMs = 0;
   var globalBound = false;
   var resizeTimer = null;
@@ -99,6 +99,38 @@
   }
   function cssEsc(s) {
     return root.CSS && root.CSS.escape ? root.CSS.escape(s) : String(s).replace(/["\\\]\[]/g, '\\$&');
+  }
+
+  // ------------------------------------------------------------------ toast "Undo" (CONTRACT section 1)
+
+  /** The latest undo step of the active course (null when courseId is not the active course). Labels
+   * repeat, so the mark also holds the course's history length and last entry id. Local copy of
+   * GT.ui.undoMark, used until js/ui/widgets.js provides it. */
+  function localUndoMark(courseId) {
+    var c = GT.store.course();
+    if (!c || c.id !== courseId) return null;
+    var hist = Array.isArray(c.history) ? c.history : [];
+    var last = hist.length ? hist[hist.length - 1] : null;
+    return JSON.stringify([
+      GT.store.undoLabel(),
+      typeof GT.store.undoStepId === 'function' ? GT.store.undoStepId() : null,
+      hist.length,
+      last && last.id ? last.id : null
+    ]);
+  }
+  /** A toast's "Undo" action for the step just made by GT.store.transact (call it right after the
+   * transact): it undoes that step only while it is still the latest undo step of its course, never a
+   * newer change or another course's step. GT.ui.undoAction once the shell has it, else the same rule here. */
+  function undoAction(courseId, label) {
+    if (typeof ui.undoAction === 'function') return ui.undoAction(courseId, label);
+    var mark = localUndoMark(courseId);
+    return {
+      label: 'Undo',
+      fn: function () {
+        if (mark && localUndoMark(courseId) === mark && (!label || GT.store.undoLabel() === label)) GT.store.undo();
+        else ui.toast('Not undone: it was already undone, or newer changes came after it. Use Undo (Ctrl+Z) step by step.', { type: 'warn' });
+      }
+    };
   }
 
   // ------------------------------------------------------------------ the core module (guarded)
@@ -156,7 +188,7 @@
       wi = { sid: null, aid: null, letter: null, aidAuto: true, letterAuto: true };
       sb = null;
       withinText = null;
-      scrollPos = {};
+      scrollPos = Object.create(null);
     }
     if (!ready()) {
       setShell(el, 'loading', '<div class="empty-state st-loading" role="status">' + icon('chart', 'st-empty-ico') +
@@ -378,7 +410,7 @@
   function compute(course, results) {
     var p = prefs();
     var d = { course: course, results: results, p: p, D: decimalsOf(course) };
-    d.students = {};
+    d.students = Object.create(null);
     course.students.forEach(function (s) { d.students[s.id] = s; });
     d.active = activeResults(course, results);
     d.nActive = d.active.length;
@@ -436,11 +468,13 @@
     var c = d.course;
     var fin = model.isFinalized(c)
       ? '<span class="badge badge-info st-fin">' + icon('lock') + 'Scores finalized on ' + esc(dateOnly(c.finalized.at)) + '</span>' : '';
-    var sub = 'Active students only (n = ' + d.nActive + ')' +
+    // The page header pattern of every tab: the tab name as the title, the course as the subtitle.
+    var course = [c.code, c.title, c.term].filter(function (x) { return typeof x === 'string' && x.trim() !== ''; }).join(' · ');
+    var sub = (course ? course + ' · ' : '') + 'Active students only (n = ' + d.nActive + ')' +
       (d.nWithdrawn ? ' · ' + plural(d.nWithdrawn, 'withdrawn student') + ' left out' : '') +
       ' · Updates as soon as a score changes';
     return '<div class="page-header st-head"><div class="st-head-text">' +
-      '<h1 class="st-title"><span class="st-code">' + esc(c.code || 'Course') + '</span> Statistics</h1>' +
+      '<h1 class="st-title">Statistics</h1>' +
       '<div class="sub">' + esc(sub) + (fin ? ' ' + fin : '') + '</div>' +
       (fin ? '<div class="sub st-ro">Scores are locked, so these figures will not change. Statistics are read-only; the planner below can still try cutoffs.</div>' : '') +
       '</div><div class="st-head-actions no-print">' +
@@ -640,6 +674,24 @@
     return 100;
   }
   function textW(s, size) { return String(s).length * (size || 11) * 0.62; }
+  /** The box a value label (class st-val, 11px) covers, with 2px to spare: anchor 'start' or 'middle' at
+   * x, baseline y. */
+  function labelBox(text, x, y, anchor) {
+    var w = textW(text, 11);
+    var x1 = anchor === 'middle' ? x - w / 2 : x;
+    return { x1: x1 - 2, x2: x1 + w + 2, y1: y - 11, y2: y + 4 };
+  }
+  /** A vertical line at x from y1 to y2, left out where it would cross a value label (boxes from
+   * labelBox): a halo keeps the line off the glyphs, but not out of the gaps between them, so a line
+   * through "78.9" still reads as "78|.9" (UX-24). */
+  function vLine(x, y1, y2, boxes) {
+    var cuts = (boxes || []).filter(function (b) { return x >= b.x1 && x <= b.x2 && b.y2 > y1 && b.y1 < y2; })
+      .sort(function (a, b) { return a.y1 - b.y1; });
+    var out = '', y = y1;
+    function seg(a, b) { return b - a >= 1 ? '<line x1="' + r1(x) + '" x2="' + r1(x) + '" y1="' + r1(a) + '" y2="' + r1(b) + '"/>' : ''; }
+    cuts.forEach(function (b) { out += seg(y, Math.max(y, b.y1)); y = Math.max(y, b.y2); });
+    return out + seg(y, y2);
+  }
   function tableToggle(chart, label) {
     var on = !!tables[chart];
     return '<button type="button" class="btn btn-sm btn-ghost st-tbl-btn no-print" data-act="table" data-chart="' + chart + '" aria-pressed="' + (on ? 'true' : 'false') +
@@ -742,7 +794,7 @@
         '<text class="st-tick" x="' + (ml - 6) + '" y="' + r1(y(v) + 4) + '" text-anchor="end">' + v + '</text>';
     });
     out += '</g>';
-    var labels = '';
+    var labels = '', boxes = [];
     bins.forEach(function (b, i) {
       var cx = ml + band * i + band / 2;
       var h = b.count / ct.top * ph;
@@ -752,7 +804,10 @@
       out += '<g class="st-mark"><title>' + esc(tip) + '</title>' +
         '<rect class="st-hit" x="' + r1(ml + band * i) + '" y="' + mt + '" width="' + r1(band) + '" height="' + ph + '"/>' +
         (b.count ? '<path class="st-bar" d="' + colPath(cx - bw / 2, mt + ph - h, bw, h) + '"/>' : '') + '</g>';
-      if (b.count) labels += '<text class="st-val" x="' + r1(cx) + '" y="' + r1(mt + ph - h - 5) + '" text-anchor="middle">' + b.count + '</text>';
+      if (b.count) {
+        labels += '<text class="st-val" x="' + r1(cx) + '" y="' + r1(mt + ph - h - 5) + '" text-anchor="middle">' + b.count + '</text>';
+        boxes.push(labelBox(String(b.count), cx, mt + ph - h - 5, 'middle'));
+      }
     });
     // x axis: bin edges
     var every = band < 26 ? Math.ceil(26 / band) : 1;
@@ -771,8 +826,8 @@
       var a = refLabel(xv(t.mean), 'Average ' + fmt(t.mean, D), meanLeft ? 'end' : 'start', ml, ml + pw);
       var b = refLabel(xv(t.median), 'Median ' + fmt(t.median, D), meanLeft ? 'start' : 'end', ml, ml + pw);
       var clash = a.x1 < b.x2 + 6 && b.x1 < a.x2 + 6;
-      out += refLine(a, mt - 14, mt + ph, mt - 18, 'st-ref st-ref-mean');
-      out += refLine(b, clash ? mt - 28 : mt - 14, mt + ph, clash ? mt - 32 : mt - 18, 'st-ref st-ref-med');
+      out += refLine(a, mt - 14, mt + ph, mt - 18, 'st-ref st-ref-mean', boxes);
+      out += refLine(b, clash ? mt - 28 : mt - 14, mt + ph, clash ? mt - 32 : mt - 18, 'st-ref st-ref-med', boxes);
     }
     return out + '<g class="st-labels" aria-hidden="true">' + labels + '</g></svg>';
   }
@@ -784,8 +839,8 @@
     var tx = anchor === 'end' ? x - 4 : x + 4;
     return { x: x, label: label, anchor: anchor, tx: tx, x1: anchor === 'end' ? tx - w : tx, x2: anchor === 'end' ? tx : tx + w };
   }
-  function refLine(p, yTop, yBottom, yText, cls) {
-    return '<g class="' + cls + '"><title>' + esc(p.label) + '</title><line x1="' + r1(p.x) + '" x2="' + r1(p.x) + '" y1="' + yTop + '" y2="' + yBottom + '"/>' +
+  function refLine(p, yTop, yBottom, yText, cls, boxes) {
+    return '<g class="' + cls + '"><title>' + esc(p.label) + '</title>' + vLine(p.x, yTop, yBottom, boxes) +
       '<text class="st-ref-t" x="' + r1(p.tx) + '" y="' + yText + '" text-anchor="' + p.anchor + '">' + esc(p.label) + '</text></g>';
   }
 
@@ -959,14 +1014,22 @@
         '<text class="st-tick" x="' + r1(x(v)) + '" y="' + (H - mb + 15) + '" text-anchor="middle">' + v + '</text>';
     }
     out += '</g>';
+    // Value labels first: the class-average line leaves a gap where it would cross one.
+    var labels = '', boxes = [];
+    list.forEach(function (t, i) {
+      var yy = mt + i * rowH + (rowH - bh) / 2;
+      var w = Math.max(1, x(t.mean) - lw);
+      var tx = lw + w + 5, ty = yy + bh / 2 + 4, txt = fmt(t.mean, 1);
+      labels += '<text class="st-val" x="' + r1(tx) + '" y="' + r1(ty) + '">' + esc(txt) + '</text>';
+      boxes.push(labelBox(txt, tx, ty, 'start'));
+    });
     if (finite(avg)) {
       var ax = x(avg);
       var at = 'Class average ' + fmt(avg, 1);
       var anchor = ax + textW(at, 11) / 2 > W - 2 ? 'end' : 'middle';
-      out += '<g class="st-ref st-ref-mean"><title>' + esc('Class average ' + fmt(avg, D)) + '</title><line x1="' + r1(ax) + '" x2="' + r1(ax) + '" y1="' + (mt - 6) + '" y2="' + (H - mb) + '"/>' +
+      out += '<g class="st-ref st-ref-mean"><title>' + esc('Class average ' + fmt(avg, D)) + '</title>' + vLine(ax, mt - 6, H - mb, boxes) +
         '<text class="st-ref-t" x="' + r1(anchor === 'end' ? ax + 4 : ax) + '" y="' + (mt - 10) + '" text-anchor="' + anchor + '">' + esc(at) + '</text></g>';
     }
-    var labels = '';
     list.forEach(function (t, i) {
       var yy = mt + i * rowH + (rowH - bh) / 2;
       var w = Math.max(1, x(t.mean) - lw);
@@ -975,7 +1038,6 @@
         '<rect class="st-hit" x="0" y="' + r1(mt + i * rowH) + '" width="' + W + '" height="' + rowH + '"/>' +
         '<text class="st-yl" x="' + (lw - 8) + '" y="' + r1(yy + bh / 2 + 4) + '" text-anchor="end">' + esc(t.name) + '</text>' +
         '<path class="st-bar" d="' + barPath(lw, yy, w, bh) + '"/></g>';
-      labels += '<text class="st-val" x="' + r1(lw + w + 5) + '" y="' + r1(yy + bh / 2 + 4) + '">' + esc(fmt(t.mean, 1)) + '</text>';
     });
     return out + '<g class="st-labels" aria-hidden="true">' + labels + '</g></svg>';
   }
@@ -1106,7 +1168,7 @@
   function scaleKey(rows) { return JSON.stringify(rows.map(function (x) { return [x.letter, x.min]; })); }
   function freshSandbox(course) {
     var base = storedScale(course);
-    return { courseId: course.id, base: base, baseKey: scaleKey(base), rows: base.map(function (x) { return { letter: x.letter, min: x.min }; }), text: {}, err: {}, note: null };
+    return { courseId: course.id, base: base, baseKey: scaleKey(base), rows: base.map(function (x) { return { letter: x.letter, min: x.min }; }), text: Object.create(null), err: Object.create(null), note: null };
   }
   /** Keeps the sandbox in step with the stored scale: a sandbox nobody edited follows it; edits survive a
    * change made elsewhere (with a note) unless the letters themselves changed. */
@@ -1162,7 +1224,8 @@
     var simRes = call('simulate', [course, results, sb.rows], null);
     var sim = simRes && Array.isArray(simRes.students) ? simRes : null;
     var nowDist = call('letterDistribution', [course, results], []);
-    var nowCount = {}, sbCount = {};
+    // Keyed by letter names, which are any text the user typed ("constructor" too): no prototype.
+    var nowCount = Object.create(null), sbCount = Object.create(null);
     (nowDist || []).forEach(function (x) { nowCount[x.letter] = x.count; });
     ((sim && sim.distribution) || []).forEach(function (x) { sbCount[x.letter] = x.count; });
     var changedCutoffs = sb.rows.filter(function (x, i) { return sb.base[i] && x.min !== sb.base[i].min; }).map(function (x) {
@@ -1196,7 +1259,7 @@
     if (!course || !results || !dom || shellKind !== 'main' || !sb) return;
     var W = dom.plPlot.clientWidth > 0 ? Math.max(220, dom.plPlot.clientWidth) : 700;
     // Only what the planner reads (compute() would redo every section for each keystroke).
-    var d = { course: course, results: results, D: decimalsOf(course), students: {}, gaps: call('gaps', [course, results, 1], []) };
+    var d = { course: course, results: results, D: decimalsOf(course), students: Object.create(null), gaps: call('gaps', [course, results, 1], []) };
     course.students.forEach(function (s) { d.students[s.id] = s; });
     renderPlanner(d, W);
   }
@@ -1267,7 +1330,7 @@
     var R = 4.5, rowH = 2 * R + 2;
     // Beeswarm: dots that would overlap stack up and down from the centre line.
     var sorted = students.slice().sort(function (a, b) { return a.total - b.total; });
-    var lastAt = {}, maxLv = 0;
+    var lastAt = Object.create(null), maxLv = 0;
     sorted.forEach(function (p) {
       var px = x(p.total);
       for (var k = 0; k < 400; k++) {
@@ -1414,15 +1477,16 @@
     var fin = model.isFinalized(course) ? '<div class="callout">' + icon('lock') + ' Scores are finalized: this changes the suggested letters only, never a score.</div>' : '';
     ui.dialog.confirm({
       title: 'Apply these cutoffs to Settings?',
-      messageHtml: '<p>The course\'s letter cutoffs become:</p><ul class="st-dlg-list">' + list + '</ul>' +
+      messageHtml: '<div class="st-dlg"><p>The course\'s letter cutoffs become:</p><ul class="st-dlg-list">' + list + '</ul>' +
         (nSug !== null ? '<p><strong>' + plural(nSug, 'student') + '</strong> get a different <strong>suggested</strong> letter. Final letters already chosen are not changed.</p>' : '') +
         '<div class="callout callout-warn">The cutoffs stay marked <strong>needs confirmation</strong> until you confirm them in Settings.</div>' + fin +
-        '<p class="muted small">One step: undo it with Ctrl+Z.</p>',
+        '<p class="muted small">One step: undo it with Ctrl+Z.</p></div>',
       confirmText: 'Apply cutoffs'
     }).then(function (ok) {
       if (!ok) return;
+      var stepLabel = 'Apply cutoffs from the planner';
       try {
-        GT.store.transact('Apply cutoffs from the planner', function (c) {
+        GT.store.transact(stepLabel, function (c) {
           var simC = call('simulate', [c, null, rows], null);
           c.settings.letterScale = simC && Array.isArray(simC.scale) && simC.scale.length
             ? simC.scale.map(function (x) { return { letter: x.letter, min: x.min }; })
@@ -1431,7 +1495,7 @@
         }, { courseId: courseId });
       } catch (e) { ui.toast('Not saved: ' + (e && e.message ? e.message : String(e)), { type: 'error' }); return; }
       sb = null; // the next render copies the new stored scale
-      ui.toast('Cutoffs applied. The suggested letters use them now.', { type: 'success', action: { label: 'Undo', fn: function () { GT.store.undo(); } } });
+      ui.toast('Cutoffs applied. The suggested letters use them now.', { type: 'success', action: undoAction(courseId, stepLabel) });
     });
   }
 
@@ -1444,7 +1508,7 @@
     var fc = sim && sim.finalChanges ? sim.finalChanges : null;
     var onlyEmptyItems = call('lettersFromScale', [course, results, rows, { onlyEmpty: true }], []);
     var allItems = call('lettersFromScale', [course, results, rows], []);
-    var byId = {};
+    var byId = Object.create(null);
     course.students.forEach(function (s) { byId[s.id] = s; });
     function changing(items) { return items.filter(function (it) { return model.finalLetterOf(byId[it.studentId]) !== it.letter; }).length; }
     var nEmpty = fc ? fc.onlyEmpty : changing(onlyEmptyItems);
@@ -1452,14 +1516,14 @@
     var replaced = nAll - nEmpty;
     var unconfirmed = !model.isConfirmed(course, 'letterScale');
     function label(n) { return n ? 'Set ' + plural(n, 'final letter') : 'Nothing to change'; }
-    var html = '<p>Write the letter each active student gets with the <strong>sandbox cutoffs</strong> into their <strong>final letter</strong>. You can still change any letter afterwards.</p>' +
+    var html = '<div class="st-dlg"><p>Write the letter each active student gets with the <strong>sandbox cutoffs</strong> into their <strong>final letter</strong>. You can still change any letter afterwards.</p>' +
       '<fieldset class="st-choices"><legend class="sr-only">Which students</legend>' +
       '<label class="st-choice"><input type="radio" name="st-uf" value="empty" checked data-n="' + nEmpty + '"><span><strong>Only students without a final letter</strong> (recommended)' +
         '<span class="st-choice-help">' + plural(nEmpty, 'student') + ' get a final letter. Letters already chosen stay as they are.</span></span></label>' +
       '<label class="st-choice"><input type="radio" name="st-uf" value="all" data-n="' + nAll + '"><span><strong>All active students</strong>' +
         '<span class="st-choice-help">' + plural(nAll, 'final letter') + ' would change' + (replaced ? ', including <strong>' + replaced + '</strong> already chosen by hand, which would be replaced' : '') + '.</span></span></label>' +
       '</fieldset><p class="muted small">Withdrawn students are skipped. This is one step: Ctrl+Z (or Undo) reverses it.</p>' +
-      (unconfirmed ? '<div class="callout callout-warn">The cutoffs are placeholders that still need confirmation, so check the letters with the instructor.</div>' : '');
+      (unconfirmed ? '<div class="callout callout-warn">The cutoffs are placeholders that still need confirmation, so check the letters with the instructor.</div>' : '') + '</div>';
     ui.dialog.open({
       title: 'Use these as final letters?',
       bodyHtml: html,
@@ -1484,15 +1548,16 @@
     }).then(function (choice) {
       if (choice !== 'empty' && choice !== 'all') return;
       var out = null;
+      var stepLabel = choice === 'empty' ? 'Use planner letters as final letters (students without one)' : 'Use planner letters as final letters (all active students)';
       try {
-        GT.store.transact(choice === 'empty' ? 'Use planner letters as final letters (students without one)' : 'Use planner letters as final letters (all active students)', function (c) {
+        GT.store.transact(stepLabel, function (c) {
           var items = GT.stats.lettersFromScale(c, calc.computeCourse(c), rows, { onlyEmpty: choice === 'empty' });
           out = model.setFinalLetters(c, items);
         }, { courseId: courseId });
       } catch (e) { ui.toast('Not saved: ' + (e && e.message ? e.message : String(e)), { type: 'error' }); return; }
       var n = out ? out.changed : 0;
       ui.toast(n ? plural(n, 'final letter') + ' set from the planner. Press Ctrl+Z to undo.' : 'No final letter was changed.',
-        { type: n ? 'success' : 'info', timeout: 7000, action: n ? { label: 'Undo', fn: function () { GT.store.undo(); } } : null });
+        { type: n ? 'success' : 'info', timeout: 7000, action: n ? undoAction(courseId, stepLabel) : null });
     });
   }
 

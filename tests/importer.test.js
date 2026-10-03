@@ -1026,7 +1026,7 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
       const { copy, res, mapping, plan: p } = await roundTrip(c, keys);
       assert.equal(mapping[keys.indexOf('letter')], 'finalLetter');
       const res2 = calc.computeCourse(copy);
-      let asSuggestion = 0;
+      let asSuggestion = 0, asWithdrawn = 0;
       c.students.forEach((s) => {
         const t = twin(copy, s);
         c.assessments.forEach((a) => {
@@ -1040,7 +1040,9 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
         // the suggestion stays a suggestion (withdrawn students too), the others become final letters.
         const r = res.byId[s.id];
         const want = r.finalLetter !== null && r.finalLetter !== r.letter ? r.finalLetter : null;
-        if (r.effectiveLetter === r.letter) asSuggestion++;
+        // Review E2E-6: a withdrawn student without a final letter is exported as "W", read back as no letter.
+        if (!r.active && r.finalLetter === null) asWithdrawn++;
+        else if (r.effectiveLetter === r.letter) asSuggestion++;
         assert.equal(model.finalLetterOf(t), want, s.lastName);
         assert.equal(res2.byId[t.id].effectiveLetter, r.effectiveLetter, 'the letter shown is the file\'s');
         const a0 = attendance.summary(c, s.id), a1 = attendance.summary(copy, t.id);
@@ -1048,6 +1050,11 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
       });
       assert.ok(asSuggestion > 0);
       assert.equal(p.counts.lettersAsSuggestion, asSuggestion);
+      // SE 4351 has 2 withdrawn students (one with a final letter), SE 6362 one (with a final letter).
+      assert.equal(asWithdrawn, template === 'SE4351' ? 1 : 0);
+      assert.equal(p.counts.lettersWithdrawn, asWithdrawn);
+      assert.equal(p.counts.lettersSkipped, 0, 'a "W" is not reported as a letter outside the scale');
+      assert.equal(p.notes.some((n) => /^Column "Letter Grade": "W" marks a withdrawn student without a letter grade/.test(n)), asWithdrawn === 1, p.notes.join('\n'));
       assert.ok(p.notes.some((n) => /"Letter Grade" looks like a file from Grade Tracker/.test(n)));
       assert.ok(['late:a_p2', 'late:a_t1', 'late:a_t2'].every((k) => mapping[keys.indexOf(k)] === k));
       assert.equal(p.counts.totalsDiffer, 0);
@@ -1060,13 +1067,17 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
       const g = sheets.find((x) => x.name === 'Grades');
       const letterCol = keys.indexOf('letter');
       const manual = c.students.filter((s) => model.finalLetterOf(s) !== null).length;
+      const wdW = c.students.filter((s) => s.status === 'withdrawn' && model.finalLetterOf(s) === null).length;
+      assert.equal(wdW, template === 'SE4351' ? 1 : 0);
       assert.equal(g.finalLetterCells.length, manual);
       assert.ok(g.finalLetterCells.every((p) => p[1] === letterCol));
       assert.equal(sheets.find((x) => x.name === 'Settings').finalLetterCells.length, 0);
       const copy = emptyCopy(c);
       const mapping = importer.guessMapping(g.rows[0], copy, { formulaColumns: g.formulaColumns });
       const p = importer.plan(copy, g.rows, 0, mapping, { finalLetterCells: g.finalLetterCells, switchAttendanceToTotals: true });
-      assert.equal(p.counts.lettersAsSuggestion, c.students.length - manual);
+      assert.equal(p.counts.lettersAsSuggestion, c.students.length - manual - wdW);
+      assert.equal(p.counts.lettersWithdrawn, wdW);
+      assert.ok(!p.items.some((it) => it.issues.some((x) => x.field === 'Final letter')), 'no "W" is reported');
       assert.ok(p.notes.some((n) => /comes from Grade Tracker: only its letters marked "Final letter assigned by the instructor"/.test(n)));
       importer.apply(copy, p);
       c.students.forEach((s) => assert.equal(model.finalLetterOf(twin(copy, s)), model.finalLetterOf(s), s.lastName));
@@ -1155,14 +1166,17 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
     assert.equal(model.finalLetterOf(t), null);
     assert.notEqual(res2.byId[t.id].letter, res1.byId[late.id].letter);
     assert.equal(model.finalLetterOf(twin(copy, other)), otherLetter);
-    assert.equal(p.counts.lettersAsSuggestion, c.students.length - 1);
+    // The 2 withdrawn students' "W" (review E2E-6) reads as no letter.
+    const wdW = c.students.filter((s) => s.status === 'withdrawn').length;
+    assert.equal(p.counts.lettersWithdrawn, wdW);
+    assert.equal(p.counts.lettersAsSuggestion, c.students.length - 1 - wdW);
 
     // Another curve here: every total differs, and the letters are still read against the file's totals.
     const curved = emptyCopy(c);
     curved.settings.curve = 3;
     const { plan: p2 } = importRows(curved, rows);
     assert.equal(p2.counts.totalsDiffer, c.students.length);
-    assert.equal(p2.counts.lettersAsSuggestion, c.students.length - 1);
+    assert.equal(p2.counts.lettersAsSuggestion, c.students.length - 1 - wdW);
     c.students.forEach((s) => assert.equal(model.finalLetterOf(twin(curved, s)), s === other ? otherLetter : null));
   });
 
@@ -1221,7 +1235,9 @@ describe('round trip: export to .xlsx, read it back, import into an empty copy',
       const p = importer.plan(c, rows, 0, importer.guessMapping(rows[0], c), {});
       assert.equal(p.counts.new, 0);
       assert.equal(p.counts.changes, 0, JSON.stringify(p.items.filter((i) => i.changes.length).map((i) => i.changes)));
-      assert.equal(p.counts.lettersAsSuggestion, c.students.length - before.filter((l) => l !== null).length);
+      const wdW = c.students.filter((s, i) => s.status === 'withdrawn' && before[i] === null).length;
+      assert.equal(p.counts.lettersWithdrawn, wdW, 'review E2E-6: "W" reads as no letter');
+      assert.equal(p.counts.lettersAsSuggestion, c.students.length - before.filter((l) => l !== null).length - wdW);
       importer.apply(c, p);
       assert.deepEqual(c.students.map((s) => model.finalLetterOf(s)), before);
     }
@@ -1282,6 +1298,44 @@ describe('letters the instructor changes in an exported workbook (review V4R2-1)
   const letterChanges = (p) => p.items.filter((it) => it.changes.length)
     .map((it) => [it.name, it.changes.map((ch) => [ch.field, ch.oldValue, ch.newValue])]);
 
+  test('a withdrawn student\'s "W" (review E2E-6) reads as no letter; a letter typed over it is a final letter; "W" on an active row is reported', async () => {
+    const c = sampleCourse('SE4351');
+    const wd = c.students.filter((s) => s.status === 'withdrawn');
+    assert.equal(wd.length, 2);
+    // Untouched: the "W" cells are neither final letters nor typed in, and the column stays a formula column.
+    const plain = await exportEdited(c, null);
+    assert.deepEqual(plain.g.editedLetterCells, []);
+    assert.deepEqual(plain.g.finalLetterCells, []);
+    assert.ok(plain.g.formulaColumns.includes(plain.lc));
+    wd.forEach((s) => assert.equal(plain.g.rows[plain.rowOf(s)][plain.lc], 'W'));
+    // The column mapped by hand: no change, no issue, one note.
+    const mapping = importer.guessMapping(plain.g.rows[0], c, { formulaColumns: plain.g.formulaColumns });
+    mapping[plain.lc] = 'finalLetter';
+    const p0 = importer.plan(c, plain.g.rows, 0, mapping, { finalLetterCells: plain.g.finalLetterCells });
+    assert.equal(p0.counts.changes, 0);
+    assert.equal(p0.counts.lettersWithdrawn, 2);
+    assert.ok(!p0.items.some((it) => it.issues.length), JSON.stringify(p0.items.map((it) => it.issues)));
+    assert.ok(p0.notes.includes('Column "Letter Grade": "W" marks 2 withdrawn students without a letter grade, so they are read as empty (no final letter).'), p0.notes.join('\n'));
+    // "D" typed over one "W" (its note stays): that one is a final letter.
+    const { g, lc, rowOf } = await exportEdited(c, (at) => { at(wd[0]).value = 'D'; });
+    assert.deepEqual(g.editedLetterCells, [[rowOf(wd[0]), lc]]);
+    const { plan: p } = planFor(c, g);
+    assert.deepEqual(letterChanges(p), [[model.studentName(wd[0]), [['Final letter', '', 'D']]]]);
+    assert.equal(p.counts.lettersWithdrawn, 1);
+    // A CSV (no notes): "W" reads as no letter on a withdrawn row only; on an active row it is reported.
+    const keys = exporter.builtInPresets(c)[0].columns;
+    const rows = importer.rowsFromCsv(exporter.toCsv(c, calc.computeCourse(c), keys));
+    const act = rows.findIndex((r, i) => i > 0 && r[keys.indexOf('status')] === 'Active');
+    rows[act][keys.indexOf('letter')] = 'W';
+    const q = importer.plan(c, rows, 0, importer.guessMapping(rows[0], c), {});
+    assert.equal(q.counts.lettersWithdrawn, 2);
+    assert.equal(q.counts.lettersSkipped, 1);
+    assert.equal(q.counts.changes, 0);
+    const flagged = q.items.filter((it) => it.issues.length);
+    assert.deepEqual(flagged.map((it) => it.rowIndex), [act]);
+    assert.match(flagged[0].issues[0].message, /^"W" is not a letter of this course's scale/);
+  });
+
   test('no final letters at export (a column of formulas): a letter typed over a formula is a final letter, the formulas stay suggestions', async () => {
     const c = sampleCourse('SE4351');
     const res = calc.computeCourse(c);
@@ -1308,7 +1362,10 @@ describe('letters the instructor changes in an exported workbook (review V4R2-1)
     assert.deepEqual(letterChanges(p).sort(), [
       [model.studentName(x), [['Final letter', '', typed]]],
       [model.studentName(same), [['Final letter', '', res.byId[same.id].letter]]]].sort());
-    assert.equal(p.counts.lettersAsSuggestion, c.students.length - 2);
+    // The withdrawn students' "W" (static, review E2E-6) reads as no letter.
+    const wd = c.students.filter((s) => s.status === 'withdrawn').length;
+    assert.equal(p.counts.lettersWithdrawn, wd);
+    assert.equal(p.counts.lettersAsSuggestion, c.students.length - 2 - wd);
     assert.ok(!p.items.some((it) => it.issues.length), JSON.stringify(p.items.map((it) => it.issues)));
     assert.ok(p.notes.some((n) => /only its letters marked "Final letter assigned by the instructor", or changed in the file after the export, are imported/.test(n)));
     importer.apply(c, p);
@@ -1390,14 +1447,19 @@ describe('letters the instructor changes in an exported workbook (review V4R2-1)
     const typed = res.byId[x.id].letter === 'D' ? 'C' : 'D';
     const { g, lc, rowOf, keys } = await exportEdited(c, (at, ws, k) => {
       const col = k.indexOf('letter') + 1;
-      for (let r = 2; r <= ws.rowCount; r++) ws.getCell(r, col).value = ws.getCell(r, col).result; // Paste Values
+      for (let r = 2; r <= ws.rowCount; r++) { // Paste Values (the withdrawn students' static "W" stays, with its note)
+        const v = ws.getCell(r, col).value;
+        if (v && typeof v === 'object' && 'formula' in v) ws.getCell(r, col).value = v.result;
+      }
       at(x).value = typed;
     });
     assert.ok(!g.formulaColumns.includes(lc));
-    assert.deepEqual(g.editedLetterCells, []);
+    assert.deepEqual(g.editedLetterCells, [], 'a "W" note does not make the pasted letters look typed in');
     const { plan: p } = planFor(c, g);
     assert.equal(p.counts.changes, 0);
-    assert.equal(p.counts.lettersAsSuggestion, c.students.length);
+    const wd = c.students.filter((s) => s.status === 'withdrawn').length;
+    assert.equal(p.counts.lettersWithdrawn, wd);
+    assert.equal(p.counts.lettersAsSuggestion, c.students.length - wd);
     const issues = p.items.filter((it) => it.issues.length);
     assert.equal(issues.length, 1);
     const total = g.rows[rowOf(x)][keys.indexOf('total')];

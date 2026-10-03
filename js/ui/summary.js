@@ -57,7 +57,13 @@
   function isNum(x) { return typeof x === 'number' && isFinite(x); }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
   function num(x, d) { return util.formatNumber(x, d === undefined ? 2 : d); }
-  function fixedNum(x, d) { return isNum(x) ? util.formatNumber(x, d, { fixed: true }) : ''; }
+  /** A total, weighted points or a statistic as the Grades and Statistics tabs show it: rounded to the
+   * course's display decimals, trailing zeros dropped (80.5, 86), '' for no value. */
+  function shown(x, d) { return isNum(x) ? util.formatNumber(x, d) : ''; }
+  /** "SE 4351 · Requirements Engineering · Fall 2026": the subtitle of every tab's page header. */
+  function courseLine(course) {
+    return course ? [course.code, course.title, course.term].filter(function (x) { return typeof x === 'string' && x.trim() !== ''; }).join(' · ') : '';
+  }
   function decimalsOf(course) {
     var d = course && course.settings ? course.settings.decimals : 2;
     return isNum(d) && d >= 0 && d <= 6 ? Math.floor(d) : 2;
@@ -160,7 +166,7 @@
    * Letters that are not on the scale are counted under "Other". */
   function localLetterDistribution(course, results) {
     var scale = sortedScale(course);
-    var counts = {}, other = 0, n = 0;
+    var counts = Object.create(null), other = 0, n = 0;
     results.activeIds.forEach(function (id) {
       var r = results.byId[id];
       if (!r) return;
@@ -169,7 +175,7 @@
       if (calc.letterIndex(scale, l) === -1) { other++; return; }
       counts[l] = (counts[l] || 0) + 1;
     });
-    var seen = {};
+    var seen = Object.create(null);
     var rows = [];
     scale.forEach(function (x) {
       if (seen[x.letter]) return;
@@ -187,7 +193,7 @@
         var d = api.letterDistribution(course, results);
         var ok = Array.isArray(d) && d.every(function (x) { return x && typeof x.letter === 'string' && isNum(x.count) && x.count >= 0; });
         if (ok) {
-          var sum = 0, seen = {}, rows = [];
+          var sum = 0, seen = Object.create(null), rows = [];
           d.forEach(function (x) {
             if (seen[x.letter]) return;
             seen[x.letter] = true;
@@ -335,7 +341,7 @@
       rows.push('<tr><th scope="row">' + esc(label) + (key ? phMark(course, key) : '') + '</th><td>' + valueHtml + '</td></tr>');
     }
     row('Letter cutoffs', esc(scaleText(course) || 'No letter scale'), 'letterScale');
-    row('Rounding', esc(ROUNDING_TEXT[st.rounding] || String(st.rounding)) + '<span class="sum-aside"> · totals shown with ' + plural(dec, 'decimal') + '</span>', 'rounding');
+    row('Rounding', esc(ROUNDING_TEXT[st.rounding] || String(st.rounding)) + '<span class="sum-aside"> · totals shown with up to ' + plural(dec, 'decimal') + '</span>', 'rounding');
     row('Curve', esc(isNum(st.curve) && st.curve ? (st.curve > 0 ? '+' : '') + num(st.curve) + ' points added to every total' : 'None (0 points)'), 'curve');
     var perWeek = isNum(st.latePointsPerWeek) ? st.latePointsPerWeek : 10;
     row('Late work', esc(perWeek > 0
@@ -406,7 +412,7 @@
           head: headLabel(a.name, num(a.weight || 0) + '%'),
           cell: function (row) {
             var d = row.r.items[a.id];
-            return d && !d.missing ? esc(fixedNum(d.weighted, dec)) : '';
+            return d && !d.missing ? esc(shown(d.weighted, dec)) : '';
           }
         });
       });
@@ -415,7 +421,7 @@
       key: 'total', head: headLabel('Total'), cls: 'num sum-c-total',
       cell: function (row, used) {
         var r = row.r;
-        var out = esc(fixedNum(r.total, dec));
+        var out = esc(shown(r.total, dec));
         if (r.incomplete) { used.incomplete = true; out += mk('*', 'Incomplete: ' + plural(r.missingCount, 'weighted score') + ' empty, counted as 0'); }
         return out;
       }
@@ -498,7 +504,10 @@
     return out;
   }
 
-  function theadHtml(cols) {
+  /** The grade table's header rows. `cont` is the "(continued)" line: the first header row, shown only in
+   * print, where the browser repeats the header on every page, so pages 2+ name the course (on page 1 the
+   * Grades heading covers it; css/summary.css). */
+  function theadHtml(cols, cont) {
     var grouped = cols.some(function (c) { return c.group; });
     var top = [], bottom = [];
     for (var i = 0; i < cols.length; i++) {
@@ -511,7 +520,8 @@
       for (var j = i; j < i + span; j++) bottom.push('<th scope="col" class="' + cols[j].cls + '">' + cols[j].head + '</th>');
       i += span - 1;
     }
-    return '<thead><tr>' + top.join('') + '</tr>' + (grouped ? '<tr>' + bottom.join('') + '</tr>' : '') + '</thead>';
+    var contRow = cont ? '<tr class="sum-cont"><th scope="colgroup" colspan="' + cols.length + '">' + esc(cont) + '</th></tr>' : '';
+    return '<thead>' + contRow + '<tr>' + top.join('') + '</tr>' + (grouped ? '<tr>' + bottom.join('') + '</tr>' : '') + '</thead>';
   }
 
   function rowHtml(cols, row, used) {
@@ -540,7 +550,7 @@
   }
 
   function gradesHtml(course, results, prefs, att) {
-    var teams = {};
+    var teams = Object.create(null);
     course.teams.forEach(function (t) { teams[t.id] = t.name; });
     var ls = results.letterSummary || { assigned: 0 };
     var ctx = { teams: teams, assignedAny: ls.assigned > 0, att: att };
@@ -548,7 +558,7 @@
     var sorted = calc.sortStudents(course, results, 'name', 'asc').filter(function (s) { return results.byId[s.id]; });
     var active = sorted.filter(function (s) { return results.byId[s.id].active; });
     var withdrawn = sorted.filter(function (s) { return !results.byId[s.id].active; });
-    var used = {};
+    var used = Object.create(null);
     var head = '<h3 class="sum-h" id="sum-h-grades">Grades' +
       '<span class="sum-h-note">Sorted by last name, then first name' + (prefs.withdrawn && withdrawn.length ? '; withdrawn students last (W)' : '') + '</span></h3>';
     if (!sorted.length) {
@@ -568,7 +578,7 @@
     if (!prefs.withdrawn && withdrawn.length) foot.push(plural(withdrawn.length, 'withdrawn student') + ' not shown.');
     if (prefs.hideNames) foot.push('Names left out: students are identified by No.');
     return '<section class="sum-sec sum-grades-sec" aria-labelledby="sum-h-grades">' + head +
-      '<div class="sum-table-wrap"><table class="sum-table sum-grades" data-cols="' + cols.length + '">' + theadHtml(cols) + body + '</table></div>' +
+      '<div class="sum-table-wrap"><table class="sum-table sum-grades" data-cols="' + cols.length + '">' + theadHtml(cols, (course.code ? course.code + ' · ' : '') + 'Course grade summary (continued)') + body + '</table></div>' +
       legendHtml(course, used) +
       (foot.length ? '<p class="sum-note">' + esc(foot.join(' ')) + '</p>' : '') +
     '</section>';
@@ -584,18 +594,19 @@
       return '<section class="sum-sec sum-stats" aria-labelledby="sum-h-stats">' + head + '<p class="sum-empty">No active students with a total yet.</p></section>';
     }
     var pr = passRate(course, results);
+    // The Statistics tab's names (UX-17): Average, Standard deviation.
     var cells = [
       ['Count', String(d.count)],
-      ['Mean', fixedNum(d.mean, dec)],
-      ['Median', fixedNum(d.median, dec)],
-      ['SD (sample, n − 1)', d.sd === null ? DASH : fixedNum(d.sd, dec)],
-      ['Minimum', fixedNum(d.min, dec)],
-      ['Maximum', fixedNum(d.max, dec)]
+      ['Average', shown(d.mean, dec)],
+      ['Median', shown(d.median, dec)],
+      ['Standard deviation', d.sd === null ? DASH : shown(d.sd, dec), 'sample, n − 1'],
+      ['Minimum', shown(d.min, dec)],
+      ['Maximum', shown(d.max, dec)]
     ];
     var passHead = esc('Pass rate (' + (pr.passingLetter || '?') + ' or better)') + phMark(course, 'passingLetter');
     var passVal = pr.total ? esc(util.formatPercent(pr.pct, 1)) + ' <span class="sum-aside">(' + pr.passing + ' of ' + pr.total + ')</span>' : DASH;
     var figures = '<table class="sum-table sum-figures"><thead><tr>' +
-      cells.map(function (c) { return '<th scope="col" class="num">' + esc(c[0]) + '</th>'; }).join('') +
+      cells.map(function (c) { return '<th scope="col" class="num">' + esc(c[0]) + (c[2] ? ' <span class="sum-sub">' + esc(c[2]) + '</span>' : '') + '</th>'; }).join('') +
       '<th scope="col" class="num">' + passHead + '</th></tr></thead><tbody><tr>' +
       cells.map(function (c) { return '<td class="num">' + esc(c[1]) + '</td>'; }).join('') +
       '<td class="num">' + passVal + '</td></tr></tbody></table>';
@@ -663,7 +674,7 @@
     }).join('');
     el.innerHTML =
       '<div class="page-header sum-screen-head no-print">' +
-        '<div><h1>Summary</h1><div class="sub">A print-ready page for the grading meeting. The options bar is not printed.</div></div>' +
+        '<div><h1>Summary</h1><div class="sub"><span class="sum-course"></span><span class="sum-course-sep"> · </span>A print-ready page for the grading meeting. The options bar is not printed.</div></div>' +
         '<button type="button" class="btn btn-primary" data-act="print" title="Print or save as PDF (Ctrl+P)">' + ui.icon('print') + '<span>Print…</span></button>' +
       '</div>' +
       '<div class="card sum-options no-print" role="group" aria-label="Print options">' +
@@ -672,7 +683,7 @@
           'If the print dialog shows portrait, switch Layout to Landscape. Names print unblurred even in privacy mode; tick “Hide names” to leave them out.</span></p>' +
       '</div>' +
       '<article class="sum-paper" aria-label="Course grade summary (print preview)"></article>';
-    dom = { doc: el.querySelector('.sum-paper'), opts: el.querySelector('.sum-opts') };
+    dom = { doc: el.querySelector('.sum-paper'), opts: el.querySelector('.sum-opts'), course: el.querySelector('.sum-course'), courseSep: el.querySelector('.sum-course-sep') };
     el.addEventListener('change', function (e) {
       var t = e.target;
       if (!t || !t.getAttribute) return;
@@ -697,6 +708,14 @@
       var v = !!p[cb.getAttribute('data-pref')];
       if (cb.checked !== v) cb.checked = v;
     });
+  }
+
+  /** Page header subtitle: "SE 4351 · Requirements Engineering · Fall 2026 · …" (the pattern of every tab). */
+  function syncCourseLine(course) {
+    if (!dom || !dom.course) return;
+    var t = courseLine(course);
+    if (dom.course.textContent !== t) dom.course.textContent = t;
+    dom.courseSep.hidden = !t;
   }
 
   function stampGenerated() {
@@ -741,6 +760,7 @@
     bindPrintOnce();
     syncOptions();
     var course = ctx.course || null;
+    syncCourseLine(course);
     var cid = course ? course.id : null;
     if (!dirty && !ctx.switched && cid === lastCourseId && lastHtml !== null) return;
     dirty = false;

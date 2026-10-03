@@ -1203,6 +1203,12 @@
     return true;
   }
 
+  /** A tab id as stored in ui.activeView: lowercase letters only and never an Object.prototype name
+   * ("constructor"), so a restored file cannot point the app at something that is not a view. */
+  function isViewId(v) {
+    return typeof v === 'string' && /^[a-z]+$/.test(v) && !(v in Object.prototype);
+  }
+
   function normalizeState(raw) {
     if (!util.isPlainObject(raw)) throw new Error('Not a Grade Tracker data file (expected a JSON object).');
     if (raw.app !== APP_ID) {
@@ -1236,7 +1242,7 @@
       ui: {
         theme: ['system', 'light', 'dark'].indexOf(ui.theme) !== -1 ? ui.theme : 'system',
         privacy: ui.privacy === true,
-        activeView: typeof ui.activeView === 'string' ? ui.activeView : 'grades'
+        activeView: isViewId(ui.activeView) ? ui.activeView : 'grades'
       },
       meta: {
         createdAt: typeof meta.createdAt === 'string' ? meta.createdAt : util.nowIso(),

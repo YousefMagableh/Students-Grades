@@ -490,9 +490,21 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   e.g. an undone deletion: `"No 5, Team 1, final letter A"`). A scale change never rewrites or logs final
   letters.
 - Reading summary details: `history.entryDetails(entry)` → the well-formed `details` items (`[]` for any
-  other entry; stored data is read defensively); `history.detailFor(entry, studentId)` → that student's item
-  or null; `history.involvesStudent(entry, studentId)` → true when `entry.studentId` is the student or a
-  detail names them. The History view's student filter matches with `involvesStudent`.
+  other entry; stored data is read defensively; an item that names its own `field` keeps it);
+  `history.detailFor(entry, studentId)` → that student's item or null (a student listed twice, e.g. marked
+  again in one roll call, gives one change: the first old value and the last new value);
+  `history.involvesStudent(entry, studentId)` → true when `entry.studentId` is the student or a detail
+  names them. The History view's student filter matches with `involvesStudent`.
+- A roll call is one entry (CODE-6): `GT.store.transact(label, mutator, { mergeKey })` folds per-student
+  attendance entries into the course's last entry when that entry has the same `mergeKey`, is less than
+  30 minutes old and has no `userNote`. The result replaces it: kind `'attendance'`, field = the transaction
+  label (e.g. "Roll call Tue Oct 6"), fieldKey `'attendance'`, newValue `"<n> marks"`, note `"<k> students"`,
+  `details: [{ studentId, studentName, no, field, oldValue, newValue }]` (every merged mark, in order; a
+  student marked twice is listed twice), a new id, `mergeKey`, `ts` and `source` as usual. The first mark
+  is an ordinary entry carrying the `mergeKey`. Undo and redo stay per transaction (per mark); their
+  entries carry no key, so a mark after an undo starts a new entry. The History view lists the marks under
+  "Show n marks"; `toRows` writes one row per mark with its own field. The attendance roll call passes
+  `mergeKey: 'rollcall:' + sessionId + ':' + rollCallOpenedAt`.
 - Finalizing (STAGE2B): a change of `course.finalized` gives kind `'settings'`, field "Scores finalized",
   fieldKey `'course.finalized'`, values `'no'` / `'yes (YYYY-MM-DD)'` (local date of `at`); the note says the
   score cells were locked (plus the finalize note) or unlocked. Finalizing again with a new date or note is
@@ -511,7 +523,25 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
 ## 5. Store (`GT.store`) and storage (`GT.storage`)
 
 - `GT.storage.init()` → `Promise<{ backend: 'indexeddb'|'localstorage'|'memory' }>`; `load()`,
-  `save(state)`, `clear()`. IndexedDB DB `grade-tracker`, object store `kv`, keys `state` and `state-prev`.
+  `save(state)`, `saveSync(state)`, `clear()`, `isStale()`, `stamp()`. IndexedDB DB `grade-tracker`, object
+  store `kv`, keys `state`, `state-prev` and `stamp`; localStorage keys `grade-tracker:state`,
+  `grade-tracker:state-prev`, `grade-tracker:stamp` and `grade-tracker:state-base`.
+- **Two open tabs (CODE-1 / E2E-1): every save is a compare-and-swap on a save stamp.** Each save writes a
+  new unique stamp (time / random tab id / counter) next to the data. `load()` remembers the stored stamp;
+  `save()` writes only while the stored stamp is still the one this tab loaded or last wrote, otherwise it
+  rejects with a conflict error (`err.conflict === true`) and writes nothing. With IndexedDB the check, the
+  data, `state-prev` and the new stamp are one readwrite transaction (atomic); with localStorage the stamp is
+  `grade-tracker:stamp`, written first. Data saved by an older version has no stamp (`''`) and is taken over
+  by the first save. `clear()` (Delete all data) deletes everything and stores a new stamp, so a stale tab
+  can never save deleted data back; restore is a normal save (it replaces the state), so it bumps the stamp
+  too. `isStale()` resolves true when the stored stamp is not this tab's.
+- Emergency copy: `saveSync(state)` (page hidden or closing) writes the state to `grade-tracker:state` and
+  the IndexedDB stamps it continues (the stored one plus those of saves still running) to
+  `grade-tracker:state-base`. `load()` prefers that copy only while it is newer (`meta.lastSavedAt`) **and**
+  the IndexedDB stamp is one of its bases; a copy written by a stale tab is ignored, and the next IndexedDB
+  save removes it. A copy without bases (a localStorage-only session, an older version) wins while it is
+  newer, as before. With the localStorage backend `save()` and `saveSync()` are synchronous compare-and-swap
+  saves. When IndexedDB fails mid-session the data moves to localStorage with the IndexedDB stamp as its base.
 - `GT.store.state` (AppState), `GT.store.course()` (active course), `GT.store.results()` (memoized
   `calc.computeCourse` for the active course, invalidated on change).
 - `GT.store.transact(label, mutator, { source = 'edit', courseId, historyMode = 'diff'|'bulk'|'none' })`:
@@ -522,8 +552,25 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   Each undo step remembers its `historyMode`: undoing or redoing a `'bulk'` step (e.g. loading sample data)
   logs one bulk entry (note `Undo of "<label>"`), not an itemized diff of every student and score.
 - `GT.store.setUi(patch)`, `GT.store.setMeta(patch)`, `GT.store.replaceState(state, source)`,
-  `GT.store.subscribe(fn)`, `GT.store.flush()` (save now), `GT.store.saveStatus()`,
-  `GT.store.annotateHistory(entryId, text)`, `setActiveCourse/addCourse/deleteCourse/moveCourse`.
+  `GT.store.clearAll(state, source)` (Delete all data: cancels the pending autosave, waits for a running save,
+  `GT.storage.clear()`, then `replaceState`), `GT.store.subscribe(fn)`, `GT.store.flush()` (save now),
+  `GT.store.flushOnLeave()`, `GT.store.saveStatus()`, `GT.store.annotateHistory(entryId, text)`,
+  `setActiveCourse/addCourse/deleteCourse/moveCourse`, `GT.store.undoStepId()` (a unique id of the active
+  course's latest undo step; every pushed step, also by undo or redo, gets a new one).
+- **Conflict (read-only) state.** A save rejected with a conflict, or `GT.store.checkConflict()` finding the
+  tab stale (app.js calls it when another tab broadcasts `saved`, when the page becomes visible again and
+  on a back/forward-cache restore), sets `saveStatus().phase === 'conflict'` (notify `{ type: 'conflict' }`).
+  Then autosave stops for good; `transact`, `addCourse`, `deleteCourse`, `moveCourse`, `replaceState` and
+  `clearAll` throw a conflict error before changing anything; `undo`/`redo` return false (`canUndo` false);
+  `annotateHistory` returns false; `flush`/`flushOnLeave` do nothing. UI-only settings (`setUi`, `setMeta`,
+  `setActiveCourse`) still change on screen but are not saved. `GT.store.readOnly()` tells views. Only a
+  reload (`init`) leaves the state. UI-only changes are saved through the same compare-and-swap, so a theme or
+  tab click in a stale tab fails into the conflict instead of writing old data back.
+- `GT.store.hasUnsavedData()`: course data changed in this tab that is neither saved nor kept by an emergency
+  copy (UI-only settings do not count; while read-only, every change not saved before the conflict counts).
+  app.js warns before the page closes when it is true (failed save, saving paused, conflict) or when the
+  memory backend holds data. A save error with `err.paused` (unreadable saved data, see app.js) is an error
+  phase that is not logged as a failure.
 - `ui` keeps per-view preference objects named `<view>Prefs` (e.g. `ui.gridPrefs`); `normalizeState` keeps
   them as shallow plain objects.
 
@@ -558,6 +605,31 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `GT.ui.download(filename, blobOrText, mime)`, `GT.ui.loadExcel()`, `GT.ui.icon(name)` (inline SVG).
 - App shell (`js/app.js`): `GT.app.VERSION` ('1.0.0', as in package.json), `GT.app.showShortcuts()`,
   `GT.app.showAbout()`, `GT.app.SHORTCUTS` (the list the shortcuts dialog shows; section 14).
+  - `GT.app.registerLeaveHook(fn)`: `fn()` runs synchronously (each in try/catch, registering the same
+    function twice is a no-op) on `pagehide`, on `visibilitychange` → hidden and on `beforeunload`, BEFORE
+    `store.flushOnLeave()`. A view uses it to commit an edit that is still being typed (the grid's open
+    editor, a focused Settings input). Views load before app.js, so they register on their first render,
+    guarded by `if (GT.app && typeof GT.app.registerLeaveHook === 'function')`.
+  - Other tabs (BroadcastChannel `grade-tracker`): messages `{ type: 'hello' | 'here' | 'goodbye' | 'saved',
+    id, stamp }`. `saved` (after every successful save, with the new stamp) makes a tab whose stamp differs
+    run `store.checkConflict()`; `goodbye` (on `pagehide`) removes that tab from the "also open in another
+    tab" banner. In the conflict state a danger banner ("Grade Tracker was changed in another tab…") offers
+    **Reload** (no leave prompt) and **Download this tab's data** (a backup of what the tab shows); the status
+    bar says "Read-only: changed in another tab". Conflict errors a view does not catch become a toast.
+  - Unreadable saved data (`loadProblem`): `GT.storage.save` is wrapped to reject with `err.paused`
+    ("Saving is paused until you download the unreadable data and restore it or start fresh"), so the status
+    says "Saving paused", the banner says changes made now are not saved, and leaving with changes warns.
+  - A stored `ui.activeView` is used only when it names a registered view (`util.hasOwn(GT.views, id)`);
+    `normalizeState` keeps it only when it is lowercase letters and not an `Object.prototype` name.
+  - On phones the tab strip scrolls sideways; when the active tab changes, app.js scrolls the strip (never
+    the page) so that the active tab is fully visible.
+- `GT.ui.undoAction(courseId, label)` (widgets.js): the `{ label: 'Undo', fn }` toast action for a change
+  just made with `GT.store.transact`. Its Undo acts only while that step is still the latest undo step of its
+  course (the course is active, `GT.ui.undoMark(courseId)` is unchanged: label, `undoStepId`, history length,
+  last entry id); otherwise it shows the "Not undone…" warning. Students & Teams and Statistics use it.
+- `GT.ui.menu(anchor, items, opts)`: an item with `checked: true|false` is a `menuitemradio` with
+  `aria-checked` and a check icon when chosen (the theme menu); the chosen item gets the focus when the menu
+  opens. `opts.label` names the menu.
 
 ### 6.1 Final grades in the UI (STAGE2B, DECISIONS 2, 5–8)
 

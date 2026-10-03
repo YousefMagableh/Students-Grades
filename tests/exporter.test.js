@@ -116,6 +116,12 @@ function readZipEntry(arrayBuffer, name) {
   throw new Error('No ' + name + ' in the zip');
 }
 
+/** What the Letter Grade column holds for a student (review E2E-6): "W" for a withdrawn student without a
+ * final letter (a static value, as on the Summary tab), else the effective letter. */
+function exportLetter(r) {
+  return !r.active && r.finalLetter === null ? exporter.WITHDRAWN_LETTER : r.effectiveLetter;
+}
+
 /** Checks every row: Total and the letter columns evaluate to the app's values; weighted cells too.
  * `sheet` may be a function (options) -> sheet: then it is checked with Excel's ROUND and with a
  * naive binary ROUND (as in HyperFormula). */
@@ -136,7 +142,7 @@ function assertParity(c, res, sh, sheet, label) {
       assert.equal(t, r.total, `${label}: total of row ${row} (${meta.studentId})`);
       checked++;
     }
-    if (lc) assert.equal(sheet.value(mx.refName(lc, row)), r.effectiveLetter, `${label}: Letter Grade of row ${row}`);
+    if (lc) assert.equal(sheet.value(mx.refName(lc, row)), exportLetter(r), `${label}: Letter Grade of row ${row}`);
     if (sc) assert.equal(sheet.value(mx.refName(sc, row)), r.letter, `${label}: suggested letter of row ${row}`);
     c.assessments.forEach((a) => {
       const wc = col('weighted:' + a.id);
@@ -331,9 +337,13 @@ describe('formula parity: every Total and letter formula gives the app\'s value'
             const sh = exporter.buildSheet(c, res, keys);
             const n = assertParity(c, res, sh, (o) => sheetFromBuild(sh, o), `${template}/${rounding}/${curve}`);
             assert.equal(n, c.students.length);
-            // No final letters yet: the Letter Grade column is a formula.
+            // No final letters yet: the Letter Grade column is a formula, except "W" (static, with its note)
+            // for the withdrawn students.
             const lc = sh.columns.findIndex((x) => x.key === 'letter');
-            assert.ok(sh.rows.every((row) => typeof row[lc].f === 'string'));
+            assert.ok(sh.rows.every((row, ri) => (sh.rowMeta[ri].withdrawn
+              ? row[lc].v === 'W' && row[lc].f === undefined && row[lc].note === exporter.WITHDRAWN_LETTER_NOTE
+              : typeof row[lc].f === 'string')));
+            assert.ok(sh.rowMeta.some((m) => m.withdrawn), "the sample has withdrawn students");
           }
           addFinalLetters(c);
           res = calc.computeCourse(c);
@@ -772,12 +782,22 @@ describe('buildSheet rows and cells', () => {
     sh.rows.forEach((row, ri) => {
       const r = res.byId[sh.rowMeta[ri].studentId];
       assert.equal(row[2].f, undefined);
+      if (!r.active) {
+        // Review E2E-6: a withdrawn student has no letter grade.
+        assert.equal(row[2].v, 'W');
+        assert.equal(row[2].note, 'Withdrawn: no letter grade');
+        return;
+      }
       assert.equal(row[2].v, r.letter);
       assert.equal(row[2].note, exporter.SUGGESTED_LETTER_NOTE + r.letter + '\nNo final letter assigned yet.');
     });
-    // With the Total column the letter is a formula, without a note.
+    // With the Total column the letter is a formula, without a note ("W" for the withdrawn students).
     const f = exporter.buildSheet(c, res, ['lastName', 'firstName', 'total', 'letter']);
-    f.rows.forEach((row) => { assert.ok(row[3].f.startsWith('IF(')); assert.equal(row[3].note, undefined); });
+    f.rows.forEach((row, ri) => {
+      if (f.rowMeta[ri].withdrawn) { assert.deepEqual([row[3].v, row[3].f], ['W', undefined]); return; }
+      assert.ok(row[3].f.startsWith('IF('));
+      assert.equal(row[3].note, undefined);
+    });
   });
 
   test('final letters: Letter Grade is the effective letter (static) with notes; Suggested stays a formula', () => {
@@ -786,22 +806,67 @@ describe('buildSheet rows and cells', () => {
     const res = calc.computeCourse(c);
     const keys = ['lastName', 'firstName', 'total', 'letter', 'suggestedLetter', 'finalLetter'];
     const sh = exporter.buildSheet(c, res, keys);
+    let wdW = 0, wdFinal = 0;
     sh.rows.forEach((row, ri) => {
       const r = res.byId[sh.rowMeta[ri].studentId];
       assert.equal(row[3].f, undefined);
-      assert.equal(row[3].v, r.effectiveLetter);
+      assert.equal(row[3].v, exportLetter(r));
       // Review V4R2-1: a suggestion carries its letter in a note, so a letter typed over it in the
-      // spreadsheet is recognized on import.
+      // spreadsheet is recognized on import. Review E2E-6: "W" for a withdrawn student without a final letter.
+      if (!r.active) { if (r.finalLetter === null) wdW++; else wdFinal++; }
       assert.equal(row[3].note, r.letterSource === 'manual' ? 'Final letter assigned by the instructor'
-        : 'Suggestion from the cutoffs: ' + r.letter + '\nNo final letter assigned yet.');
+        : !r.active ? 'Withdrawn: no letter grade'
+          : 'Suggestion from the cutoffs: ' + r.letter + '\nNo final letter assigned yet.');
       assert.ok(row[4].f.startsWith('IF('));
       assert.equal(row[5].v, r.finalLetter === null ? '' : r.finalLetter);
       assert.equal(row[5].f, undefined);
     });
+    // A withdrawn student's own final letter is exported as is.
+    assert.deepEqual([wdW, wdFinal], [1, 1]);
+    assert.equal(sh.rows[sh.rowMeta.findIndex((m) => m.studentId === fl.withdrawn.id)][3].v, model.finalLetterOf(fl.withdrawn));
     const diff = sh.rows[sh.rowMeta.findIndex((m) => m.studentId === fl.different.id)];
     assert.notEqual(diff[3].v, res.byId[fl.different.id].letter);
     assert.match(sh.columns[3].note, /^Final letters assigned by the instructor/);
     assert.match(sh.notes.join(' '), /final letters/);
+  });
+
+  test('a withdrawn student without a final letter gets "W" (static, with a note) in Letter Grade, in the .xlsx and the CSV (review E2E-6)', async () => {
+    const c = sampleCourse('SE4351');
+    const wd = c.students.filter((s) => s.status === 'withdrawn');
+    assert.equal(wd.length, 2);
+    const keys = DEFAULT(c);
+    const lc = keys.indexOf('letter');
+    const noteOf = (cell) => (cell.note && typeof cell.note === 'object' ? cell.note.texts.map((t) => t.text).join('') : cell.note);
+    const check = async (label, finalOn1) => {
+      const res = calc.computeCourse(c);
+      const sh = exporter.buildSheet(c, res, keys);
+      assert.match(sh.columns[lc].note, / W: withdrawn, no letter grade\./, label);
+      const ws = (await loadWorkbook(await exporter.toWorkbook(ExcelJS, c, res, keys, { now: NOW }))).getWorksheet('Grades');
+      const rows = csv.parse(exporter.toCsv(c, res, keys)).slice(1);
+      sh.rowMeta.forEach((m, ri) => {
+        const cell = ws.getRow(ri + 2).getCell(lc + 1);
+        const r = res.byId[m.studentId];
+        if (m.studentId === wd[0].id || (m.studentId === wd[1].id && !finalOn1)) {
+          assert.deepEqual([cell.value, noteOf(cell), rows[ri][lc]], ['W', 'Withdrawn: no letter grade', 'W'], label + ': ' + m.studentId);
+        } else if (m.studentId === wd[1].id) {
+          assert.deepEqual([cell.value, noteOf(cell), rows[ri][lc]], [finalOn1, 'Final letter assigned by the instructor', finalOn1], label);
+        } else if (finalOn1) {
+          assert.equal(cell.value, r.effectiveLetter, label);
+        } else {
+          // Formula parity for everyone else: the nested IF on the Total, cached with the app's letter.
+          assert.equal(cell.value.formula, exporter.letterFormula(c, exporter.colLetter(keys.indexOf('total') + 1) + (ri + 2)), label);
+          assert.equal(cell.value.result, r.letter, label);
+          assert.equal(rows[ri][lc], r.letter, label);
+        }
+      });
+    };
+    await check('no final letters', null);
+    // A withdrawn student's own final letter is kept (the column then holds static letters for everyone).
+    model.setFinalLetter(c, wd[1].id, 'F');
+    await check('one withdrawn final letter', 'F');
+    // No withdrawn student without a letter: the header note does not mention W.
+    model.setFinalLetter(c, wd[0].id, 'D');
+    assert.doesNotMatch(exporter.buildSheet(c, calc.computeCourse(c), keys).columns[lc].note, /W: withdrawn/);
   });
 
   test('attendance columns come from GT.attendance.summary', () => {
@@ -942,7 +1007,12 @@ describe('toWorkbook (ExcelJS in Node)', () => {
     // Without final letters and not finalized
     const d = sampleCourse('SE6362');
     const rows2 = exporter.settingsRows(d, calc.computeCourse(d), NOW).filter(Array.isArray);
-    assert.equal(rows2.find((r) => r[0] === 'Letter Grade column')[1], 'Suggestions from the cutoffs (no final letters assigned yet)');
+    assert.equal(rows2.find((r) => r[0] === 'Letter Grade column')[1],
+      'Suggestions from the cutoffs (no final letters assigned yet); W for a withdrawn student without a final letter (no letter grade)');
+    // Without withdrawn students, no word about W.
+    d.students.forEach((s) => { s.status = 'active'; });
+    assert.equal(exporter.settingsRows(d, calc.computeCourse(d), NOW).filter(Array.isArray).find((r) => r[0] === 'Letter Grade column')[1],
+      'Suggestions from the cutoffs (no final letters assigned yet)');
     assert.equal(rows2.find((r) => r[0] === 'Scores finalized')[1], 'No');
     assert.equal(rows2.find((r) => r[0] === 'Attendance')[1], 'Off');
   });
@@ -1028,9 +1098,11 @@ describe('toCsv', () => {
     rows.slice(1).forEach((row, ri) => {
       const r = res.byId[sh.rowMeta[ri].studentId];
       assert.equal(Number(row[13]), r.total);
-      assert.equal(row[14], r.effectiveLetter);
+      assert.equal(row[14], exportLetter(r));
       assert.ok(!row.some((v) => v.startsWith('ROUND(') || v.startsWith('IF(')));
     });
+    // Review E2E-6: the withdrawn students get "W", as on the Summary tab.
+    assert.deepEqual(rows.slice(1).filter((row) => row[18] === 'Withdrawn').map((row) => row[14]), ['W', 'W']);
   });
 
   test('escaping and the formula guard; numbers are not guarded', () => {

@@ -129,9 +129,10 @@ async function studentsByName() {
 function historyCount() { return page.evaluate(() => GT.store.course().history.length); }
 function historySince(n) { return page.evaluate((k) => GT.store.course().history.slice(k), n); }
 
+/** Clicks a menu item (role menuitem, or menuitemradio in a one-choice menu such as the theme). */
 async function openMenuItem(buttonSel, label) {
   await page.click(buttonSel);
-  await page.locator('.menu [role="menuitem"]', { hasText: label }).first().click();
+  await page.locator('.menu [role="menuitem"], .menu [role="menuitemradio"]', { hasText: label }).first().click();
 }
 
 // Stage 2b helpers: drop-down cells, final letters, finalize.
@@ -382,6 +383,8 @@ function appRows() {
       return {
         id: s.id, no: s.no, last: s.lastName, first: s.firstName, status: s.status, total: x.total, letter: x.letter,
         effective: x.effectiveLetter, source: x.letterSource,
+        // What an export writes in Letter Grade: "W" (a static value) for a withdrawn student without a final letter.
+        wdW: s.status === 'withdrawn' && GT.model.finalLetterOf(s) === null,
         weighted: c.assessments.map((a) => x.items[a.id].weightedUnrounded),
         att: [sm.excused, sm.unexcused, sm.totalAbsences]
       };
@@ -441,6 +444,53 @@ async function withLocalStoragePage(init, arg, fn) {
   } finally {
     await ctx.close();
   }
+}
+
+/** Runs fn(open) in a fresh browser context (its own IndexedDB, localStorage and BroadcastChannel), where
+ * open({ noChannel }) opens another tab of the app. A tab opened with noChannel has no BroadcastChannel:
+ * it neither sends nor hears "saved", so only the compare-and-swap on save protects the data from it. */
+async function withTwoTabs(fn) {
+  const ctx = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 860 } });
+  try {
+    const open = async (opts = {}) => {
+      const p = await ctx.newPage();
+      p.setDefaultTimeout(10000);
+      watch(p);
+      if (opts.noChannel) {
+        await p.addInitScript(() => { Object.defineProperty(window, 'BroadcastChannel', { value: undefined, configurable: true }); });
+      }
+      await p.goto(APP_URL);
+      await p.waitForFunction(() => window.GT && GT.store && GT.store.state && document.querySelector('#tabs .tab'));
+      return p;
+    };
+    await fn(open);
+  } finally {
+    await ctx.close();
+  }
+}
+
+/** In page p: loads the SE 4351 sample (light theme, backup reminder off) and waits until it is saved. */
+async function seedSample(p) {
+  await p.evaluate(async () => {
+    GT.store.transact('Load sample data', (c) => GT.sample.loadInto(c, {}), { source: 'sample', historyMode: 'bulk' });
+    GT.store.setUi({ theme: 'light' });
+    GT.store.setMeta({ lastBackupAt: new Date().toISOString() });
+    await GT.store.flush();
+  });
+  assert.equal(await p.evaluate(() => GT.store.saveStatus().phase), 'saved');
+}
+
+/** Opens one more tab in the context of p and returns what it loaded: { phase, students, t1 (sid -> Test 1) }. */
+async function freshLook(open) {
+  const p = await open();
+  const r = await p.evaluate(() => {
+    const c = GT.store.course();
+    const t1 = {};
+    c.students.forEach((s) => { const e = GT.model.getEntry(c.scores, s.id, 'a_t1'); t1[s.id] = e ? e.value : null; });
+    return { students: c.students.length, t1, theme: GT.store.state.ui.theme, privacy: GT.store.state.ui.privacy };
+  });
+  await p.close();
+  return r;
 }
 
 // Stage 5 helpers: the Statistics tab.
@@ -522,7 +572,8 @@ function summaryExpected() {
     return sorted.filter((s) => r.byId[s.id].active).concat(sorted.filter((s) => !r.byId[s.id].active)).map((s) => {
       const x = r.byId[s.id];
       return {
-        sid: s.id, wd: !x.active, no: String(s.no), total: GT.util.formatNumber(x.total, d, { fixed: true }),
+        // Totals as the Grades tab shows them (one number format everywhere, UX-17): 80.5, not 80.50.
+        sid: s.id, wd: !x.active, no: String(s.no), total: GT.util.formatNumber(x.total, d),
         letter: !x.active ? 'W' : anyFinal ? (s.finalLetter || '—') : x.effectiveLetter,
         rank: x.rank === null ? '—' : String(x.rank)
       };
@@ -2147,9 +2198,14 @@ async function run() {
       }
       if (row.getCell(14).formula !== 'ROUND(SUM(I' + r + ':M' + r + '),10)') bad.push(r + ': total formula ' + row.getCell(14).formula);
       if (val(14).result !== s.total || sheet.value('N' + r) !== s.total) bad.push(r + ': total ' + sheet.value('N' + r) + ' != ' + s.total);
-      // No final letters yet: Letter Grade is the suggestion, a nested IF on the Total.
-      if (!String(row.getCell(15).formula).startsWith('IF(N' + r + '>=97,"A+",IF(N' + r + '>=93,"A",')) bad.push(r + ': letter formula');
-      if (val(15).result !== s.letter || sheet.value('O' + r) !== s.letter) bad.push(r + ': letter ' + sheet.value('O' + r) + ' != ' + s.letter);
+      // No final letters yet: Letter Grade is the suggestion, a nested IF on the Total; a withdrawn student
+      // gets a static "W" (no letter grade), as on the Summary tab.
+      if (s.wdW) {
+        if (row.getCell(15).formula || val(15) !== 'W') bad.push(r + ': withdrawn letter ' + JSON.stringify(val(15)));
+      } else {
+        if (!String(row.getCell(15).formula).startsWith('IF(N' + r + '>=97,"A+",IF(N' + r + '>=93,"A",')) bad.push(r + ': letter formula');
+        if (val(15).result !== s.letter || sheet.value('O' + r) !== s.letter) bad.push(r + ': letter ' + sheet.value('O' + r) + ' != ' + s.letter);
+      }
       if ([val(16), val(17), val(18)].join() !== s.att.join()) bad.push(r + ': absences ' + [val(16), val(17), val(18)] + ' != ' + s.att);
       if (val(19) !== (s.status === 'withdrawn' ? 'Withdrawn' : 'Active')) bad.push(r + ': status ' + val(19));
     });
@@ -2192,7 +2248,7 @@ async function run() {
     app.forEach((s, i) => {
       const cell = ws.getRow(i + 2).getCell(15);
       if (cell.formula) bad.push(s.last + ': Letter Grade is a formula');
-      if (cell.value !== s.effective) bad.push(s.last + ': ' + cell.value + ' != ' + s.effective);
+      if (cell.value !== (s.wdW ? 'W' : s.effective)) bad.push(s.last + ': ' + cell.value + ' != ' + (s.wdW ? 'W' : s.effective));
       const manual = /Final letter assigned by the instructor/.test(noteText(cell.note));
       if (manual !== (s.source === 'manual')) bad.push(s.last + ': note');
       if (!ws.getRow(i + 2).getCell(14).formula) bad.push(s.last + ': Total is not a formula');
@@ -2210,7 +2266,7 @@ async function run() {
     app.forEach((s, i) => {
       const row = rows[i + 1];
       assert.deepEqual([row[1], row[2], Number(row[13]), row[14], row[18]],
-        [s.last, s.first, s.total, s.effective, s.status === 'withdrawn' ? 'Withdrawn' : 'Active']);
+        [s.last, s.first, s.total, s.wdW ? 'W' : s.effective, s.status === 'withdrawn' ? 'Withdrawn' : 'Active']);
     });
     exportedCsv = { file: c.file, name: c.name, app };
   });
@@ -2954,8 +3010,20 @@ async function run() {
     assert.equal(filter, 'none');
   });
 
-  await check('dark theme applies from the theme menu', async () => {
+  await check('dark theme applies from the theme menu (one-choice menu: menuitemradio with aria-checked)', async () => {
     await resetSample();
+    await page.click('#btn-theme');
+    const items = await page.evaluate(() => [...document.querySelectorAll('.menu [role]')].map((b) => ({
+      role: b.getAttribute('role'), checked: b.getAttribute('aria-checked'), text: b.textContent.trim(),
+      check: !!b.querySelector('.menu-check svg') && getComputedStyle(b.querySelector('.menu-check')).visibility
+    })));
+    assert.deepEqual(items, [
+      { role: 'menuitemradio', checked: 'false', text: 'System', check: 'hidden' },
+      { role: 'menuitemradio', checked: 'true', text: 'Light', check: 'visible' },
+      { role: 'menuitemradio', checked: 'false', text: 'Dark', check: 'hidden' }
+    ]);
+    assert.equal(await page.evaluate(() => document.activeElement.textContent.trim()), 'Light', 'the current theme has the focus');
+    await page.keyboard.press('Escape');
     await openMenuItem('#btn-theme', 'Dark');
     await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'dark');
     const dark = await page.evaluate(() => ({
@@ -2966,9 +3034,16 @@ async function run() {
     assert.equal(dark.bg, 'rgb(15, 20, 25)');
     assert.equal(dark.scheme, 'dark');
     assert.equal(await page.evaluate(() => GT.store.state.ui.theme), 'dark');
+    await page.click('#btn-theme');
+    assert.equal(await page.locator('.menu [role="menuitemradio"][aria-checked="true"]').innerText(), 'Dark');
+    await page.keyboard.press('Escape');
     await openMenuItem('#btn-theme', 'Light');
     await page.waitForFunction(() => document.documentElement.getAttribute('data-theme') === 'light');
     assert.equal(await page.evaluate(() => getComputedStyle(document.body).backgroundColor), 'rgb(246, 247, 249)');
+    // The Data menu names the backup plainly (no "JSON").
+    await page.click('#btn-data-menu');
+    assert.ok((await page.locator('.menu [role="menuitem"]').allInnerTexts()).includes('Download backup'));
+    await page.keyboard.press('Escape');
   });
 
   await check('backup download and restore round trip', async () => {
@@ -3199,8 +3274,18 @@ async function run() {
     }, BAD, async (p) => {
       assert.equal(await p.evaluate(() => GT.storage.backend()), 'localstorage');
       await p.locator('#banners', { hasText: 'Saved data could not be read' }).waitFor();
+      assert.match(await p.locator('#banners').innerText(), /changes you make now are not saved/);
+      const leaveBefore = await p.evaluate(() => { const ev = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(ev); return ev.defaultPrevented; });
+      assert.equal(leaveBefore, false, 'nothing changed yet: no warning');
       await p.evaluate(() => GT.store.transact('Edit', (c) => { c.title = 'edited'; }));
       await p.evaluate(() => GT.store.flush());
+      assert.equal(await p.evaluate(() => localStorage.getItem('grade-tracker:state')), BAD);
+      // The edit is not saved, and nothing says it is: the status says so and leaving the page warns.
+      assert.equal(await p.evaluate(() => GT.store.saveStatus().phase), 'error');
+      await p.locator('#statusbar', { hasText: 'Saving paused' }).waitFor();
+      assert.equal(await p.locator('#banners', { hasText: 'Could not save to browser storage' }).count(), 0, 'one banner says it');
+      const leaveAfter = await p.evaluate(() => { const ev = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(ev); return ev.defaultPrevented; });
+      assert.equal(leaveAfter, true);
       assert.equal(await p.evaluate(() => localStorage.getItem('grade-tracker:state')), BAD);
       const [download] = await Promise.all([p.waitForEvent('download'), p.click('#banners [data-act="download-raw"]')]);
       const file = path.join(TMP, 'unreadable.json');
@@ -3235,6 +3320,284 @@ async function run() {
       assert.equal(r.status.phase, 'saved', 'save failed: ' + r.status.error);
       assert.equal(r.notes, 2000);
     });
+  });
+
+  await check('after a failed save (storage full), leaving the page warns; once a save works again it does not', async () => {
+    await withLocalStoragePage(null, null, async (p) => {
+      await p.evaluate(() => GT.store.flush());
+      const r = await p.evaluate(async () => {
+        const leaveWarns = () => { const ev = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(ev); return ev.defaultPrevented; };
+        const tick = () => new Promise((res) => setTimeout(res, 50));
+        const out = { before: leaveWarns() };
+        const orig = Storage.prototype.setItem;
+        const origError = console.error;
+        console.error = () => {}; // the expected "Save failed" logs
+        Storage.prototype.setItem = function (k, v) {
+          if (k === 'grade-tracker:state') throw new DOMException('Simulated quota', 'QuotaExceededError');
+          return orig.call(this, k, v);
+        };
+        try {
+          GT.store.transact('Edit', (c) => { c.title = 'not stored'; });
+          await GT.store.flush();
+          out.phase = GT.store.saveStatus().phase;
+          out.failed = leaveWarns(); // the leave flush fails again: the change is not stored
+          await tick();
+        } finally {
+          Storage.prototype.setItem = orig;
+          console.error = origError;
+        }
+        await GT.store.flush(); // storage works again: the retry saves
+        out.after = GT.store.saveStatus().phase;
+        out.ok = leaveWarns();
+        out.title = JSON.parse(localStorage.getItem('grade-tracker:state')).courses[0].title;
+        return out;
+      });
+      assert.deepEqual(r, { before: false, phase: 'error', failed: true, after: 'saved', ok: false, title: 'not stored' });
+    });
+  });
+
+  await check('at 390 px the tab strip keeps the active tab in view (Summary, Import / Export, Grades)', async () => {
+    await resetSample();
+    await page.setViewportSize({ width: 390, height: 800 });
+    try {
+      for (const id of ['summary', 'exchange', 'grades']) {
+        await page.evaluate((v) => GT.app.navigate(v), id);
+        await page.waitForFunction((v) => document.querySelector('#tabs [aria-selected="true"]').getAttribute('data-view') === v, id);
+        await rendered();
+        const box = await page.evaluate(() => {
+          const nav = document.getElementById('tabs').getBoundingClientRect();
+          const t = document.querySelector('#tabs [aria-selected="true"]').getBoundingClientRect();
+          return { navL: nav.left, navR: nav.right, l: t.left, r: t.right, pageX: window.scrollX, wide: document.documentElement.scrollWidth };
+        });
+        assert.ok(box.l >= box.navL - 0.5 && box.r <= box.navR + 0.5, id + ' tab cut off: ' + JSON.stringify(box));
+        assert.equal(box.pageX, 0);
+        assert.ok(box.wide <= 390, 'the page scrolls sideways: ' + box.wide);
+      }
+    } finally {
+      await page.setViewportSize({ width: 1280, height: 860 });
+    }
+  });
+
+  await check('History: a roll call merged into one entry ("3 marks") lists every mark; title "History" and the course subtitle', async () => {
+    await resetSample();
+    const ids = (await studentsByName()).slice(0, 3).map((s) => s.id);
+    const n = await historyCount();
+    await page.evaluate((sids) => {
+      const c = GT.store.course();
+      const ses = c.attendance.sessions[0];
+      const key = 'rollcall:' + ses.id + ':' + Date.now();
+      sids.forEach((sid) => {
+        const cur = (c.attendance.records[sid] || {})[ses.id];
+        const m = cur === 'A' ? 'E' : 'A'; // a real change for each student
+        GT.store.transact('Roll call ' + ses.date, (co) => GT.attendance.setMark(co, sid, ses.id, m), { mergeKey: key });
+      });
+    }, ids);
+    const added = await historySince(n);
+    assert.equal(added.length, 1, 'three marks, one entry');
+    assert.equal(added[0].newValue, '3 marks');
+    assert.equal(added[0].details.length, 3);
+    // One Undo undoes the last mark only.
+    await page.evaluate(() => GT.store.undo());
+    assert.equal((await historySince(n)).length, 2);
+    await page.evaluate(() => GT.store.redo());
+    await gotoView('history');
+    assert.equal(await page.locator('.view-history .page-header h1').innerText(), 'History');
+    assert.equal(await page.locator('.view-history .page-header .sub').innerText(), 'SE 4351 · Requirements Engineering · Fall 2026');
+    assert.ok((await page.locator('.view-history .hist-groups button').allInnerTexts()).some((t) => /^Students & Teams/.test(t)));
+    const row = page.locator('.hist-table tbody tr', { hasText: '3 marks' }).first();
+    await row.locator('details.hist-details > summary').click();
+    assert.match(await row.locator('details.hist-details > summary').innerText(), /Show 3 marks/);
+    assert.equal(await row.locator('details.hist-details li').count(), 3);
+    assert.equal(await row.locator('details.hist-details li .pii').count(), 3);
+    await gotoView('grades');
+  });
+
+  await check('GT.ui.undoAction: a toast\'s Undo acts only while its step is the latest of its course (never another course\'s change)', async () => {
+    await resetSample();
+    const r = await page.evaluate(async () => {
+      const a = GT.store.course();
+      const b = GT.store.state.courses[1];
+      GT.store.transact('Rename A', (c) => { c.title = 'A renamed'; });
+      const act = GT.ui.undoAction(a.id, 'Rename A');
+      GT.store.setActiveCourse(b.id);
+      GT.store.transact('Rename B', (c) => { c.title = 'B renamed'; });
+      document.querySelectorAll('#toasts .toast').forEach((t) => t.remove());
+      act.fn(); // course B is active: refused
+      const warned = [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent).join(' ');
+      const afterRefused = [GT.store.state.courses[0].title, GT.store.state.courses[1].title];
+      GT.store.setActiveCourse(a.id);
+      act.fn(); // its course again, still the latest step: undone
+      return { act: act.label, warned, afterRefused, after: [GT.store.state.courses[0].title, GT.store.state.courses[1].title] };
+    });
+    assert.equal(r.act, 'Undo');
+    assert.match(r.warned, /Not undone/);
+    assert.deepEqual(r.afterRefused, ['A renamed', 'B renamed']);
+    assert.deepEqual(r.after, ['Requirements Engineering', 'B renamed']);
+  });
+
+  await check('a stored ui.activeView of "constructor" (restored backup) opens the first tab; navigate() ignores it', async () => {
+    await resetSample();
+    const r = await page.evaluate(async () => {
+      const raw = GT.model.wrapBackup(GT.model.createDefaultState(), new Date().toISOString());
+      raw.state.ui.activeView = 'constructor';
+      const res = GT.model.readBackup(JSON.parse(JSON.stringify(raw)));
+      GT.store.replaceState(res.state, 'restore');
+      GT.app.navigate('constructor');
+      GT.app.navigate('toString');
+      await new Promise((res2) => requestAnimationFrame(() => requestAnimationFrame(res2)));
+      return { stored: GT.store.state.ui.activeView, tab: document.querySelector('#tabs [aria-selected="true"]').getAttribute('data-view'), failed: !!document.querySelector('#view .callout-danger') };
+    });
+    assert.deepEqual(r, { stored: 'grades', tab: 'grades', failed: false });
+  });
+
+  await check('two tabs: a stale tab cannot overwrite the newer tab, by a UI-only click or by an edit; it turns read-only with Reload and Download, and Reload shows the newer data', async () => {
+    await withTwoTabs(async (open) => {
+      // A hears nothing from the other tab (no BroadcastChannel): only the save's compare-and-swap protects B's work.
+      const A = await open({ noChannel: true });
+      await seedSample(A);
+      const B = await open();
+      const ids = await B.evaluate(() => GT.calc.sortStudents(GT.store.course(), GT.store.results(), 'name', 'asc').map((s) => s.id));
+      const t1 = await B.evaluate(() => [...document.querySelectorAll('.gt-grid thead th.h-raw')]
+        .find((h) => h.querySelector('.h-name').textContent.trim() === 'Test 1').getAttribute('data-c'));
+      await B.locator(`.gt-grid tbody tr[data-sid="${ids[0]}"] td[data-c="${t1}"]`).click();
+      for (const v of ['91', '92', '93']) { await B.keyboard.type(v); await B.keyboard.press('Enter'); }
+      await B.keyboard.press('Escape');
+      await B.evaluate(() => GT.store.flush());
+      assert.equal(await B.evaluate(() => GT.store.saveStatus().phase), 'saved');
+      // In the stale tab A the TA only clicks another tab: that UI-only change is saved through the same check.
+      await A.bringToFront();
+      await A.click('#tab-stats');
+      await A.waitForFunction(() => GT.store.saveStatus().phase === 'conflict');
+      const banner = A.locator('#banners .banner-danger', { hasText: 'changed in another tab' });
+      await banner.waitFor();
+      assert.equal(await banner.locator('[data-act="reload"]').innerText(), 'Reload');
+      assert.match(await banner.locator('[data-act="backup"]').innerText(), /Download this tab.s data/);
+      assert.match(await A.locator('#statusbar').innerText(), /Read-only/);
+      // Read-only: every data change is refused before anything changes; Undo is refused with a toast.
+      const refused = await A.evaluate(() => {
+        const before = JSON.stringify(GT.store.course().scores);
+        let err = null;
+        try { GT.store.transact('Edit', (c) => { c.title = 'from the stale tab'; }); } catch (e) { err = e.conflict === true; }
+        return { err, same: before === JSON.stringify(GT.store.course().scores), title: GT.store.course().title, canUndo: GT.store.canUndo() };
+      });
+      assert.deepEqual(refused, { err: true, same: true, title: 'Requirements Engineering', canUndo: false });
+      await A.focus('#tab-stats');
+      await A.keyboard.press('Control+z');
+      await A.locator('#toasts .toast', { hasText: 'this tab is read-only' }).first().waitFor();
+      let look = await freshLook(open);
+      assert.deepEqual([look.t1[ids[0]], look.t1[ids[1]], look.t1[ids[2]]], [91, 92, 93], 'B\'s scores survive the stale tab');
+      // "Download this tab's data" saves a backup of what A shows; nothing is written to storage.
+      const [dl] = await Promise.all([A.waitForEvent('download'), banner.locator('[data-act="backup"]').click()]);
+      const file = path.join(TMP, 'stale-tab.json');
+      await dl.saveAs(file);
+      const backup = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(backup.state.courses[0].students.length, SAMPLE_STUDENTS);
+      const staleT1 = (backup.state.courses[0].scores[ids[0]] || {}).a_t1;
+      assert.notEqual(staleT1 && staleT1.value, 91, 'the backup holds the stale tab\'s data');
+      // Reload: no "leave this page?" prompt; A then shows B's data and is writable again.
+      await Promise.all([A.waitForEvent('load'), banner.locator('[data-act="reload"]').click()]);
+      await A.waitForFunction(() => window.GT && GT.store && GT.store.state && document.querySelector('#tabs .tab'));
+      assert.equal(await A.evaluate((id) => GT.model.getEntry(GT.store.course().scores, id, 'a_t1').value, ids[0]), 91);
+      assert.equal(await A.locator('#banners', { hasText: 'changed in another tab' }).count(), 0);
+      assert.equal(await A.evaluate(() => GT.store.readOnly()), false);
+
+      // Now B is the stale one (A edits after its reload; B hears nothing because A has no channel). An edit
+      // typed into B's grid is refused when it is saved, and A's newer edit stays.
+      await A.evaluate((id) => {
+        GT.store.transact('Edit Test 1', (c) => GT.model.setEntry(c.scores, id, 'a_t1', { value: 44 }));
+        return GT.store.flush();
+      }, ids[3]);
+      await B.bringToFront();
+      await B.locator(`.gt-grid tbody tr[data-sid="${ids[4]}"] td[data-c="${t1}"]`).click();
+      await B.keyboard.type('55');
+      await B.keyboard.press('Enter');
+      await B.keyboard.press('Escape');
+      await B.waitForFunction(() => GT.store.saveStatus().phase === 'conflict');
+      await B.locator('#banners', { hasText: 'changed in another tab' }).waitFor();
+      look = await freshLook(open);
+      assert.equal(look.t1[ids[3]], 44, 'A\'s newer edit stays');
+      assert.notEqual(look.t1[ids[4]], 55, 'the stale tab\'s edit was not written');
+      assert.deepEqual([look.t1[ids[0]], look.t1[ids[1]], look.t1[ids[2]]], [91, 92, 93]);
+    });
+  });
+
+  await check('two tabs: a "saved" message makes the other tab read-only at once; "goodbye" clears the other-tab banner', async () => {
+    await withTwoTabs(async (open) => {
+      const A = await open();
+      await seedSample(A);
+      const B = await open();
+      await A.locator('#banners', { hasText: 'also open in another tab' }).waitFor();
+      await B.locator('#banners', { hasText: 'also open in another tab' }).waitFor();
+      // B goes away (navigates elsewhere): A's banner disappears.
+      await B.goto('about:blank');
+      await A.waitForFunction(() => !/also open in another tab/.test(document.querySelector('#banners').textContent));
+      // B is back; it saves a change: A (which did nothing) turns read-only without trying to save.
+      await B.goto(APP_URL);
+      await B.waitForFunction(() => window.GT && GT.store && GT.store.state && document.querySelector('#tabs .tab'));
+      await A.locator('#banners', { hasText: 'also open in another tab' }).waitFor();
+      await B.evaluate(() => { GT.store.transact('Edit', (c) => { c.title = 'Saved in B'; }); return GT.store.flush(); });
+      await A.waitForFunction(() => GT.store.saveStatus().phase === 'conflict');
+      await A.locator('#banners .banner-danger', { hasText: 'changed in another tab' }).waitFor();
+      assert.equal(await A.evaluate(() => GT.store.course().title), 'Requirements Engineering', 'A still shows its own (old) data');
+      assert.equal(await B.evaluate(() => GT.store.readOnly()), false);
+      // A UI-only click in A is never saved now; B's data stays.
+      await A.click('#btn-privacy');
+      await A.waitForTimeout(600);
+      const look = await freshLook(open);
+      assert.equal(look.privacy, false);
+      const title = await B.evaluate(() => GT.store.course().title);
+      assert.equal(title, 'Saved in B');
+    });
+  });
+
+  await check('two tabs: Delete all data in one tab, then a theme change or an edit in the other does not bring the data back', async () => {
+    await withTwoTabs(async (open) => {
+      const A = await open();
+      await seedSample(A);
+      const B = await open({ noChannel: true }); // B does not hear about the delete
+      assert.equal(await B.evaluate(() => GT.store.course().students.length), SAMPLE_STUDENTS);
+      await A.bringToFront();
+      await A.click('#btn-data-menu');
+      await A.locator('.menu [role="menuitem"]', { hasText: 'Delete all data' }).click();
+      await A.fill('#del-confirm', 'DELETE');
+      await A.locator('dialog[open] .btn-danger-solid').click();
+      await A.waitForFunction(() => GT.store.state.courses.every((c) => c.students.length === 0));
+      await A.evaluate(() => GT.store.flush());
+      // B only switches the theme from the menu.
+      await B.bringToFront();
+      await B.click('#btn-theme');
+      await B.locator('.menu [role="menuitemradio"]', { hasText: 'Dark' }).click();
+      await B.waitForFunction(() => GT.store.saveStatus().phase === 'conflict');
+      let look = await freshLook(open);
+      assert.equal(look.students, 0, 'the deleted students came back');
+      assert.equal(look.theme, 'light');
+      // An edit in B is refused now too.
+      assert.equal(await B.evaluate(() => { try { GT.store.transact('x', (c) => { c.title = 'x'; }); return 'saved'; } catch (e) { return e.conflict ? 'refused' : e.message; } }), 'refused');
+      look = await freshLook(open);
+      assert.equal(look.students, 0);
+    });
+  });
+
+  await check('leave hooks run before the save when the page goes away: a score typed without Enter survives a reload', async () => {
+    await resetSample();
+    const r = await page.evaluate(() => {
+      let n = 0;
+      const fn = () => { n++; };
+      GT.app.registerLeaveHook(fn);
+      GT.app.registerLeaveHook(fn); // the same function twice: still one call
+      window.dispatchEvent(new Event('pagehide'));
+      return n;
+    });
+    assert.equal(r, 1);
+    await page.evaluate(() => GT.store.flush());
+    const sid = (await studentsByName())[0].id;
+    const c = await gridCol('raw', 'Test 1');
+    await gridCell(sid, c).click();
+    await page.keyboard.type('12');
+    await page.reload();
+    await ready();
+    assert.equal(await page.evaluate((id) => GT.model.getEntry(GT.store.course().scores, id, 'a_t1').value, sid), 12,
+      'the typed score was lost on reload');
   });
 
   await check('delete all data (typed confirmation) empties storage, also after a reload', async () => {

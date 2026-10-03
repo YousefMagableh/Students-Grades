@@ -53,8 +53,6 @@
   /** The summary columns stay pinned on the right only while at least this many session columns remain
    * visible between them and the name columns; otherwise they scroll with the sessions (class sr-static). */
   var MIN_VISIBLE_SESSIONS = 6;
-  /** A mark change touching at most this many cells patches the grid in place instead of rebuilding it. */
-  var PATCH_MAX_CELLS = 60;
 
   var CELL_P = '<td class="m mp">P</td>';
   var CELL_A = '<td class="m ma">A</td>';
@@ -82,8 +80,6 @@
   var drag = null;           // { moved, armed } while the mouse button is down in the grid
   var armedCycle = null;     // the cell a second click cycles
   var invalid = {};          // data-f -> { value, msg }: typed values that were refused (kept across re-renders)
-  var dirtyVersion = 0;      // counts every reason to re-render (store changes, search, preferences)
-  var patchHint = null;      // { version, courseId, cells: [{ sid, ses }] }: the last change was only these marks
   var endHold = null;        // { sid, ses }: a mark just set on the last row; the next P/A/E there is ignored
 
   // ------------------------------------------------------------------ small helpers
@@ -107,7 +103,7 @@
     var code = typeof e.code === 'string' ? e.code : '';
     return code === 'KeyP' ? 'P' : code === 'KeyA' ? 'A' : code === 'KeyE' ? 'E' : '';
   }
-  function markDirty() { dataDirty = true; dirtyVersion++; }
+  function markDirty() { dataDirty = true; }
 
   /** The computer's local calendar date (the "today" the TA sees on the wall clock). */
   function todayIso() {
@@ -119,11 +115,18 @@
     if (!util.isIsoDate(iso)) return str(iso);
     return util.MONTH_SHORT[parseInt(iso.slice(5, 7), 10) - 1] + ' ' + parseInt(iso.slice(8, 10), 10);
   }
+  /** The page subtitle of every view (UX-16): "SE 4351 · Requirements Engineering · Fall 2026". */
+  function courseLine(course) {
+    return [course.code, course.title, course.term].map(function (x) { return str(x).trim(); }).filter(Boolean).join(' · ') || 'Course';
+  }
   function shortDate(iso) { return (wdOf(iso) + ' ' + mdOf(iso)).trim(); }
   function longDate(iso) { return util.isIsoDate(iso) ? shortDate(iso) + ', ' + iso.slice(0, 4) : str(iso); }
   function sesName(s) { return s ? shortDate(s.date) + (s.label ? ' (' + s.label + ')' : '') : ''; }
   function pct(x) { return typeof x === 'number' && isFinite(x) ? util.formatPercent(x, 1) : ''; }
   function studentName(s) { return model.studentName ? model.studentName(s) : (s.lastName || '') + ', ' + (s.firstName || ''); }
+  /** A student in attributes (aria-label, title): the No, never the name. Attributes cannot be blurred in
+   * privacy mode, and the row's name cells next to it already say who it is (CODE-9). */
+  function studentLabel(s) { return 'Student No ' + (s && typeof s.no === 'number' ? s.no : '?'); }
   function byName(a, b) {
     if (GT.calc && GT.calc.compareByName) return GT.calc.compareByName(a, b);
     return util.compareText(a.lastName, b.lastName) || util.compareText(a.firstName, b.firstName);
@@ -235,19 +238,6 @@
     });
   }
 
-  /** Runs one undoable change of marks only, and remembers which cells it touched, so the next render can
-   * patch those cells instead of rebuilding the grid. Returns what tx returns. */
-  function txMarks(label, cells, mutator, opts) {
-    var v0 = dirtyVersion;
-    var clean = !dataDirty; // everything before this change is already on screen
-    var courseId = opts && opts.courseId ? opts.courseId : (GT.store.course() || {}).id;
-    var ret = tx(label, mutator, opts);
-    // Exactly one notification (this transaction) and nothing else: the change was these marks only.
-    patchHint = clean && dirtyVersion === v0 + 1 && cells && cells.length <= PATCH_MAX_CELLS
-      ? { version: dirtyVersion, courseId: courseId, cells: cells } : null;
-    return ret;
-  }
-
   function isActiveView() {
     return !!(boundEl && document.body.contains(boundEl) && GT.store && GT.store.state && GT.store.state.ui.activeView === 'attendance');
   }
@@ -257,6 +247,7 @@
   function render(el, ctx) {
     if (el !== boundEl) bindContainer(el);
     bindGlobal();
+    bindLeaveHook();
     var course = ctx.course;
     if (!course) {
       el.innerHTML = '<div class="empty-state"><h2>No course</h2><p>Add a course from the course menu.</p></div>';
@@ -292,18 +283,13 @@
       needScrollToActive = true;
     }
     if (contentKind === 'per-session') queueSize(); // a banner above may have come or gone
-    var hint = patchHint;
-    patchHint = null;
     if (!rebuilt && !dataDirty && !courseChanged && !ctx.switched && !params) return;
     dataDirty = false;
     try {
       var cs = mode !== 'off' && coreReady() ? read('courseSummary', [course], null) : null;
       updateTop(course, mode, cs);
-      // Only a few marks changed since the last render: patch those cells instead of rebuilding the grid.
-      var patched = !rebuilt && !courseChanged && !ctx.switched && !params && !!hint && hint.version === dirtyVersion &&
-        hint.courseId === course.id && kind === 'per-session' && gridKind === 'grid' && patchGrid(course, cs, hint.cells);
-      if (patched) updateCards(course, kind, cs);
-      else updateContent(course, kind, cs);
+      // The same grid as before (same course, nothing rebuilt): renderGrid patches only the cells that changed.
+      updateContent(course, kind, cs, !rebuilt && !courseChanged);
     } catch (e) {
       logErr(e);
       dom.content.innerHTML = '<div class="callout callout-danger"><strong>Attendance could not be shown.</strong> ' + esc(e && e.message) +
@@ -318,7 +304,7 @@
       setTimeout(function () { gotoCard(params.section); }, 0);
     } else if (needScrollToActive && kind === 'per-session' && gridKind === 'grid') {
       needScrollToActive = false;
-      if (sel.b && gv.rowIdx[sel.b.sid] !== undefined && gv.colIdx[sel.b.ses] !== undefined) ensureVisible(activeTd());
+      if (sel.b && gv.rowIdx[sel.b.sid] !== undefined && gv.colIdx[sel.b.ses] !== undefined) { revealRow(gv.rowIdx[sel.b.sid]); ensureVisible(activeTd()); }
       else jumpToToday(false);
     }
   }
@@ -327,7 +313,6 @@
     if (ui.closeMenu) ui.closeMenu();
     drag = null;
     armedCycle = null;
-    patchHint = null;
     endHold = null;
   }
 
@@ -355,11 +340,31 @@
     el.addEventListener('focusin', onFocusIn);
   }
 
+  /** When the page is closed, reloaded or hidden, a number typed in a threshold, rule or totals field is
+   * saved the way leaving the field saves it (E2E-4; see GT.app.registerLeaveHook). */
+  function commitOnLeave() {
+    var t = document.activeElement;
+    if (!boundEl || !t || !document.body.contains(boundEl) || !boundEl.contains(t) || t.tagName !== 'INPUT') return;
+    var f = t.getAttribute('data-f');
+    if (!f || f === 'search' || t.type === 'checkbox' || t.value === t.defaultValue) return;
+    if (f === 'held') commitHeld(t);
+    else if (f.indexOf('t:') === 0) commitTotal(t);
+    else commitSetting(t);
+  }
+  var leaveHookBound = false;
+  function bindLeaveHook() {
+    if (leaveHookBound || !(GT.app && typeof GT.app.registerLeaveHook === 'function')) return;
+    GT.app.registerLeaveHook(commitOnLeave);
+    leaveHookBound = true;
+  }
+
   function bindGlobal() {
     if (globalBound) return;
     globalBound = true;
     document.addEventListener('mouseup', function () { if (drag) drag = null; });
     root.addEventListener('resize', function () { if (isActiveView()) sizeWrap(); });
+    root.addEventListener('beforeprint', onBeforePrint);
+    root.addEventListener('afterprint', onAfterPrint);
     document.addEventListener('keydown', function (e) {
       if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
       if (!isActiveView() || ui.isTypingTarget(e.target) || document.querySelector('dialog[open]')) return;
@@ -378,13 +383,13 @@
     }).join('');
     el.innerHTML =
       '<div class="page-header att-head">' +
-        '<div class="att-head-text"><h1 class="att-title"><span class="att-code"></span><span class="att-title-sub">Attendance</span></h1>' +
-        '<div class="sub att-sub"></div></div>' +
+        '<div class="att-head-text"><h1 class="att-title">Attendance</h1>' +
+        '<div class="sub att-course"></div><div class="sub att-sub"></div></div>' +
         '<div class="att-modes" role="group" aria-label="Attendance mode">' + modes + '</div>' +
       '</div>' +
       '<div class="att-content"></div>';
     dom = {
-      code: el.querySelector('.att-code'),
+      course: el.querySelector('.att-course'),
       sub: el.querySelector('.att-sub'),
       modes: el.querySelector('.att-modes'),
       content: el.querySelector('.att-content')
@@ -478,7 +483,8 @@
   // ------------------------------------------------------------------ header (course, mode)
 
   function updateTop(course, mode, cs) {
-    dom.code.textContent = course.code || 'Course';
+    var line = courseLine(course);
+    if (dom.course.textContent !== line) dom.course.textContent = line;
     ui.$$('.att-mode', dom.modes).forEach(function (b) {
       b.setAttribute('aria-pressed', b.getAttribute('data-mode') === mode ? 'true' : 'false');
     });
@@ -506,7 +512,7 @@
 
   // ------------------------------------------------------------------ content
 
-  function updateContent(course, kind, cs) {
+  function updateContent(course, kind, cs, allowPatch) {
     if (kind === 'off') { renderOff(course); return; }
     if (kind === 'nocore') return;
     var p = getPrefs();
@@ -516,14 +522,14 @@
       wbtn.title = p.showWithdrawn ? 'Withdrawn students are shown greyed out. Click to hide them.' : 'Withdrawn students are hidden. Click to show them.';
     }
     cs = cs || read('courseSummary', [course], null) || { byStudent: {}, warnings: [] };
-    if (kind === 'per-session') renderPerSession(course, cs, p);
+    if (kind === 'per-session') renderPerSession(course, cs, p, allowPatch);
     else renderTotals(course, cs, p);
     updateCards(course, kind, cs);
   }
 
   function updateCards(course, kind, cs) {
     cs = cs || { byStudent: {}, warnings: [] };
-    setHtmlKeep(dom.warnCard, warningsCardHtml(course, cs, kind));
+    updateWarnCard(dom.warnCard, warningsParts(course, cs, kind));
     setHtmlKeep(dom.setCard, settingsCardHtml(course, kind));
     restoreInvalid(dom.setCard);
   }
@@ -572,7 +578,7 @@
 
   // ------------------------------------------------------------------ per-session mode: the grid
 
-  function renderPerSession(course, cs, p) {
+  function renderPerSession(course, cs, p, allowPatch) {
     var students = course.students;
     var sessions = sessionsOf(course);
     var want = !students.length ? 'nostudents' : !sessions.length ? 'nosessions' : 'grid';
@@ -582,6 +588,7 @@
         dom.gridHost.innerHTML = '<div class="att-wrap"><table class="att-grid" role="grid" tabindex="0" aria-label="Attendance marks: rows are students, columns are class sessions">' +
           '<thead></thead><tbody></tbody><tfoot></tfoot></table></div>';
         dom.wrap = dom.gridHost.querySelector('.att-wrap');
+        dom.wrap.addEventListener('scroll', onGridScroll, { passive: true });
         dom.table = dom.gridHost.querySelector('.att-grid');
         dom.thead = dom.table.tHead;
         dom.tbody = dom.table.tBodies[0];
@@ -603,8 +610,8 @@
     dom.count.textContent = countText(course, rows.length, p);
     var sb = dom.content.querySelector('[data-act="summary-cols"]');
     if (sb) sb.setAttribute('aria-pressed', p.summary ? 'true' : 'false');
-    if (want !== 'grid') { gv = { rows: [], sessions: [], rowIdx: {}, colIdx: {}, byId: {}, held: {}, counts: [] }; return; }
-    renderGrid(course, cs, rows, sessions, p);
+    if (want !== 'grid') { gv = { rows: [], sessions: [], rowIdx: {}, colIdx: {}, byId: {}, held: {}, counts: [], win: null }; shown = null; return; }
+    renderGrid(course, cs, rows, sessions, p, !!allowPatch);
   }
 
   function heldMap(course) {
@@ -613,9 +620,140 @@
     return held;
   }
 
-  function renderGrid(course, cs, rows, sessions, p) {
+  /** What the grid shows, by row and column (filled by every full build, kept current by every patch), so a
+   * data change patches only what differs: the changed mark cells, those students' summary cells and row
+   * class, and the changed sessions' header and footer counts. Rows (search, filter, students and their
+   * names or status), sessions (dates, labels, today), thresholds and the summary toggle rebuild the grid. */
+  var shown = null;
+  var PATCH_MIN_CELLS = 600; // a patch may touch this many mark cells (or a quarter of the grid) before a rebuild is faster
+
+  function markCode(m, isHeld) { return m === 'P' || m === 'A' || m === 'E' ? m : isHeld ? '.' : 'u'; }
+  function codeCell(code) { return code === 'P' ? CELL_P : code === 'A' ? CELL_A : code === 'E' ? CELL_E : code === '.' ? '<td></td>' : '<td class="u"></td>'; }
+  function paintCode(td, code) {
+    if (code === 'P' || code === 'A' || code === 'E') {
+      td.className = 'm m' + code.toLowerCase();
+      td.textContent = code;
+      return;
+    }
+    if (td.firstChild) td.textContent = '';
+    if (code === 'u') td.className = 'u';
+    else td.removeAttribute('class'); // the "not recorded" dot (css :not([class]))
+  }
+
+  // ------------------------------------------------------------------ large classes: only the rows near the view
+
+  /** More rows than this: only the rows near the visible part of the grid are in the DOM (gv.win, rows w0 to
+   * w1 - 1), between two spacer rows of the same total height, so the scroll bar and every position stay
+   * true. A 300 x 47 table of sticky cells costs about 40 ms of layout, paint and compositing per change;
+   * a window of about 75 rows keeps marking under 60 ms. The real classes (59 and 10 students) render every
+   * row, and so does printing. */
+  var VIRT_MIN_ROWS = 120;
+  var WIN_PAD = 30;          // rows rendered above and below the visible ones
+  var WIN_EDGE = 10;         // move the window when the visible rows come this close to one of its ends
+  var rowH = 31;             // height of a body row in px (measured after each full build)
+  var printing = false;
+  var scrollQueued = false;
+
+  /** The <tr> of row r (index in gv.rows), or null when it is outside the rendered window. */
+  function rowEl(r) {
+    if (!dom || !dom.tbody || r === undefined || r === null || r < 0) return null;
+    var w = gv.win;
+    if (!w) return dom.tbody.rows[r] || null;
+    return r >= w.w0 && r < w.w1 ? dom.tbody.rows[r - w.w0 + 1] || null : null; // + 1: the top spacer row
+  }
+  /** The rows in view (approximate: the window's margin covers the sticky header and footer). */
+  function visibleRows(scroll) {
+    var top = scroll ? scroll.top : 0, h = scroll && scroll.h ? scroll.h : 600;
+    return { first: Math.max(0, Math.floor(top / rowH) - 2), last: Math.ceil((top + h) / rowH) };
+  }
+  function scrollState() { return dom && dom.wrap ? { top: dom.wrap.scrollTop, h: dom.wrap.clientHeight } : null; }
+  function pickWindow(n, v) {
+    var first = Math.max(0, Math.min(n - 1, v.first));
+    var last = Math.max(first, Math.min(n - 1, v.last));
+    return { w0: Math.max(0, first - WIN_PAD), w1: Math.min(n, last + 1 + WIN_PAD) };
+  }
+  function padRow(nRows, cols) {
+    return '<tr class="att-pad" aria-hidden="true"><td class="att-pad-cell" colspan="' + cols + '" style="height:' + Math.round(nRows * rowH) + 'px"></td></tr>';
+  }
+  function rowHtml(r, data, S) {
+    var st = gv.rows[r], c = data.codes[r];
+    var h = '<tr data-sid="' + esc(st.id) + '"' + (data.rcls[r] ? ' class="' + data.rcls[r] + '"' : '') + '>' +
+      '<td class="sc sc1 c-no">' + esc(str(st.no)) + '</td>' +
+      '<td class="sc sc2 c-last"><span class="pii">' + esc(st.lastName) + '</span></td>' +
+      '<td class="sc sc3 c-first"><span class="pii">' + esc(st.firstName) + '</span>' + (st.status === 'withdrawn' ? '<span class="badge wd-badge">Withdrawn</span>' : '') + '</td>';
+    for (var j = 0; j < S; j++) h += codeCell(c.charAt(j));
+    if (data.summaryOn) h += summaryCellsHtml(data.sums[r]);
+    return h + '</tr>';
+  }
+  /** The body rows of the window (or of every row) from the grid data `data` (shown, or the next one). */
+  function bodyHtml(data) {
+    var S = gv.sessions.length, n = gv.rows.length;
+    var cols = FIRST + S + (data.summaryOn ? SUMMARY_KEYS.length : 0);
+    if (!n) return '<tr class="no-rows"><td colspan="' + cols + '"><div class="no-rows-msg">No student matches the search.</div></td></tr>';
+    var w = gv.win, r0 = w ? w.w0 : 0, r1 = w ? w.w1 : n;
+    var parts = [];
+    if (w) parts.push(padRow(r0, cols));
+    for (var r = r0; r < r1; r++) parts.push(rowHtml(r, data, S));
+    if (w) parts.push(padRow(n - r1, cols));
+    return parts.join('');
+  }
+  /** Renders another window of rows (from the data on screen) and decorates the selection again. */
+  function setWindow(w) {
+    if (!gv.win || !shown || !dom || !dom.tbody) return;
+    if (w.w0 === gv.win.w0 && w.w1 === gv.win.w1) return;
+    undecorate();
+    gv.win = w;
+    dom.tbody.innerHTML = bodyHtml(shown);
+    decorate();
+  }
+  /** Makes sure row r is rendered (keyboard moves, jumps): the window moves to it. */
+  function revealRow(r) {
+    var w = gv.win;
+    if (!w || r === undefined || (r >= w.w0 && r < w.w1)) return;
+    setWindow(pickWindow(gv.rows.length, { first: r, last: r }));
+  }
+  /** After a full build: the real row height (zoom, fonts), so the spacers stay exact. */
+  function measureRows() {
+    var w = gv.win;
+    if (!w || w.w1 - w.w0 < 2) return;
+    var a = rowEl(w.w0), b = rowEl(w.w1 - 1);
+    if (!a || !b) return;
+    var h = (b.offsetTop - a.offsetTop) / (w.w1 - 1 - w.w0);
+    if (!(h > 5) || Math.abs(h - rowH) < 0.2) return;
+    rowH = h;
+    var pads = dom.tbody.querySelectorAll('tr.att-pad > td');
+    if (pads.length === 2) {
+      pads[0].style.height = Math.round(w.w0 * rowH) + 'px';
+      pads[1].style.height = Math.round((gv.rows.length - w.w1) * rowH) + 'px';
+    }
+  }
+  function onGridScroll() {
+    if (!gv.win || scrollQueued) return;
+    scrollQueued = true;
+    (root.requestAnimationFrame || setTimeout)(function () {
+      scrollQueued = false;
+      var w = gv.win, n = gv.rows.length;
+      if (!w || printing || !dom || !dom.wrap) return;
+      var v = visibleRows(scrollState());
+      if ((v.first < w.w0 + WIN_EDGE && w.w0 > 0) || (v.last > w.w1 - WIN_EDGE && w.w1 < n)) setWindow(pickWindow(n, v));
+    });
+  }
+  /** Printing shows every row; afterwards the window comes back. */
+  function onBeforePrint() {
+    if (!gv.win || !isActiveView()) return;
+    printing = true;
+    setWindow({ w0: 0, w1: gv.rows.length });
+  }
+  function onAfterPrint() {
+    if (!printing) return;
+    printing = false;
+    if (gv.win) setWindow(pickWindow(gv.rows.length, visibleRows(scrollState())));
+  }
+
+  function renderGrid(course, cs, rows, sessions, p, allowPatch) {
     var t0 = now();
     var hostW = dom.gridHost ? dom.gridHost.clientWidth : 0; // read before any write (no forced layout)
+    var scroll = rows.length > VIRT_MIN_ROWS ? scrollState() : null;
     var held = heldMap(course);
     var byId = {};
     course.students.forEach(function (s) { byId[s.id] = s; });
@@ -624,7 +762,7 @@
     sessions.forEach(function (s, j) { colIdx[s.id] = j; });
     var counts = sessions.map(function (s) { return held[s.id] ? read('sessionCounts', [course, s.id], null) : null; });
     var oldRowIdx = gv.rowIdx || {}, oldColIdx = gv.colIdx || {};
-    gv = { rows: rows, sessions: sessions, rowIdx: rowIdx, colIdx: colIdx, byId: byId, held: held, counts: counts };
+    gv = { rows: rows, sessions: sessions, rowIdx: rowIdx, colIdx: colIdx, byId: byId, held: held, counts: counts, win: gv.win || null };
 
     // The active cell's student or session is gone (deleted, or filtered out by the search): stay on the
     // nearest remaining row and column, so the next key still marks a cell and the TA keeps their place.
@@ -640,110 +778,147 @@
 
     var today = todayIso();
     var summaryOn = p.summary;
-    dom.table.classList.toggle('no-summary', !summaryOn);
-    applyPinning(hostW, summaryOn);
-    var width = LEFT_W + sessions.length * W.ses + (summaryOn ? SUMMARY_W : 0);
-    dom.table.style.width = width + 'px';
-    setHtml(dom.thead, headHtml(course, sessions, held, counts, today));
-
-    // Body: one string (59 x 26 cells in a few ms).
-    var tb = now();
-    var rec = recordsOf(course);
-    var S = sessions.length;
-    var ids = new Array(S), blank = new Array(S);
-    for (var j = 0; j < S; j++) {
-      ids[j] = sessions[j].id;
-      blank[j] = held[ids[j]] ? '<td></td>' : '<td class="u"></td>';
-    }
     var thr = thresholdOf(course), tthr = totalThresholdOf(course);
+    var heads = sesHeads(course, sessions, held, counts, today);
+    var S = sessions.length;
+    var ids = new Array(S);
+    for (var j = 0; j < S; j++) ids[j] = sessions[j].id;
+    var next = {
+      table: dom.table,
+      rowKey: rows.map(function (s) { return s.id; }).join('\n'),
+      sesKey: ids.join('\n'),
+      staticKey: [summaryOn ? 1 : 0, thr, tthr, dropOf(course), failOf(course)].join('|') + '|' + heads.map(function (h) { return h.key; }).join('\u0003'),
+      summaryOn: summaryOn,
+      idents: new Array(rows.length), codes: new Array(rows.length), rcls: new Array(rows.length),
+      sums: new Array(rows.length), sumKeys: new Array(rows.length), heads: heads, foot: null
+    };
+
+    // Per row: what the identity cells, the marks and the summary cells show.
+    var rec = recordsOf(course);
     var byStudent = cs && util.isPlainObject(cs.byStudent) ? cs.byStudent : {};
-    var parts = new Array(rows.length);
     for (var r = 0; r < rows.length; r++) {
       var s = rows[r];
       var sm = util.hasOwn(byStudent, s.id) ? byStudent[s.id] : read('summary', [course, s.id], null);
       var wd = s.status === 'withdrawn';
-      var rcls = rowClass(s, sm);
-      var h = '<tr data-sid="' + esc(s.id) + '"' + (rcls ? ' class="' + rcls + '"' : '') + '>' +
-        '<td class="sc sc1 c-no">' + esc(str(s.no)) + '</td>' +
-        '<td class="sc sc2 c-last"><span class="pii">' + esc(s.lastName) + '</span></td>' +
-        '<td class="sc sc3 c-first"><span class="pii">' + esc(s.firstName) + '</span>' + (wd ? '<span class="badge wd-badge">Withdrawn</span>' : '') + '</td>';
       var row = util.hasOwn(rec, s.id) ? rec[s.id] : null;
-      for (j = 0; j < S; j++) {
-        var m = row && util.hasOwn(row, ids[j]) ? row[ids[j]] : '';
-        h += m === 'P' ? CELL_P : m === 'A' ? CELL_A : m === 'E' ? CELL_E : blank[j];
+      var code = '';
+      for (j = 0; j < S; j++) code += markCode(row && util.hasOwn(row, ids[j]) ? row[ids[j]] : '', !!held[ids[j]]);
+      next.idents[r] = str(s.no) + '\u0001' + str(s.lastName) + '\u0001' + str(s.firstName) + '\u0001' + (wd ? 'w' : '');
+      next.codes[r] = code;
+      next.rcls[r] = rowClass(s, sm);
+      if (summaryOn) {
+        next.sums[r] = summaryData(sm, thr, tthr, wd);
+        next.sumKeys[r] = summaryKey(next.sums[r]);
       }
-      if (summaryOn) h += summaryCells(sm, thr, tthr, wd);
-      parts[r] = h + '</tr>';
     }
-    dom.tbody.innerHTML = parts.join('') ||
-      '<tr class="no-rows"><td colspan="' + (FIRST + S + (summaryOn ? SUMMARY_KEYS.length : 0)) + '"><div class="no-rows-msg">No student matches the search.</div></td></tr>';
-    var bodyMs = now() - tb;
-    setHtml(dom.tfoot, footHtml(sessions, held, counts, summaryOn));
-    // decorate() first clears the previous decoration, including a header cell that survived because the
-    // header markup did not change (otherwise two session dates end up highlighted).
-    decorate();
+    next.foot = FOOT_ROWS.map(function (d, k) { return counts.map(function (c) { return footCell(c, k); }); });
+
+    dom.table.classList.toggle('no-summary', !summaryOn);
+    applyPinning(hostW, summaryOn);
+    var width = (LEFT_W + S * W.ses + (summaryOn ? SUMMARY_W : 0)) + 'px';
+    if (dom.table.style.width !== width) dom.table.style.width = width;
+
+    var tb = now();
+    if (allowPatch && canPatch(next, rows.length)) {
+      patchGrid(next, S);
+    } else {
+      undecorate(); // its cells are about to be replaced
+      setHtml(dom.thead, headHtml(course, sessions, heads));
+      if (rows.length > VIRT_MIN_ROWS && !printing) {
+        // A large class: the rows around the active cell when it is to be shown, else around the scroll position.
+        var ar = needScrollToActive && sel.b ? rowIdx[sel.b.sid] : undefined;
+        gv.win = pickWindow(rows.length, ar !== undefined ? { first: ar, last: ar } : visibleRows(scroll));
+      } else {
+        gv.win = null;
+      }
+      dom.tbody.innerHTML = bodyHtml(next);
+      setHtml(dom.tfoot, footHtml(sessions, held, counts, summaryOn));
+      measureRows();
+      // decorate() first clears the previous decoration, including a header cell that survived because the
+      // header markup did not change (otherwise two session dates end up highlighted).
+      decorate();
+    }
+    shown = next;
+    lastRenderMs = now() - tb;
     queueSize();
-    lastRenderMs = bodyMs;
     gv.renderMs = now() - t0;
   }
 
-  /** Patches a mark-only change in place: the changed cells, their rows' summary cells and warning stripe,
-   * and the header and footer counts. Much cheaper than rebuilding every row (no full table layout), so
-   * typing P, A, E stays instant. Returns false when a full rebuild is needed instead: a session became
-   * held or not held (every blank cell of that column changes), or the grid no longer matches. */
-  function patchGrid(course, cs, cells) {
-    if (!dom || !dom.table || !dom.tbody || !cells || !cells.length) return false;
-    var sessions = sessionsOf(course);
-    if (sessions.length !== gv.sessions.length) return false;
-    for (var j = 0; j < sessions.length; j++) if (!sessions[j] || sessions[j].id !== gv.sessions[j].id) return false;
-    var held = heldMap(course);
-    var hk = Object.keys(held);
-    if (hk.length !== Object.keys(gv.held).length || hk.some(function (id) { return !gv.held[id]; })) return false;
-    var i, x, r, c;
-    for (i = 0; i < cells.length; i++) {
-      x = cells[i];
-      if (gv.colIdx[x.ses] === undefined) return false;
-      r = gv.rowIdx[x.sid];
-      if (r !== undefined && (!dom.tbody.rows[r] || dom.tbody.rows[r].getAttribute('data-sid') !== x.sid)) return false;
+  /** Whether the grid on screen has the same rows, sessions and settings as `next` (so patching is enough),
+   * and the change is small enough for a patch to be faster than a rebuild. */
+  function canPatch(next, nRows) {
+    var old = shown;
+    if (!old || old.table !== next.table || !dom.tbody || !dom.thead || !dom.tfoot) return false;
+    if (old.rowKey !== next.rowKey || old.sesKey !== next.sesKey || old.staticKey !== next.staticKey) return false;
+    var w = gv.win;
+    if (!nRows || !!w !== (nRows > VIRT_MIN_ROWS && !printing)) return false;
+    if (dom.tbody.rows.length !== (w ? w.w1 - w.w0 + 2 : nRows) || !dom.thead.rows[0] || dom.tfoot.rows.length !== FOOT_ROWS.length) return false;
+    var changed = 0, S = next.heads.length;
+    var limit = Math.max(PATCH_MIN_CELLS, (nRows * S) / 4);
+    for (var r = 0; r < nRows; r++) {
+      if (old.idents[r] !== next.idents[r]) return false; // a name, No or status changed: rebuild that rarely
+      var a = old.codes[r], b = next.codes[r];
+      if (a === b) continue;
+      for (var j = 0; j < S; j++) if (a.charCodeAt(j) !== b.charCodeAt(j)) changed++;
+      if (changed > limit) return false;
     }
-    var p = getPrefs();
-    var byStudent = cs && util.isPlainObject(cs.byStudent) ? cs.byStudent : {};
-    var thr = thresholdOf(course), tthr = totalThresholdOf(course);
-    var rowsDone = {}, colsDone = {};
-    undecorate();
-    for (i = 0; i < cells.length; i++) {
-      x = cells[i];
-      c = gv.colIdx[x.ses];
-      colsDone[c] = true;
-      r = gv.rowIdx[x.sid];
-      if (r === undefined) continue; // not shown (search, or withdrawn hidden): only the counts change
-      var td = dom.tbody.rows[r].cells[FIRST + c];
-      if (!td) continue;
-      var m = markAt(course, x.sid, x.ses);
-      td.textContent = m;
-      if (m) td.className = 'm m' + m.toLowerCase();
-      else if (held[x.ses]) td.removeAttribute('class'); // the "not recorded" dot (css :not([class]))
-      else td.className = 'u';
-      rowsDone[r] = true;
-    }
-    Object.keys(rowsDone).forEach(function (k) {
-      var s = gv.rows[+k];
-      var row = dom.tbody.rows[+k];
-      var sm = util.hasOwn(byStudent, s.id) ? byStudent[s.id] : read('summary', [course, s.id], null);
-      var rc = rowClass(s, sm);
-      if (rc) row.className = rc; else row.removeAttribute('class');
-      if (!p.summary) return;
-      ui.$$('td.sr', row).forEach(function (cell) { row.removeChild(cell); });
-      row.insertAdjacentHTML('beforeend', summaryCells(sm, thr, tthr, s.status === 'withdrawn'));
-    });
-    Object.keys(colsDone).forEach(function (k) {
-      var ses = gv.sessions[+k];
-      gv.counts[+k] = held[ses.id] ? read('sessionCounts', [course, ses.id], null) : null;
-    });
-    setHtml(dom.thead, headHtml(course, gv.sessions, held, gv.counts, todayIso()));
-    setHtml(dom.tfoot, footHtml(gv.sessions, held, gv.counts, p.summary));
-    decorate();
     return true;
+  }
+
+  /** Writes only what differs between the grid on screen (shown) and `next` into the existing cells, so the
+   * table keeps its layout and its sticky cells (no rebuild of 300 x 47 cells for one mark). */
+  function patchGrid(next, S) {
+    var old = shown;
+    undecorate();
+    var w = gv.win, r0 = w ? w.w0 : 0, r1 = w ? w.w1 : next.codes.length;
+    for (var r = r0; r < r1; r++) {
+      var tr = rowEl(r);
+      if (!tr) continue;
+      var a = old.codes[r], b = next.codes[r];
+      if (a !== b) {
+        for (var j = 0; j < S; j++) if (a.charCodeAt(j) !== b.charCodeAt(j)) paintCode(tr.cells[FIRST + j], b.charAt(j));
+      }
+      if (old.rcls[r] !== next.rcls[r]) {
+        if (next.rcls[r]) tr.className = next.rcls[r]; else tr.removeAttribute('class');
+      }
+      if (next.sums[r] && old.sumKeys[r] !== next.sumKeys[r]) {
+        var od = old.sums[r] || [];
+        next.sums[r].forEach(function (x, k) {
+          var cell = tr.cells[FIRST + S + k];
+          var o = od[k] || {};
+          if (!cell) return;
+          if (o.cls !== x.cls) cell.className = x.cls;
+          if (o.title !== x.title) { if (x.title) cell.title = x.title; else cell.removeAttribute('title'); }
+          if (o.html !== x.html) cell.innerHTML = x.html;
+        });
+      }
+    }
+    var hr = dom.thead.rows[0];
+    next.heads.forEach(function (x, j) {
+      var o = old.heads[j];
+      if (o.cls === x.cls && o.title === x.title && o.aria === x.aria) return;
+      var th = hr.cells[FIRST + j];
+      var btn = th ? th.querySelector('.ses-btn') : null;
+      if (!btn) return;
+      if (o.cls !== x.cls) th.className = x.cls;
+      if (o.title !== x.title) btn.title = x.title;
+      if (o.aria !== x.aria) btn.setAttribute('aria-label', x.aria);
+    });
+    next.foot.forEach(function (list, k) {
+      var fr = dom.tfoot.rows[k];
+      list.forEach(function (x, j) {
+        var o = old.foot[k][j];
+        if (o.cls === x.cls && o.text === x.text) return;
+        var td = fr.cells[1 + j];
+        if (!td) return;
+        if (o.cls !== x.cls) td.className = x.cls;
+        if (o.text !== x.text) td.textContent = x.text;
+      });
+    });
+    // The header and footer markup cached by setHtml no longer matches the patched cells.
+    dom.thead.__attHtml = null;
+    dom.tfoot.__attHtml = null;
+    decorate();
   }
 
   /** The row's classes: withdrawn (muted, never a warning: warnings cover active students only), or the
@@ -765,21 +940,33 @@
     if (dom.narrowNote) dom.narrowNote.hidden = !unpin;
   }
 
-  function headHtml(course, sessions, held, counts, today) {
-    var h = '<tr><th scope="col" class="sc sc1 c-no">No</th><th scope="col" class="sc sc2 c-last">Last name</th>' +
-      '<th scope="col" class="sc sc3 c-first">First name</th>';
+  /** What a session's header cell shows. key: the parts only a full rebuild changes (date, label, today);
+   * cls, title and aria change with the marks and are patched in place (see patchGrid). */
+  function sesHead(s, isHeld, cnt, nMarks, active, today) {
+    var marked = cnt ? whole(cnt.present) + whole(cnt.absent) + whole(cnt.excused) : 0;
+    return {
+      key: s.date + '\u0001' + (s.label || '') + '\u0001' + (s.date === today ? '1' : ''),
+      cls: 'ses' + (isHeld ? '' : ' unheld') + (s.date === today ? ' today' : ''),
+      title: longDate(s.date) + (s.label ? ' · ' + s.label : '') + '\n' +
+        (isHeld ? marked + ' of ' + active + ' active students marked' : 'Not held yet: nobody has a mark') +
+        (s.date === today ? '\nToday' : '') + '\nClick for options: mark everyone present, edit, delete.',
+      aria: longDate(s.date) + (s.label ? ', ' + s.label : '') + (isHeld ? '' : ', not held yet') + ', ' + plural(nMarks || 0, 'mark') + '. Session options'
+    };
+  }
+  function sesHeads(course, sessions, held, counts, today) {
     var marks = marksPerSession(course);
     var active = course.students.filter(function (s) { return s.status !== 'withdrawn'; }).length;
+    return sessions.map(function (s, j) { return sesHead(s, !!held[s.id], counts[j], marks[s.id], active, today); });
+  }
+
+  function headHtml(course, sessions, heads) {
+    var h = '<tr><th scope="col" class="sc sc1 c-no">No</th><th scope="col" class="sc sc2 c-last">Last Name</th>' +
+      '<th scope="col" class="sc sc3 c-first">First Name</th>';
     sessions.forEach(function (s, j) {
-      var isHeld = !!held[s.id];
-      var cnt = counts[j];
-      var marked = cnt ? whole(cnt.present) + whole(cnt.absent) + whole(cnt.excused) : 0;
-      var title = longDate(s.date) + (s.label ? ' · ' + s.label : '') + '\n' +
-        (isHeld ? marked + ' of ' + active + ' active students marked' : 'Not held yet: nobody has a mark') +
-        (s.date === today ? '\nToday' : '') + '\nClick for options: mark everyone present, edit, delete.';
-      h += '<th scope="col" class="ses' + (isHeld ? '' : ' unheld') + (s.date === today ? ' today' : '') + '">' +
-        '<button type="button" class="ses-btn" tabindex="-1" data-act="ses-menu" data-ses="' + esc(s.id) + '" aria-haspopup="menu" title="' + esc(title) + '"' +
-        ' aria-label="' + esc(longDate(s.date) + (s.label ? ', ' + s.label : '') + (isHeld ? '' : ', not held yet') + ', ' + plural(marks[s.id] || 0, 'mark') + '. Session options') + '">' +
+      var x = heads[j];
+      h += '<th scope="col" class="' + x.cls + '">' +
+        '<button type="button" class="ses-btn" tabindex="-1" data-act="ses-menu" data-ses="' + esc(s.id) + '" aria-haspopup="menu" title="' + esc(x.title) + '"' +
+        ' aria-label="' + esc(x.aria) + '">' +
         '<span class="s-wd">' + esc(wdOf(s.date)) + '</span><span class="s-md">' + esc(mdOf(s.date)) + '</span>' +
         (s.label ? '<span class="s-lb">' + esc(s.label) + '</span>' : '') + '</button></th>';
     });
@@ -798,24 +985,35 @@
 
   /** The 7 summary cells of a row. A withdrawn student gets the numbers but no warning (no chip, no
    * threshold highlight): warnings cover active students only, like the warnings list. */
-  function summaryCells(sm, thr, tthr, withdrawn) {
-    if (!sm) return '<td class="sr sr-exc num"></td><td class="sr sr-unx num"></td><td class="sr sr-tot num"></td><td class="sr sr-arate num"></td>' +
-      '<td class="sr sr-urate num"></td><td class="sr sr-streak num"></td><td class="sr sr-warn"></td>';
+  function summaryCellsHtml(data) {
+    return data.map(function (x) {
+      return '<td class="' + x.cls + '"' + (x.title ? ' title="' + esc(x.title) + '"' : '') + '>' + x.html + '</td>';
+    }).join('');
+  }
+  /** The 7 summary cells as data ({ cls, title, html }), so a re-render can patch only the cells that changed. */
+  function summaryData(sm, thr, tthr, withdrawn) {
+    if (!sm) {
+      return SUMMARY_KEYS.map(function (k) { return { cls: 'sr sr-' + k + (k === 'warn' ? '' : ' num'), title: '', html: '' }; });
+    }
     var rec = whole(sm.recorded);
     var of = ' of ' + plural(rec, 'recorded session');
     var unx = whole(sm.unexcused), tot = whole(sm.totalAbsences), streak = whole(sm.longestStreak);
     var over = !withdrawn && !!sm.overThreshold, overT = !withdrawn && !!sm.overTotalThreshold;
-    var h = '<td class="sr sr-exc num' + (sm.excused ? '' : ' zero') + '">' + whole(sm.excused) + '</td>' +
-      '<td class="sr sr-unx num' + (over ? ' over' : unx ? '' : ' zero') + '"' +
-        (over ? ' title="Above the unexcused-absence threshold (' + thr + ')"' : '') + '>' + unx + '</td>' +
-      '<td class="sr sr-tot num' + (overT ? ' over' : tot ? '' : ' zero') + '"' +
-        (overT ? ' title="Above the total-absence threshold (' + tthr + ')"' : '') + '>' + tot + '</td>' +
-      '<td class="sr sr-arate num" title="' + tot + of + '">' + (pct(sm.absenceRate) || '<span class="faint">—</span>') + '</td>' +
-      '<td class="sr sr-urate num" title="' + unx + of + '">' + (pct(sm.unexcusedRate) || '<span class="faint">—</span>') + '</td>' +
-      '<td class="sr sr-streak num' + (streak >= 2 ? '' : ' zero') + '">' + streak + '</td>' +
-      '<td class="sr sr-warn">' + (!withdrawn ? warnChip(sm) : sm.warning || sm.overThreshold || sm.overTotalThreshold
-        ? '<span class="faint small" title="Warnings cover active students only">withdrawn: no warning</span>' : '') + '</td>';
-    return h;
+    return [
+      { cls: 'sr sr-exc num' + (sm.excused ? '' : ' zero'), title: '', html: String(whole(sm.excused)) },
+      { cls: 'sr sr-unx num' + (over ? ' over' : unx ? '' : ' zero'), title: over ? 'Above the unexcused-absence threshold (' + thr + ')' : '', html: String(unx) },
+      { cls: 'sr sr-tot num' + (overT ? ' over' : tot ? '' : ' zero'), title: overT ? 'Above the total-absence threshold (' + tthr + ')' : '', html: String(tot) },
+      { cls: 'sr sr-arate num', title: tot + of, html: pct(sm.absenceRate) || '<span class="faint">—</span>' },
+      { cls: 'sr sr-urate num', title: unx + of, html: pct(sm.unexcusedRate) || '<span class="faint">—</span>' },
+      { cls: 'sr sr-streak num' + (streak >= 2 ? '' : ' zero'), title: '', html: String(streak) },
+      { cls: 'sr sr-warn', title: '', html: !withdrawn ? warnChip(sm) : sm.warning || sm.overThreshold || sm.overTotalThreshold
+        ? '<span class="faint small" title="Warnings cover active students only">withdrawn: no warning</span>' : '' }
+    ];
+  }
+  function summaryKey(data) {
+    var k = '';
+    for (var i = 0; i < data.length; i++) k += data[i].cls + '\u0001' + data[i].title + '\u0001' + data[i].html + '\u0002';
+    return k;
   }
 
   /** The row's syllabus chip: fail (danger) or drop (warn), with "(warning only)" in view (T5: the grade
@@ -834,17 +1032,21 @@
     return '';
   }
 
+  var FOOT_ROWS = [['present', 'Present'], ['absent', 'Absent'], ['excused', 'Excused'], ['unmarked', 'Not marked']];
+  /** One footer cell: { cls, text } for count row k (FOOT_ROWS) of a session with counts c (null: not held). */
+  function footCell(c, k) {
+    if (!c) return { cls: 'u', text: '' };
+    var key = FOOT_ROWS[k][0];
+    var v = whole(c[key]);
+    return { cls: v === 0 ? 'zero' : key === 'absent' ? 'fa' : key === 'excused' ? 'fe' : key === 'unmarked' ? 'fu' : 'fp', text: String(v) };
+  }
   function footHtml(sessions, held, counts, summaryOn) {
-    var rowsDef = [['present', 'Present'], ['absent', 'Absent'], ['excused', 'Excused'], ['unmarked', 'Not marked']];
-    return rowsDef.map(function (d, k) {
+    return FOOT_ROWS.map(function (d, k) {
       var h = '<tr class="f' + (k + 1) + '"><th scope="row" colspan="3" class="sc sc-span f-label">' + d[1] +
         (k === 0 ? '<span class="f-note">active students</span>' : '') + '</th>';
       sessions.forEach(function (s, j) {
-        var c = counts[j];
-        if (!c) { h += '<td class="u"></td>'; return; }
-        var v = whole(c[d[0]]);
-        var cls = v === 0 ? 'zero' : d[0] === 'absent' ? 'fa' : d[0] === 'excused' ? 'fe' : d[0] === 'unmarked' ? 'fu' : 'fp';
-        h += '<td class="' + cls + '">' + v + '</td>';
+        var x = footCell(counts[j], k);
+        h += '<td class="' + x.cls + '">' + x.text + '</td>';
       });
       if (summaryOn) h += '<td class="sr sr-span" colspan="' + SUMMARY_KEYS.length + '">' +
         (k === 0 ? '<span class="f-note">Per session, active students only</span>' : '') + '</td>';
@@ -872,7 +1074,7 @@
     if (!sel.b || !dom || !dom.tbody) return null;
     var r = gv.rowIdx[sel.b.sid], c = gv.colIdx[sel.b.ses];
     if (r === undefined || c === undefined) return null;
-    var tr = dom.tbody.rows[r];
+    var tr = rowEl(r);
     return tr ? tr.cells[FIRST + c] || null : null;
   }
 
@@ -903,10 +1105,11 @@
     if (!dom || !dom.table) return;
     var rg = range();
     if (!rg) { dom.table.removeAttribute('aria-activedescendant'); return; }
-    var rows = dom.tbody.rows;
+    var w = gv.win;
     if (rg.r0 !== rg.r1 || rg.c0 !== rg.c1) {
-      for (var r = rg.r0; r <= rg.r1; r++) {
-        var tr = rows[r];
+      // A large class renders only a window of rows: the part of the range outside it is decorated when shown.
+      for (var r = w ? Math.max(rg.r0, w.w0) : rg.r0, rEnd = w ? Math.min(rg.r1, w.w1 - 1) : rg.r1; r <= rEnd; r++) {
+        var tr = rowEl(r);
         if (!tr) continue;
         for (var c = rg.c0; c <= rg.c1; c++) {
           var cell = tr.cells[FIRST + c];
@@ -914,9 +1117,9 @@
         }
       }
     }
-    var atr = rows[rg.ar];
+    var atr = rowEl(rg.ar);
     var td = atr ? atr.cells[FIRST + rg.ac] : null;
-    if (!td) return;
+    if (!td) { dom.table.removeAttribute('aria-activedescendant'); return; } // scrolled out of the rendered window
     td.classList.add('is-active');
     td.id = 'att-active';
     decorated.push(td);
@@ -926,7 +1129,7 @@
     if (th) { th.classList.add('hdr-active'); decorated.push(th); }
     var s = gv.rows[rg.ar], ses = gv.sessions[rg.ac];
     var m = markAt(GT.store.course(), s.id, ses.id);
-    td.setAttribute('aria-label', studentName(s) + ', ' + longDate(ses.date) + (ses.label ? ' ' + ses.label : '') + ': ' + (m ? MARK_LONG[m] : 'not recorded'));
+    td.setAttribute('aria-label', studentLabel(s) + ', ' + longDate(ses.date) + (ses.label ? ' ' + ses.label : '') + ': ' + (m ? MARK_LONG[m] : 'not recorded'));
     dom.table.setAttribute('aria-activedescendant', 'att-active');
   }
 
@@ -939,6 +1142,7 @@
     if (extend) { if (!sel.a) sel.a = sel.b || cell; }
     else sel.a = null;
     sel.b = cell;
+    revealRow(r);
     decorate();
     ensureVisible(activeTd());
   }
@@ -974,8 +1178,7 @@
   }
   /** Body cells tell whether a column is pinned: header cells are sticky anyway (for the top edge). */
   function firstBodyRow() {
-    var tr = dom.tbody ? dom.tbody.rows[0] : null;
-    return tr && !tr.classList.contains('no-rows') ? tr : null;
+    return dom.tbody ? dom.tbody.querySelector('tr[data-sid]') : null; // not the spacer of a large class
   }
   function stickyRight() {
     var tr = firstBodyRow();
@@ -1023,8 +1226,10 @@
     var td = e.target.closest ? e.target.closest('td') : null;
     if (!td || !dom.tbody.contains(td)) return null;
     var tr = td.parentNode;
-    var r = tr.sectionRowIndex, c = td.cellIndex - FIRST;
-    if (!gv.rows[r]) return null;
+    var sid = tr.getAttribute('data-sid');
+    var r = sid !== null && util.hasOwn(gv.rowIdx, sid) ? gv.rowIdx[sid] : undefined; // a large class renders a window of rows
+    var c = td.cellIndex - FIRST;
+    if (r === undefined || !gv.rows[r]) return null;
     return { td: td, r: r, c: c, isMark: c >= 0 && c < gv.sessions.length };
   }
 
@@ -1064,8 +1269,7 @@
     var what = mark ? MARK_NAME[mark] : 'cleared';
     var ses = gv.sessions[gv.colIdx[sel.b.ses]];
     var label = list.length === 1 ? 'Attendance ' + (ses ? shortDate(ses.date) : '') + ': ' + what : 'Attendance: ' + list.length + ' cells ' + what;
-    var changed = txMarks(label, list.map(function (x) { return { sid: x.studentId, ses: x.sessionId }; }),
-      function (c) { return setMarksIn(c, list); });
+    var changed = tx(label, function (c) { return setMarksIn(c, list); });
     if (changed === undefined) return;
     if (list.length > 1 || skipped) {
       ui.toast((list.length === 1 ? '1 cell ' : list.length + ' cells ') + (mark ? 'set to ' + MARK_LONG[mark] : 'cleared') +
@@ -1263,6 +1467,7 @@
     var r = sel.b && gv.rowIdx[sel.b.sid] !== undefined ? gv.rowIdx[sel.b.sid] : 0;
     if (gv.rows.length) {
       sel = { a: null, b: { sid: gv.rows[r].id, ses: ses.id } };
+      revealRow(r);
       decorate();
     }
     // Put the session a little right of the name columns, so the previous sessions stay in view.
@@ -1305,15 +1510,15 @@
       var sm = util.hasOwn(byStudent, s.id) ? byStudent[s.id] : read('summary', [course, s.id], null);
       var t = util.hasOwn(totals, s.id) && util.isPlainObject(totals[s.id]) ? totals[s.id] : {};
       var wd = s.status === 'withdrawn';
-      var name = studentName(s);
+      var name = studentName(s), who = studentLabel(s);
       var unx = sm ? whole(sm.unexcused) : whole(t.absent), tot = sm ? whole(sm.totalAbsences) : whole(t.absent) + whole(t.excused);
       var over = !wd && sm && sm.overThreshold, overT = !wd && sm && sm.overTotalThreshold; // active students only
       var tooMany = heldN > 0 && tot > heldN;
       return '<tr data-sid="' + esc(s.id) + '"' + (wd ? ' class="row-withdrawn"' : '') + '>' +
         '<td class="num">' + esc(str(s.no)) + '</td>' +
         '<td class="t-name"><span class="pii">' + esc(name) + '</span>' + (wd ? ' <span class="badge wd-badge">Withdrawn</span>' : '') + '</td>' +
-        '<td class="t-in">' + countInput('t:absent:' + s.id, t.absent, 'Absent (not allowed, unexcused) for ' + name, over ? 'Above the unexcused-absence threshold (' + thr + ')' : '') + '</td>' +
-        '<td class="t-in">' + countInput('t:excused:' + s.id, t.excused, 'Excused (allowed, instructor-approved) for ' + name, '') + '</td>' +
+        '<td class="t-in">' + countInput('t:absent:' + s.id, t.absent, 'Absent (not allowed, unexcused) for ' + who, over ? 'Above the unexcused-absence threshold (' + thr + ')' : '') + '</td>' +
+        '<td class="t-in">' + countInput('t:excused:' + s.id, t.excused, 'Excused (allowed, instructor-approved) for ' + who, '') + '</td>' +
         '<td class="num' + (overT ? ' over' : '') + (tooMany ? ' too-many' : '') + '"' +
           (overT ? ' title="Above the total-absence threshold (' + tthr + ')"' : tooMany ? ' title="More absences than sessions held (' + heldN + ')"' : '') + '>' + tot +
           (tooMany ? ' ' + icon('alert', 'icon-sm') : '') + '</td>' +
@@ -1486,7 +1691,9 @@
     return null;
   }
 
-  function warningsCardHtml(course, cs, kind) {
+  /** The warnings card as parts: the header, the empty-state body (no warnings) and one item per student,
+   * so a change of one student's numbers replaces only that student's item (see updateWarnCard). */
+  function warningsParts(course, cs, kind) {
     var warnings = cs && Array.isArray(cs.warnings) ? cs.warnings : [];
     var byStudent = cs && util.isPlainObject(cs.byStudent) ? cs.byStudent : {};
     var groups = [], idx = {};
@@ -1497,16 +1704,19 @@
       if (g.kinds.indexOf(w.kind) === -1) g.kinds.push(w.kind);
       if (typeof w.detail === 'string' && w.detail) g.details.push(w.detail);
     });
-    var head = '<div class="card-header"><h2>' + icon('alert') + ' Warnings' + (groups.length ? ' <span class="badge badge-warn">' + groups.length + '</span>' : '') + '</h2>' +
-      '<span class="muted small">Active students only. Warnings never change grades.</span></div>';
+    var head = '<h2>' + icon('alert') + ' Warnings' + (groups.length ? ' <span class="badge badge-warn">' + groups.length + '</span>' : '') + '</h2>' +
+      '<span class="muted small">Active students only. Warnings never change grades.</span>';
     if (!groups.length) {
-      return head + '<div class="card-body"><p class="muted att-no-warn">' + icon('check') + ' No warnings: nobody has ' + dropOf(course) +
-        ' absences in a row' + (kind === 'totals' ? ' (n/a in totals mode)' : '') + ' or is above a threshold.</p></div>';
+      return { head: head, items: [], empty: '<p class="muted att-no-warn">' + icon('check') + ' No warnings: nobody has ' + dropOf(course) +
+        ' absences in a row' + (kind === 'totals' ? ' (n/a in totals mode)' : '') + ' or is above a threshold.</p>' };
     }
     var thr = thresholdOf(course), tthr = totalThresholdOf(course);
-    var items = groups.map(function (g) {
-      var s = model.findStudent(course, g.sid);
-      if (!s) return '';
+    var studentsById = Object.create(null);
+    course.students.forEach(function (x) { studentsById[x.id] = x; });
+    var items = [];
+    groups.forEach(function (g) {
+      var s = studentsById[g.sid];
+      if (!s) return;
       var sm = util.hasOwn(byStudent, g.sid) ? byStudent[g.sid] : read('summary', [course, g.sid], null) || {};
       var chips = [], lines = [];
       g.kinds.forEach(function (k) {
@@ -1523,16 +1733,58 @@
       lines.push(whole(sm.unexcused) + ' unexcused (not allowed) · ' + whole(sm.excused) + ' excused (allowed) · ' +
         whole(sm.totalAbsences) + ' in total of ' + plural(whole(sm.recorded), 'recorded session'));
       if (!lines.length && g.details.length) lines.push(g.details.join(' · '));
-      return '<li class="aw-item" data-sid="' + esc(g.sid) + '">' +
+      items.push({ sid: g.sid, html: '<li class="aw-item" data-sid="' + esc(g.sid) + '">' +
         '<div class="aw-main"><span class="aw-no">No ' + esc(str(s.no)) + '</span> <span class="pii aw-name">' + esc(studentName(s)) + '</span>' +
         '<span class="aw-chips">' + chips.join('') + '</span></div>' +
         '<div class="aw-detail small muted">' + lines.map(esc).join('<br>') + '</div>' +
         '<div class="aw-actions"><button type="button" class="btn btn-sm" data-act="jump" data-sid="' + esc(g.sid) + '">' +
           icon('chevron-right') + (kind === 'totals' ? 'Show in the table' : 'Show in the grid') + '</button>' +
         (typeof ui.openStudent === 'function' ? '<button type="button" class="btn btn-sm btn-ghost" data-act="student" data-sid="' + esc(g.sid) + '">' + icon('user') + 'Details</button>' : '') +
-        '</div></li>';
-    }).join('');
-    return head + '<div class="card-body"><ul class="att-warn-list">' + items + '</ul></div>';
+        '</div></li>' });
+    });
+    return { head: head, items: items, empty: '' };
+  }
+
+  /** Writes the warnings card: header and body separately, and the list item by item (keyed by student),
+   * so marking one student re-lays out one item, not a list of 150. Keyboard focus on a replaced or moved
+   * item's button moves to the same button of its new item. */
+  function updateWarnCard(card, parts) {
+    if (!card) return;
+    var head = card.firstElementChild, body = card.lastElementChild;
+    if (card.children.length !== 2 || !head.classList.contains('card-header') || !body.classList.contains('card-body')) {
+      card.innerHTML = '<div class="card-header"></div><div class="card-body"></div>';
+      head = card.firstElementChild;
+      body = card.lastElementChild;
+    }
+    setHtmlKeep(head, parts.head);
+    if (!parts.items.length) { setHtmlKeep(body, parts.empty); return; }
+    var ul = body.children.length === 1 && body.firstElementChild.classList.contains('att-warn-list') ? body.firstElementChild : null;
+    if (!ul) {
+      setHtmlKeep(body, '<ul class="att-warn-list">' + parts.items.map(function (x) { return x.html; }).join('') + '</ul>');
+      ul = body.firstElementChild;
+      parts.items.forEach(function (x, i) { if (ul.children[i]) ul.children[i].__h = x.html; });
+      return;
+    }
+    body.__attHtml = null; // edited in place below: setHtmlKeep must not trust its cached markup
+    var ae = document.activeElement;
+    var focus = ae && ul.contains(ae) ? { act: ae.getAttribute('data-act'), sid: ae.getAttribute('data-sid') } : null;
+    var old = Object.create(null);
+    for (var c = ul.firstElementChild; c; c = c.nextElementSibling) old[c.getAttribute('data-sid')] = c;
+    var nodes = parts.items.map(function (x) {
+      var li = old[x.sid];
+      if (li && li.__h === x.html) { delete old[x.sid]; return li; }
+      var n = ui.el(x.html);
+      n.__h = x.html;
+      return n;
+    });
+    nodes.forEach(function (n, i) { var at = ul.children[i]; if (at !== n) ul.insertBefore(n, at || null); });
+    while (ul.children.length > nodes.length) ul.removeChild(ul.lastElementChild);
+    if (focus && document.activeElement !== ae && focus.act) {
+      var t = ul.querySelector('[data-act="' + cssEsc(focus.act) + '"]' + (focus.sid ? '[data-sid="' + cssEsc(focus.sid) + '"]' : ''));
+      if (!t) t = ul.querySelector('[data-act="jump"]'); // that student has no warning any more
+      if (t) { try { t.focus({ preventScroll: true }); } catch (e) { t.focus(); } }
+      else focusModeButton();
+    }
   }
 
   // ------------------------------------------------------------------ cards: settings
@@ -1703,7 +1955,7 @@
       if (th) dom.wrap.scrollLeft = Math.max(0, th.offsetLeft - stickyLeftWidth() - W.ses);
       ensureVisible(td);
     }
-    flash(dom.tbody.rows[r]);
+    flash(rowEl(r));
     focusGrid();
   }
 
@@ -2203,6 +2455,10 @@
     var ses = (sesId && findSession(course, sesId)) || sessions[idx] || sessions[0];
     var current = 0;
     var dlgEl = null;
+    // CODE-6: every mark of this roll call (per session) folds into one History entry (see store.transact's
+    // mergeKey), so taking roll for 300 students adds one entry, not 300. Undo still works mark by mark.
+    var openedAt = util.nowIso ? util.nowIso() : new Date().toISOString();
+    function rollOpts() { return { courseId: courseId, mergeKey: 'rollcall:' + ses.id + ':' + openedAt }; }
 
     var body = document.createElement('div');
     body.className = 'rc';
@@ -2218,11 +2474,12 @@
       }).join('');
     }
     /** Keeps the "(n of 57 marked)" of every session in the drop-down current (the selection stays). */
-    function refreshOptions() {
+    function refreshOptions(onlyId) {
       var c = c0();
       var select = body.querySelector('#rc-ses');
       if (!c || !select) return;
       ui.$$('option', select).forEach(function (o) {
+        if (onlyId && o.value !== onlyId) return;
         var s = findSession(c, o.value);
         var t = s ? optionText(c, s) : null;
         if (t !== null && o.textContent !== t) o.textContent = t;
@@ -2280,18 +2537,26 @@
       var rest = body.querySelector('[data-rc="rest"]');
       rest.disabled = marked === students.length;
       rest.lastChild.textContent = marked === students.length ? 'Everyone has a mark' : 'Mark remaining present (' + (students.length - marked) + ')';
-      refreshOptions();
+      // Marking here changes only this session's count (the other options were current when it was chosen).
+      refreshOptions(ses.id);
     }
     function atEnd() { return current >= rowsEls.length; }
     /** Makes row i the current one. Past the last row is the end of the list: no row is current (so a key
      * typed now cannot overwrite the last student's mark) and Done gets the focus. */
+    var shownCurrent = -1; // the row drawn as current (only it and the new one change: 300 rows stay fast)
+    function drawCurrent(k, on) {
+      var li = rowsEls[k];
+      if (!li) return;
+      li.classList.toggle('is-current', on);
+      ui.$$('button', li).forEach(function (b) { b.tabIndex = on ? 0 : -1; });
+    }
     function setCurrent(i, focus) {
       current = i >= rowsEls.length ? rowsEls.length : Math.max(0, i);
-      rowsEls.forEach(function (li, k) {
-        var on = k === current;
-        li.classList.toggle('is-current', on);
-        ui.$$('button', li).forEach(function (b) { b.tabIndex = on ? 0 : -1; });
-      });
+      if (shownCurrent !== current) {
+        drawCurrent(shownCurrent, false);
+        drawCurrent(current, true);
+        shownCurrent = current;
+      }
       var endEl = body.querySelector('.rc-end'), helpEl = body.querySelector('.rc-help');
       if (endEl) endEl.hidden = !atEnd();
       if (helpEl) helpEl.hidden = atEnd();
@@ -2312,9 +2577,9 @@
       var c = c0();
       if (!c || !s) return;
       if (markAt(c, s.id, ses.id) !== m) {
-        var r = txMarks('Roll call ' + shortDate(ses.date), [{ sid: s.id, ses: ses.id }], function (cc) {
+        var r = tx('Roll call ' + shortDate(ses.date), function (cc) {
           return setMarksIn(cc, [{ studentId: s.id, sessionId: ses.id, mark: m || null }]);
-        }, { courseId: courseId });
+        }, rollOpts());
         if (r === undefined) return;
       }
       paintRow(i);
@@ -2389,7 +2654,7 @@
         function markRest() {
           var n = tx('Roll call ' + shortDate(ses.date) + ': mark remaining present', function (c) {
             return mut('markAllPresent')(c, ses.id, { activeOnly: true });
-          }, { courseId: courseId });
+          }, rollOpts());
           if (n === undefined) return;
           paintAll();
           ui.toast(n ? plural(n, 'student') + ' marked present.' : 'Everyone already has a mark.', { type: n ? 'success' : 'info' });

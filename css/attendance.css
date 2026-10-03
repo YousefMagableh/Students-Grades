@@ -7,8 +7,7 @@
 
 .att-head { align-items: flex-start; }
 .att-head-text { min-width: 0; }
-.att-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0; }
-.att-title-sub { font-weight: 500; color: var(--text-muted); font-size: 16px; }
+.att-title { margin: 0; }
 .att-sub { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
 .att-sub .chip .icon { width: 13px; height: 13px; }
 .att-warn-chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -199,12 +198,22 @@
   background-repeat: no-repeat; background-position: center;
 }
 
+/* Large classes render only the rows near the view: two spacer rows keep the scroll height (attendance.js). */
+.att-grid tbody tr.att-pad > td.att-pad-cell,
+.att-grid tbody tr.att-pad:hover > td.att-pad-cell {
+  padding: 0; border: 0; background: none; cursor: default;
+}
+
 /* names and withdrawn rows */
 .att-grid tbody td.c-last, .att-grid tbody td.c-first { font-weight: 550; }
 .att-grid .wd-badge { font-size: 10px; padding: 2px 5px; margin-left: 4px; }
 .att-grid tbody tr.wd td { color: var(--withdrawn-text); }
 .att-grid tbody tr.wd td.c-last, .att-grid tbody tr.wd td.c-first { font-weight: 450; }
-.att-grid tbody tr.wd td.m { opacity: 0.6; }
+/* Withdrawn rows: muted but readable marks (no opacity, which took them to about 2.3:1); the A and E tints
+ * are mixed half-way to the cell background so the row still reads as inactive. */
+.att-grid tbody tr.wd td.m { color: var(--withdrawn-text); }
+.att-grid tbody tr.wd td.ma { background-color: color-mix(in srgb, var(--danger-soft) 50%, var(--bg-elev)); }
+.att-grid tbody tr.wd td.me { background-color: color-mix(in srgb, var(--info-soft) 50%, var(--bg-elev)); }
 
 /* summary cells */
 .att-grid tbody td.sr.zero { color: var(--text-faint); }
@@ -214,15 +223,15 @@
 }
 .att-grid tbody td.sr-warn { padding: 0 5px; }
 .att-chip { font-size: 11px; font-weight: 650; padding: 2px 7px; line-height: 1.35; }
-.att-chip .att-chip-note { font-size: 0.9em; font-weight: 500; }
+.att-chip .att-chip-note { font-size: 11px; font-weight: 500; }
 /* In the grid the chip takes two short lines, so "(warning only)" stays in view in a narrow column
  * (T5: a warning never changes a grade) and the row keeps its height. */
 .att-grid .att-chip {
   display: inline-block; max-width: 100%; vertical-align: middle;
   padding: 1px 6px; border-radius: 6px;
-  font-size: 10.5px; line-height: 1.15; white-space: normal;
+  font-size: 11px; line-height: 1.12; white-space: normal;
 }
-.att-grid .att-chip .att-chip-note { display: block; font-size: 9.5px; }
+.att-grid .att-chip .att-chip-note { display: block; font-size: 11px; }
 .chip.danger.att-chip { border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 
 /* warning rows: a stripe on the No cell, so it shows on the left too */
@@ -321,6 +330,9 @@
 .aw-item {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center;
   padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elev);
+  /* A large class can list 150 students: items out of view are not laid out or painted, so marking stays
+   * fast (CODE-5). Scrolling, focus, find-in-page and printing render them as usual. */
+  content-visibility: auto; contain-intrinsic-size: auto 80px;
 }
 .aw-main { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .aw-no { color: var(--text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }

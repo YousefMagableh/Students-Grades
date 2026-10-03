@@ -1,9 +1,10 @@
 /* Grade Tracker - History view (GT.views.history): the course's append-only change log (G5).
  * Newest first, filterable by kind group, source, student, free text and date range; the TA can add a
  * note to any entry (GT.store.annotateHistory) and export the filtered entries as CSV.
- * A band of more than 10 final letters is one "Final letters: n changed" entry: its details list every
- * student (a "Show n students" disclosure); the student filter, search and export read those details, and
- * filtered to one student the entry shows that student's own old -> new letter.
+ * A band of more than 10 final letters is one "Final letters: n changed" entry, and a roll call is one
+ * "<n> marks" entry (GT.store.transact mergeKey): their details list every student (a "Show n students" /
+ * "Show n marks" disclosure); the student filter, search and export read those details, and filtered to
+ * one student the entry shows that student's own old -> new value.
  * Browser only. Filters persist in GT.store.state.ui.historyPrefs.
  * Privacy: student names (and name/notes values) carry class "pii"; the student filter lists only the
  * student's No while privacy mode is on, because a native dropdown cannot be blurred. */
@@ -22,7 +23,7 @@
   var GROUPS = [
     { id: 'all', label: 'All' },
     { id: 'grades', label: 'Grades' },
-    { id: 'students', label: 'Students & teams' },
+    { id: 'students', label: 'Students & Teams' },
     { id: 'settings', label: 'Settings' },
     { id: 'attendance', label: 'Attendance' },
     { id: 'other', label: 'Other' }
@@ -274,7 +275,8 @@
     try { d = GT.history.detailFor(e, studentId); } catch (err) { d = null; }
     if (!d) return null;
     var fk = str(e.fieldKey);
-    var f = util.hasOwn(DETAIL_FIELDS, fk) ? DETAIL_FIELDS[fk] : { field: str(e.field), key: fk };
+    var f = util.hasOwn(DETAIL_FIELDS, fk) ? DETAIL_FIELDS[fk]
+      : { field: str(d.field) || str(e.field), key: fk };
     return {
       id: e.id, ts: e.ts, kind: e.kind, source: e.source,
       studentId: d.studentId, studentName: d.studentName,
@@ -381,23 +383,29 @@
       'title="Record why this changed (for example: per instructor email, Oct 12)">' + icon('plus') + 'Add note</button>';
   }
 
-  /** A summary entry's students (a band of final letters) behind a disclosure in the Note cell:
-   * name (pii), No and old -> new for every student it changed. */
+  /** A summary entry's changes (a band of final letters, a roll call) behind a disclosure in the Note
+   * cell: name (pii), No and old -> new for every change. Items name their own field (a roll call's
+   * session date) when the entry covers more than one. */
   function detailsHtml(e) {
     var list = detailsOf(e);
     if (!list.length) return '';
     var fk = str(e.fieldKey);
     var field = util.hasOwn(DETAIL_FIELDS, fk) ? DETAIL_FIELDS[fk].field : str(e.field);
+    var fieldSet = Object.create(null), nFields = 0;
+    list.forEach(function (d) { var f = str(d.field); if (f && !fieldSet[f]) { fieldSet[f] = true; nFields++; } });
     var items = list.map(function (d) {
       return '<li><span class="hist-dl-who"><span class="pii hist-dl-name">' +
           (d.studentName ? esc(d.studentName) : '<em class="faint">(no name)</em>') + '</span>' +
-          (d.no !== null ? ' <span class="hist-dl-no">No ' + esc(String(d.no)) + '</span>' : '') + '</span>' +
+          (d.no !== null ? ' <span class="hist-dl-no">No ' + esc(String(d.no)) + '</span>' : '') +
+          (nFields > 1 && d.field ? ' <span class="hist-dl-field">' + esc(d.field) + '</span>' : '') + '</span>' +
         '<span class="hist-dl-change">' +
-          changeHtml({ kind: e.kind, studentId: d.studentId, field: field, oldValue: d.oldValue, newValue: d.newValue }) +
+          changeHtml({ kind: e.kind, studentId: d.studentId, field: d.field || field, oldValue: d.oldValue, newValue: d.newValue }) +
         '</span></li>';
     }).join('');
+    // A roll call lists marks (a student marked twice appears twice); a band of letters lists students.
+    var unit = e.kind === 'attendance' ? plural(list.length, 'mark') : plural(list.length, 'student');
     return '<details class="hist-details" data-id="' + esc(e.id) + '">' +
-      '<summary>' + icon('chevron-right', 'icon-sm') + 'Show ' + esc(plural(list.length, 'student')) + '</summary>' +
+      '<summary>' + icon('chevron-right', 'icon-sm') + 'Show ' + esc(unit) + '</summary>' +
       '<ul class="hist-dl">' + items + '</ul></details>';
   }
 
@@ -427,7 +435,7 @@
     }).join('');
     return '' +
       '<div class="page-header">' +
-        '<div><h1>Change history</h1><div class="sub" data-ref="sub"></div></div>' +
+        '<div><h1>History</h1><div class="sub" data-ref="sub"></div></div>' +
         '<div class="toolbar"><button type="button" class="btn" data-act="export">' + icon('download') + 'Export CSV</button></div>' +
       '</div>' +
       '<p class="muted hist-explain">' + icon('info') + '<span>This log is append-only: every change is kept with its time and source. ' +
@@ -506,8 +514,8 @@
       lastCourseId = course.id;
       limit = PAGE;
     }
-    sub.textContent = (GT.model && GT.model.courseLabel ? GT.model.courseLabel(course) : str(course.code)) +
-      (course.term ? ' · ' + course.term : '');
+    // The same subtitle as the other tabs: "SE 4351 · Requirements Engineering · Fall 2026".
+    sub.textContent = [str(course.code), str(course.title), str(course.term)].filter(Boolean).join(' · ');
 
     var all = sortedEntries(course);
 
@@ -711,10 +719,12 @@
     var had = str(e.userNote) !== '';
     // Opened from one student's row of a band entry: show that student's change and say the note is shared.
     var own = activeStudent ? asStudentRow(e, activeStudent) : null;
+    var what = e.kind === 'attendance' ? 'This mark is part of one entry with other students\u2019 marks'
+      : 'This letter was set together with other students in one step';
     var intro = own
       ? noteDialogIntro(own) + '<p class="small muted hist-dlg-shared">' + icon('info', 'icon-sm') +
-        '<span>This letter was set together with other students in one step (' + esc(str(e.field) + ': ' + str(e.newValue)) +
-        '). Your note is saved with that whole step, so it shows for every student in it.</span></p>'
+        '<span>' + what + ' (' + esc(str(e.field) + ': ' + str(e.newValue)) +
+        '). Your note is saved with that whole entry, so it shows for every student in it.</span></p>'
       : noteDialogIntro(e);
     ui.dialog.form({
       title: had ? 'Edit your note' : 'Add a note to this change',
@@ -732,6 +742,10 @@
       if (!v) return;
       var text = str(v.note).trim();
       if (text === str(e.userNote)) return;
+      if (GT.store.readOnly && GT.store.readOnly()) {
+        ui.toast('Not saved: Grade Tracker was changed in another tab, so this tab is read-only. Reload to see the latest data.', { type: 'warn' });
+        return;
+      }
       GT.store.annotateHistory(id, text);
       ui.toast(text ? 'Note saved.' : 'Note removed.', { type: 'success' });
     });

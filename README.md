@@ -338,7 +338,11 @@ On a Mac, use Cmd instead of Ctrl.
   cleared. Use **Data → Restore from backup** with your latest backup file.
 - **A banner says saving is not possible**: the browser is in a private window or blocks storage. Open
   `index.html` in a normal window, and download a backup before closing the tab.
-- **"Grade Tracker is also open in another tab"**: close one of them; two tabs overwrite each other's changes.
+- **"Grade Tracker is also open in another tab"**: work in one of them. As soon as the other tab saves a
+  change, this one becomes read-only ("Grade Tracker was changed in another tab") so it can never overwrite
+  newer grades: click **Reload** (first **Download this tab's data** if it has changes you want to keep).
+- **"Saving paused"**: the saved data could not be read. Download it from the banner, then restore it or start
+  fresh; nothing you change before that is saved.
 - **Excel export says the library could not be loaded**: keep the `vendor` folder next to `index.html`.
 - **An old `.xls` file cannot be imported**: open it in Excel and use *Save As → Excel Workbook (.xlsx)*.
 

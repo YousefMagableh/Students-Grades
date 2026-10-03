@@ -506,10 +506,15 @@
     drag = null;
   }
 
+  /** The page subtitle of every view (UX-16): "SE 4351 · Requirements Engineering · Fall 2026". */
+  function courseLine(course) {
+    return [course.code, course.title, course.term].map(function (x) { return str(x).trim(); }).filter(Boolean).join(' \u00b7 ') || 'Course';
+  }
+
   function renderHead(course) {
-    var sub = esc(model.courseLabel ? model.courseLabel(course) : course.code) + (course.term ? ' \u00b7 ' + esc(course.term) : '');
     patch(dom.head, 'head',
-      '<div><h1>Import / Export</h1><div class="sub">' + sub + ' \u00b7 Files are made and read on this computer only; nothing is uploaded.</div></div>');
+      '<div><h1>Import / Export</h1><div class="sub">' + esc(courseLine(course)) + '</div>' +
+      '<div class="sub">Files are made and read on this computer only; nothing is uploaded.</div></div>');
   }
 
   // ------------------------------------------------------------------ render: export card
@@ -698,8 +703,8 @@
     out += '<p class="xc-help">In the Excel file, the weighted scores, Total and Letter Grade are real formulas, so the instructor can click a cell to see how it is calculated.</p>';
     out += '<div id="xc-export-status" class="xc-status" role="status" aria-live="polite">' + statusHtml() + '</div>';
     out += '<p class="xc-reminder">' + icon('lock') + '<span><strong>Exported files contain confidential grades.</strong> Keep them on this computer, ' +
-      'out of shared or synced folders (OneDrive, Google Drive, Dropbox, iCloud) and out of the Grade Tracker project folder ' +
-      '(its .gitignore already keeps *.xlsx, *.csv and backup .json files out of Git). Delete copies you no longer need.</span></p>';
+      'out of shared or synced folders (OneDrive, Google Drive, Dropbox, iCloud) and out of the Grade Tracker folder. ' +
+      'Delete copies you no longer need.</span></p>';
     return out + '</div>';
   }
 
@@ -1227,9 +1232,19 @@
     remap();
   }
 
+  /** The name columns as every view writes them (UX-17: "Last Name / First Name"), whatever the importer calls them. */
+  var NAME_TARGET_LABELS = { lastName: 'Last Name', firstName: 'First Name', fullName: 'Full Name ("Last, First" or "First Last")' };
+  var NAME_FIELD_LABELS = { 'Last name': 'Last Name', 'First name': 'First Name', 'Full name': 'Full Name' };
+
   function targetList(course) {
     var list = safeCall('importer', 'targetsFor', [course], []);
-    list = (Array.isArray(list) ? list : []).filter(function (t) { return t && typeof t.key === 'string'; });
+    list = (Array.isArray(list) ? list : []).filter(function (t) { return t && typeof t.key === 'string'; }).map(function (t) {
+      if (!util.hasOwn(NAME_TARGET_LABELS, t.key) || t.label === NAME_TARGET_LABELS[t.key]) return t;
+      var c = {};
+      Object.keys(t).forEach(function (k) { c[k] = t[k]; });
+      c.label = NAME_TARGET_LABELS[t.key];
+      return c;
+    });
     if (!list.some(function (t) { return t.key === 'ignore'; })) list.unshift({ key: 'ignore', label: 'Do not import' });
     return list;
   }
@@ -1780,7 +1795,7 @@
       var a = model.findAssessment(course, m[2]);
       if (a) return m[1] === 'raw' ? a.name : m[1] === 'weighted' ? a.name + ' (weighted)' : a.name + ': weeks late';
     }
-    return k;
+    return util.hasOwn(NAME_FIELD_LABELS, k) ? NAME_FIELD_LABELS[k] : k;
   }
 
   function valueHtml(v) {
@@ -1848,9 +1863,10 @@
       out += '<ul class="xc-map-notes">' + planNotes.map(function (t) { return '<li>' + icon('info', 'icon-sm') + '<span>' + esc(str(t)) + '</span></li>'; }).join('') + '</ul>';
     }
 
-    // Changes (first 50)
+    // Changes (first 50). The heading counts them the way the tiles do (UX-22): the student changes of the
+    // "changes" tile, then what the list adds to them (team-score followers, blocked changes, the course setting).
     var changes = [];
-    var total = 0;
+    var total = 0, nItem = 0, nBlocked = 0, nPropagated = 0;
     if (switchMode) {
       total++;
       changes.push({ item: { action: 'course' }, ch: { field: 'Attendance mode', oldValue: ATTENDANCE_MODE_LABELS[modeNow], newValue: ATTENDANCE_MODE_LABELS.totals } });
@@ -1859,6 +1875,7 @@
       if (!it || it.action === 'skip' || !Array.isArray(it.changes)) return;
       it.changes.forEach(function (ch) {
         total++;
+        if (ch && (ch.blocked || ch.status === 'blocked')) nBlocked++; else nItem++;
         if (changes.length < CHANGE_LIMIT) changes.push({ item: it, ch: ch });
       });
     });
@@ -1867,10 +1884,17 @@
       if (!p || !Array.isArray(p.changes)) return;
       p.changes.forEach(function (ch) {
         total++;
+        nPropagated++;
         if (changes.length < CHANGE_LIMIT) changes.push({ item: { action: 'propagated', name: p.name }, ch: ch });
       });
     });
-    out += '<h4 class="xc-sub-h">Changes' + (total ? ' <span class="muted">(' + (total > CHANGE_LIMIT ? 'first ' + CHANGE_LIMIT + ' of ' + fmtCount(total) : fmtCount(total)) + ')</span>' : '') + '</h4>';
+    var nStudent = typeof counts.changes === 'number' ? counts.changes : nItem;
+    var countParts = [fmtCount(nStudent)];
+    if (nPropagated) countParts.push(fmtCount(nPropagated) + ' via team score');
+    if (nBlocked) countParts.push(fmtCount(nBlocked) + ' blocked');
+    if (switchMode) countParts.push('1 course setting');
+    out += '<h4 class="xc-sub-h">Changes' + (total ? ' <span class="muted">(' + countParts.join(' + ') +
+      (total > CHANGE_LIMIT ? '; the first ' + CHANGE_LIMIT + ' are listed' : '') + ')</span>' : '') + '</h4>';
     var used = plan.items.filter(function (it) { return it && it.action !== 'skip'; }).length;
     if (!changes.length) {
       if (!plan.items.length) {

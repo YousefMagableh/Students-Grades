@@ -110,6 +110,59 @@ Where the absences show up:
 - **Attendance tab**: the summary columns at the right of the grid, and a **Warnings** list with a button that
   jumps to the student's row.
 
+## How the numbers are calculated
+
+Everything recalculates the moment a score changes, just like the formulas in the old Excel sheet. No
+formula is ever typed by hand.
+
+| What | Formula |
+| --- | --- |
+| Weighted points | score ÷ max score × weight. Example: Project I 94 out of 100, weight 10% → 9.4 |
+| Late penalty | weeks late × points per week (10) × max ÷ 100, taken off the score **before** weighting; never below 0; none when *penalty waived* is ticked |
+| Total | sum of the weighted points + curve (0 by default), then rounding (none by default) |
+| Empty score | counts as 0; the Total shows a small *incomplete* mark until every weighted item has a score |
+| Suggested letter | the highest letter whose cutoff the Total reaches (cutoffs in Settings) |
+| Final letter | chosen by hand from a drop-down; once set, it is the grade used in exports, statistics and the summary |
+| Rank | among active students by Total, highest first; equal totals share a rank (1, 2, 2, 4) |
+| Percentile | share of the other active students with a lower Total: 100 × lower ÷ (active − 1) |
+| Difference from average | Total − the class average of active students |
+
+**Worked example** (the check the tests use): Project I 90, Project II 85, Test 1 80, Test 2 70,
+Participation 0 → 90÷100×10 + 85÷100×20 + 80÷100×25 + 70÷100×40 + 0÷5×5 = 9 + 17 + 20 + 28 + 0 = **74.0**.
+
+More details:
+
+- **Rounding modes**: none, nearest 0.01, nearest whole number. Halves round away from zero, exactly like
+  Excel's `ROUND`, so 81.025 becomes 81.03. Display decimals only change what is shown, never the value.
+- **Team-graded items** (Project I and II): type the team score once in any member's cell and every member
+  gets it. A **per-member override** (cell menu → *Override for this student only…*) gives one student a
+  different score and shows a ◆ marker, because an unequal split needs the team's written agreement.
+- **Withdrawn students** stay in the list (greyed out), in History and in exports with Status "Withdrawn", but
+  they are left out of the class average, rank, percentile and every statistic.
+- **Statistics** use active students only: standard deviation and variance are the *sample* versions
+  (n − 1); quartiles use the same method as Excel's `QUARTILE.INC`; the grade distribution bins are those of
+  the university eLearning panel (90 - 100, 80 - 89 … where 89.99 counts in 80 - 89). The **pass rate** counts
+  students whose letter is at or above the passing letter set in Settings.
+
+## Settings that still need confirmation
+
+These defaults are **placeholders**. Each shows a yellow *needs confirmation* badge until you press **Mark
+confirmed** in **Settings → Needs confirmation** (the Settings tab shows how many are left). Changing a value
+never confirms it by itself.
+
+| Setting | Default now |
+| --- | --- |
+| Letter-grade cutoffs, undergraduate (SE 4351) | A+ 97, A 93, A- 90, B+ 87, B 83, B- 80, C+ 77, C 73, C- 70, D+ 67, D 63, D- 60, below 60 F |
+| Letter-grade cutoffs, graduate (SE 6362) | A 93, A- 90, B+ 87, B 83, B- 80, C+ 77, C 70, below 70 F |
+| Rounding of the total | none |
+| Curve | 0 points |
+| Late-work exceptions | 10 points per week; what counts as pre-approved is decided case by case (*penalty waived*) |
+| Max scores | 100 for every item, except Class/Project Participation out of 5 |
+| Project split | Project I 10% + Project II 20% (SE 4351's syllabus lists Questionnaire 5 + Presentation and Deliverable 25 inside the 30%; use **Split…** in Settings once confirmed) |
+| Term Paper weight (SE 6362) | 0% |
+| Unexcused-absence threshold | highlight above 3 (the optional total-absence threshold is off) |
+| Passing grade for the pass rate | D- (undergraduate), C (graduate) |
+
 ## Export and import
 
 Open the **Import / Export** tab. Files are made and read on this computer only; nothing is uploaded.

@@ -1064,7 +1064,7 @@
         '<div class="table-wrap st-twrap" data-scroll="wi"><table class="table st-table st-mini" aria-labelledby="st-h-wi-all"><thead><tr><th scope="col">Letter</th><th scope="col" class="num">Total needed</th><th scope="col" class="num">Score needed</th></tr></thead><tbody>' +
         trs + '</tbody></table></div></div>';
     }
-    return head + '<div class="card-body st-wi"><div class="st-wi-main">' + form + '<div class="pii st-wi-who">' + esc(nameOf(s)) + '</div>' + nowLine + out + assume + '</div>' + table + '</div>';
+    return head + '<div class="card-body st-wi"><div class="st-wi-main">' + form + nowLine + out + assume + '</div>' + table + '</div>';
   }
 
   // ------------------------------------------------------------------ 9. cutoff planner

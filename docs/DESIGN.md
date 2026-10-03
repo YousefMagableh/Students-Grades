@@ -1202,3 +1202,125 @@ failing. For tests: `GT.views.exchange.exportKeys()` (the keys the download woul
 - Row cells, sample values and change rows that hold names or notes carry `pii`, without a `title` tooltip.
 - Preferences: `ui.exchangePrefs = { sort: 'name' | 'no', includeSettings, includeHistory, presets: {
   [courseId]: presetId } }` (the last preset chosen per course; built-ins by id, e.g. `builtin:previous`).
+
+## 10. Statistics (`GT.stats`) — ST1–ST3, STAGE5 section 1 and Addendum
+
+`js/core/stats.js`, pure and UMD like `calc.js` (depends on `util`, `model`, `calc` and `attendance`; loaded
+after `attendance.js`). Tests: `tests/stats.test.js`. No DOM, no clock; results pass through `util.fix`.
+
+Conventions for every course function `f(course, results, …)`:
+- `results` is `calc.computeCourse(course)`; pass `null` and it is computed. Pass the same object to every
+  call of one render (the view computes it once).
+- **Active students only** (S2): withdrawn students are left out of every number, list and chart. They show
+  only in `statusDistribution().withdrawn` ("Withdrawn (excluded)") and in `perTeam().members` (the roster).
+- **Letters are effective letters** (DECISIONS 2, section 2.5): the final letter when one is set, otherwise
+  the cutoff suggestion. `{ letters: 'suggested' }` (letterDistribution, passRate, topBottom, borderline,
+  simulate) uses the suggestion instead. "n of N final letters assigned" = `results.letterSummary.assigned`
+  of `results.letterSummary.active`.
+- Totals are `total` (rounded by the course's rounding mode, as in the grid). Only `borderline` reads
+  `totalUnrounded`, because `calc.minTotalForLetter` is defined on it.
+
+### 10.1 Numbers
+
+- `describe(values)` → `{ count, min, max, range, mean, median, sd, variance, sdPopulation,
+  variancePopulation, q1, q3, iqr }` over the finite numbers in `values` (null, NaN, text are ignored).
+  - `sd` / `variance` are the **sample** statistics (n − 1; Excel `STDEV.S` / `VAR.S`), null when count < 2.
+    `sdPopulation` / `variancePopulation` divide by n (0 for one value).
+  - Quartiles are Excel **QUARTILE.INC** (R type 7): sort ascending, position h = (n − 1)·p counted from 0,
+    value = x[⌊h⌋] + (h − ⌊h⌋)·(x[⌊h⌋+1] − x[⌊h⌋]). `median` = Q2. Example: 46 55 62 70 75 81 84 88 93 96 →
+    Q1 64, median 78, Q3 87.
+  - `mean` = `fix(util.sum(values) / n)`, the same formula as `computeCourse().average`, so the panel's
+    Average equals the class average.
+  - count 0: `count` is 0 and every other field null.
+- `quartileInc(values, k)` (k = 0…4) and `percentileInc(values, p)` (0 ≤ p ≤ 1) → number or null.
+- `bins10(values)` → the 12 eLearning bins `[{ label, lo, hi, rule, count }]` in panel order:
+  `'Greater than 100'` (v > 100; hi null), `'90 - 100'` (90 ≤ v ≤ 100), `'80 - 89'` … `'0 - 9'`
+  (10k ≤ v < 10k + 10, so 89.99 is in `'80 - 89'` and 79.995 in `'70 - 79'`), `'Less than 0'` (v < 0; lo null).
+  `rule` is a short phrase per bin ("at least 80 and below 90"); `BINS10_RULE` is the sentence for the panel
+  tooltip; `BINS10` lists the bins; `bin10Index(v)` → 0…11 (−1 for a non-number). Counts add up to
+  `describe(values).count`.
+- `histogram(values, width = 10, lo = 0, hi = 100)` → `[{ lo, hi, label, count, below, above }]`,
+  ⌈(hi − lo) / width⌉ bins; each holds lo ≤ v < hi, the **last** lo ≤ v ≤ hi (100 is in 90–100). Values below
+  `lo` are counted in the first bin and values above `hi` in the last; `below` / `above` say how many (0 on
+  every other bin), so the chart can mark them. `label` is `'90–100'` (en dash). A width that is not above 0
+  means 10; hi ≤ lo means hi = lo + width; at most 1,000 bins.
+
+### 10.2 Values for the panel's measure selector
+
+- `activeTotals(course, results)` → active students' `total`, in `course.students` order (non-finite left
+  out). The panel is `describe(activeTotals(…))` and `bins10(activeTotals(…))`.
+- `assessmentValues(course, results, assessmentId, { percent })` → active students' **raw** numeric scores
+  on that item (the effective entry: team score, override or own score; as entered, before a late penalty),
+  empty and invalid cells left out. `{ percent: true }` → `v × 100 / maxScore` (the item's own max:
+  participation 4.5 of 5 is 90, so it goes in `'90 - 100'`). Unknown item → `[]`. With an assessment as the
+  measure, the STATISTICS column uses the raw values and the bins the percent values (label says so).
+
+### 10.3 Course summaries
+
+- `statusDistribution(course, results)` → `{ active, withdrawn, complete, incomplete, invalidEntries,
+  overrides }`. complete + incomplete = active (`incomplete` = calc's flag: an empty or invalid score on an
+  item with weight > 0). `invalidEntries` and `overrides` count **cells** of active students (invalid text;
+  per-member overrides of team scores).
+- `letterDistribution(course, results, { letters })` → `[{ letter, min, count, pct, inScale }]`: every
+  letter of the scale, highest cutoff first (zero counts included), then one row `{ min: null, inScale:
+  false }` per other letter met (a final letter the scale no longer has). `pct` = 100 × count / active
+  students (null when there are none).
+- `passRate(course, results, { letters })` → `{ passing, total, pct, passingLetter, unknown }`. Passing =
+  the letter is `passingLetter` or higher in scale order; `passingLetter` = `model.passingLetterFor(scale,
+  settings.passingLetter, course.level)`; `unknown` = letters outside the scale (not passing); `pct` null
+  when `total` is 0.
+- `perAssessment(course, results)` → one item per assessment, course order: `{ assessmentId, name,
+  maxScore, weight, teamGraded, n, missing, invalid, mean, median, min, max, sd, meanPct }` from
+  `assessmentValues` (raw). `n` = students with a number; `missing` = without one (empty **or invalid**), so
+  n + missing = active students; `invalid` = those holding invalid text. `sd` sample (null when n < 2).
+  `meanPct` = mean × 100 / maxScore (participation: 4.3 of 5 → 86); null when n = 0.
+- `perTeam(course, results)` → one item per team (`course.teams` order), then `{ teamId: null, name: 'No
+  team' }` when at least one **active** student has no team (or a team id that no longer exists):
+  `{ teamId, name, members, activeMembers, mean, min, max, teamScores: { aid: number|null }, overrides
+  [, avgUnexcused] }`. `members` counts every member (withdrawn included); the rest uses active members.
+  mean/min/max of their totals (null when none). `teamScores`: the stored team score of each team-graded
+  item (null when empty or invalid; `{}` for No team). `overrides`: override cells of active members.
+  `avgUnexcused` is present **only when attendance is not off**: mean `attendance.courseSummary().byStudent
+  [sid].unexcused` of the active members (null when none).
+
+### 10.4 Students
+
+- `topBottom(course, results, n = 5, { letters })` → `{ top, bottom }`, items `{ studentId, total, letter,
+  rank }` (rank = `computeCourse`'s competition rank, shared on ties). `top` highest first, `bottom`
+  **lowest first**; equal totals ordered by name (`calc.compareByName`) in both. The lists overlap when the
+  class has fewer than 2n students. Non-finite totals are left out.
+- `borderline(course, results, within = 1, { letters })` → students whose `totalUnrounded` is more than 0
+  and at most `within` points below `calc.minTotalForLetter(nextLetter)`, by gap ascending then name:
+  `{ studentId, total, totalUnrounded, letter, suggestedLetter, nextLetter, cutoff, minTotal, gap,
+  finalAtOrAboveNext }`. `nextLetter` is the scale letter just above the band the total is in (from the
+  cutoffs, whatever the final letter); `cutoff` its scale min; `minTotal` the unrounded total that earns it
+  (rounding `'integer'`: cutoff − 0.5; `'hundredth'`: cutoff − 0.005; the curve is inside
+  `totalUnrounded`); `gap = minTotal − totalUnrounded`. `letter` is the effective letter;
+  `finalAtOrAboveNext` = a final letter is set that is `nextLetter` or higher (already raised by hand).
+  Students in the top band are never listed.
+- `gaps(course, results, minGap = 1)` → natural breaks: for neighbouring distinct active totals (ascending)
+  with difference ≥ minGap, `{ below, above, gap, mid, countAbove }` (`mid` halfway; `countAbove` = active
+  students with a total ≥ `above`), sorted by gap descending, then by `above` descending. Equal totals never
+  form a gap.
+
+### 10.5 Cutoff planner
+
+- `simulate(course, results, scale, { letters })` changes nothing. `scale` goes through
+  `model.normalizeLetterScale(scale, course.level)` (sorted, bottom letter at 0, F appended when missing,
+  the default scale when nothing valid is left) and each active student's `total` through `calc.letterFor`.
+  Returns `{ scale, distribution, byId, students, changes, finalChanges }`:
+  - `scale`: the normalized scale; `distribution`: as `letterDistribution`, over that scale;
+    `byId`: `{ studentId: simulated letter }`;
+  - `students`: `[{ studentId, total, suggested, finalLetter, current, simulated, changed }]`, total
+    descending then name; `current` = effective letter (or the suggestion with `{ letters: 'suggested' }`);
+    `changed = simulated !== current`; `changes` = the rows with `changed`;
+  - `finalChanges: { onlyEmpty, all }` = how many stored final letters "Use these as final letters…" would
+    change with "Only students without a final letter" / "All active students" (for the confirm dialog).
+- `lettersFromScale(course, results, scale, { onlyEmpty = false })` → `[{ studentId, letter }]` for active
+  students (course order), the letter `simulate` gives, spelled as the course's scale spells it
+  (`model.matchLetter`); letters that are not in the course's scale are left out (a sandbox that only moves
+  cutoffs never has any). Pass it to `model.setFinalLetters` inside ONE `GT.store.transact` (one undo step);
+  its `changed` equals `finalChanges.onlyEmpty` / `.all`.
+- "Apply cutoffs to Settings" writes `simulate(…).scale` (already normalized) into
+  `course.settings.letterScale`; this changes only the suggested letters.
+- What-if (ST2) is `calc.neededScore(course, student, assessmentId, letter)` (section 3).

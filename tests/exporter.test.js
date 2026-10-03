@@ -713,6 +713,58 @@ describe('buildSheet rows and cells', () => {
     assert.equal(rowOf(activeIndividuals(c).find((s) => s.teamId !== late.team.id && s !== late.late1 && s !== late.waived))[3].v, null);
   });
 
+  test('stage 6: the sample\'s late work (lateWork) in the default preset: penalty formula, waived without one, notes and weeks', () => {
+    for (const template of ['SE4351', 'SE6362']) {
+      const c = model.createCourse(template);
+      sample.loadInto(c, { lateWork: true });
+      // Plus participation (max 5) 1 week late: P = 10 × 5 / 100 = 0.5, scaled to its max.
+      const p = activeIndividuals(c).find((s) => model.getEntry(c.scores, s.id, 'a_part'));
+      model.setEntry(c.scores, p.id, 'a_part', model.withLate(model.getEntry(c.scores, p.id, 'a_part'), 1, false));
+      const res = calc.computeCourse(c);
+      const keys = DEFAULT(c);
+      // The weeks-late columns follow the weighted block, so the Total stays one SUM range.
+      assert.deepEqual(keys.filter((k) => /^late:/.test(k)), ['late:a_p1', 'late:a_t1', 'late:a_part']);
+      assert.equal(keys.indexOf('late:a_p1'), keys.indexOf('weighted:' + c.assessments[c.assessments.length - 1].id) + 1);
+      const sh = exporter.buildSheet(c, res, keys);
+      const ci = (k) => sh.columns.findIndex((x) => x.key === k);
+      const L = (k) => exporter.colLetter(ci(k) + 1);
+      let nT1 = 0, nP1 = 0;
+      sh.rowMeta.forEach((m, ri) => {
+        const row = sh.rows[ri], r = res.byId[m.studentId], n = ri + 2;
+        const t1 = r.items.a_t1, p1 = r.items.a_p1, part = r.items.a_part;
+        if (t1.weeksLate) {
+          nT1++;
+          // Not waived: the penalty comes off the raw cell before weighting.
+          assert.equal(row[ci('weighted:a_t1')].f, `MAX(0,${L('raw:a_t1')}${n}-10)/100*25`);
+          assert.equal(row[ci('raw:a_t1')].note, '1 week late, −10 points');
+          assert.equal(row[ci('late:a_t1')].v, 1);
+          assert.equal(row[ci('late:a_t1')].note, '−10 points');
+        } else {
+          assert.equal(row[ci('weighted:a_t1')].f, `${L('raw:a_t1')}${n}/100*25`);
+          assert.equal(row[ci('late:a_t1')].v, null);
+        }
+        if (p1.weeksLate) {
+          nP1++;
+          // Waived (pre-approved): no penalty in the formula, "1 (waived)" in the weeks-late column.
+          assert.equal(p1.waived, true);
+          assert.equal(row[ci('weighted:a_p1')].f, `${L('raw:a_p1')}${n}/100*10`);
+          assert.equal(row[ci('raw:a_p1')].note, '1 week late, penalty waived');
+          assert.equal(row[ci('late:a_p1')].v, '1 (waived)');
+          assert.equal(row[ci('late:a_p1')].note, 'Penalty waived');
+        }
+        if (part.weeksLate) {
+          assert.equal(row[ci('weighted:a_part')].f, `MAX(0,${L('raw:a_part')}${n}-0.5)/5*5`);
+          assert.equal(row[ci('raw:a_part')].note, '1 week late, −0.5 points');
+        }
+      });
+      assert.equal(nT1, 1, template);
+      assert.ok(nP1 >= 3, template + ': every member of the waived team');
+      assert.match(sh.columns[ci('late:a_t1')].note, /"2 \(waived\)" for pre-approved late work/);
+      // The spreadsheet's own arithmetic gives the app's weighted points, totals and letters.
+      assertParity(c, res, sh, (o) => sheetFromBuild(sh, o), template + ' sample late');
+    }
+  });
+
   test('without a Total column, Letter Grade holds plain suggestions, each with its letter in a note (review V4R2-1)', () => {
     const c = sampleCourse('SE4351');
     const res = calc.computeCourse(c);

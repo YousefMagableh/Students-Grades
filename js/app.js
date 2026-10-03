@@ -454,7 +454,7 @@
       confirmText: hasData ? 'Replace with sample data' : 'Load sample data', danger: hasData
     }).then(function (ok) {
       if (!ok) return;
-      store.transact('Load sample data', function (co) { GT.sample.loadInto(co); },
+      store.transact('Load sample data', function (co) { GT.sample.loadInto(co, { lateWork: true }); },
         { source: 'sample', historyMode: 'bulk', note: 'Replaced students, teams, scores and attendance with fake sample data' });
       ui.toast('Sample data loaded.', { type: 'success' });
     });
@@ -526,6 +526,7 @@
       ['Ctrl+C / Ctrl+V', 'Copy / paste a block (works with Excel)'],
       ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
       ['Shift+F10 or menu key', 'Cell and column actions (override, fill or clear a column, final letters)'],
+      ['Ctrl+L', 'Late work of the active score cell (weeks late, penalty waived)'],
       ['/', 'Search students'],
       ['Alt+1 … Alt+8', 'Switch tabs'],
       ['?', 'Show this list']

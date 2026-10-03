@@ -27,6 +27,7 @@
     { id: 'course', title: 'Course details', icon: 'file' },
     { id: 'assessments', title: 'Assessments and weights', icon: 'layers' },
     { id: 'calc', title: 'Grade calculation', icon: 'settings' },
+    { id: 'late', title: 'Late work', icon: 'clock' },
     { id: 'letters', title: 'Letter scale', icon: 'chart' },
     { id: 'data', title: 'Data & privacy', icon: 'database' }
   ];
@@ -51,9 +52,10 @@
   ];
 
   /** Where each placeholder is edited in this view: section, the element carrying data-ph-anchor,
-   * and what to focus inside it. lateWork and unexcusedThreshold are edited elsewhere (later views). */
+   * and what to focus inside it. unexcusedThreshold is edited in the Attendance tab. */
   var PH_TARGET = {
     letterScale: { sec: 'letters', focus: '[data-role="ls-min"]' },
+    lateWork: { sec: 'late', focus: 'input[data-field="late:perWeek"]' },
     passingLetter: { sec: 'letters', focus: 'select' },
     rounding: { sec: 'calc', focus: 'button[aria-pressed="true"]' },
     curve: { sec: 'calc', focus: 'input' },
@@ -65,6 +67,7 @@
   var MAX_NAME = 80;
   var MAX_LETTER = 6;
   var CURVE_LIMIT = 100;
+  var LATE_LIMIT = 100;   // points per week late: 100 takes a whole 100-point score per week
   var MAX_PARTS = 4;
 
   // ------------------------------------------------------------------ module state
@@ -453,6 +456,7 @@
       return a ? assessmentHandler(course, a, k.prop) : null;
     }
     if (k.kind === 'calc' && k.prop === 'curve') return curveHandler(course);
+    if (k.kind === 'late' && k.prop === 'perWeek') return lateHandler(course);
     if (k.kind === 'ls') return letterHandler(course, parseInt(k.id, 10), k.prop);
     return null;
   }
@@ -567,6 +571,24 @@
       same: function (v) { return v === cur; },
       label: function (v) { return v ? 'Set curve to ' + num(v) + ' points' : 'Remove curve'; },
       apply: function (c, v) { c.settings.curve = v; }
+    };
+  }
+
+  function lateHandler(course) {
+    var cur = typeof course.settings.latePointsPerWeek === 'number' ? course.settings.latePointsPerWeek : 10;
+    return {
+      stored: String(cur),
+      totals: 'totals',
+      parse: function (t) {
+        var p = util.parseScoreInput(t);
+        if (p.kind !== 'number' || p.value < 0 || p.value > LATE_LIMIT) {
+          return { error: 'Enter points from 0 to ' + LATE_LIMIT + ', for example 10 (0 turns the late penalty off).' };
+        }
+        return { value: p.value };
+      },
+      same: function (v) { return v === cur; },
+      label: function (v) { return 'Set the late penalty to ' + num(v) + ' points per week'; },
+      apply: function (c, v) { c.settings.latePointsPerWeek = v; }
     };
   }
 
@@ -1012,7 +1034,8 @@
       help: 'A flat number of points added to each total, for example 2. Use 0 for no curve.' + (curveBadge ? ' ' + esc(phNote(course, 'curve')) : '')
     }) + lockNoteHtml(course, 'totals') + '</div>';
     h += '</div>';
-    h += '<div class="callout set-formula"><strong>How totals are calculated.</strong> Weighted = raw ÷ max × weight. ' +
+    h += '<div class="callout set-formula"><strong>How totals are calculated.</strong> Weighted = raw ÷ max × weight ' +
+      '(a late score loses its late penalty first: see Late work). ' +
       'Total = sum of weighted + curve, then rounded (if set). Empty scores count as 0. The letter grade comes from the rounded total.</div>';
     var active = results ? results.activeIds.map(function (id) { return results.byId[id]; }).filter(function (r) { return r && isFinite(r.total); }) : [];
     if (active.length) {
@@ -1022,6 +1045,103 @@
         '(' + plural(active.length, 'active student') + ') · highest <span class="num">' + esc(ui.fmt(hi)) + '</span> · lowest <span class="num">' + esc(ui.fmt(lo)) + '</span></p>';
     } else {
       h += '<p class="set-effect muted" data-role="calc-effect">' + icon('info', 'icon-sm') + ' No active students yet: totals appear once students are added.</p>';
+    }
+    return h + '</div>';
+  }
+
+  // ------------------------------------------------------------------ render: 4b. late work (K4, STAGE6 §1)
+
+  /** Every late entry of the course, as each student sees it (calc.resolveEntry): one row per team
+   * entry (team-graded items without an override reach the whole team) and one per override or
+   * individual entry. Sorted by assessment order, then team or student name.
+   * [{ kind: 'team'|'override'|'individual', team, student, members, a, weeks, waived, penalty, scored, goto }] */
+  function lateEntries(course) {
+    var out = [], seen = Object.create(null);
+    var students = calc.sortStudents(course, null, 'name', 'asc');
+    course.assessments.forEach(function (a, ai) {
+      students.forEach(function (s) {
+        var r = calc.resolveEntry(course, s, a);
+        var e = r.entry;
+        var weeks = e && typeof e.weeksLate === 'number' && e.weeksLate > 0 ? e.weeksLate : 0;
+        if (!weeks) return;
+        var team = r.source === 'team' ? model.findTeam(course, r.teamId) : null;
+        var row = {
+          kind: team ? 'team' : r.source, a: a, order: ai, weeks: weeks, waived: !!e.waived,
+          penalty: calc.latePenalty(e, a, course.settings), scored: model.hasScore(e), team: team, student: team ? null : s,
+          members: 0, goto: s
+        };
+        if (team) {
+          var key = team.id + '\n' + a.id;
+          if (seen[key]) {
+            seen[key].members++;
+            if (seen[key].goto.status === 'withdrawn' && s.status !== 'withdrawn') seen[key].goto = s; // link to an active member
+            return;
+          }
+          seen[key] = row;
+          row.members = 1;
+        }
+        out.push(row);
+      });
+    });
+    return out;
+  }
+
+  function lateWho(course, row) {
+    if (row.kind === 'team') {
+      return '<strong>' + esc(row.team.name) + '</strong> <span class="muted small">team score · ' + esc(plural(row.members, 'member')) + '</span>';
+    }
+    var s = row.student;
+    var t = s.teamId ? model.findTeam(course, s.teamId) : null;
+    return '<span class="set-late-no">No ' + (typeof s.no === 'number' ? s.no : '–') + '</span> <span class="pii">' + esc(model.studentName(s) || '(no name)') + '</span>' +
+      (row.kind === 'override' ? ' <span class="muted small">◆ override' + (t ? ' (' + esc(t.name) + ')' : '') + '</span>' : '') +
+      (s.status === 'withdrawn' ? ' <span class="badge">Withdrawn</span>' : '');
+  }
+
+  function lateHtml(course) {
+    var s = course.settings;
+    var perWeek = typeof s.latePointsPerWeek === 'number' ? s.latePointsPerWeek : 10;
+    var rows = lateEntries(course);
+    var lateBadge = badge(course, 'lateWork');
+    var right = lateBadge + (rows.length ? '<span class="badge">' + esc(plural(rows.length, 'late entry', 'late entries')) + '</span>' : '');
+    var h = cardHead('late', 'Late work', 'Points come off a late score before weighting. Set the weeks late of a score in the Grades tab: ' +
+      'right-click the score and choose <strong>Late work…</strong>, or press <kbd>Ctrl+L</kbd>.', right);
+    h += '<div class="card-body">';
+    if (isUnconfirmed(course, 'lateWork')) {
+      h += '<div class="callout callout-warn set-ph-callout"><div class="set-ph-title"><strong>Late-work exceptions</strong>' + lateBadge + '</div>' +
+        '<div>' + esc(phNote(course, 'lateWork')) + '</div></div>';
+    }
+    h += '<div class="set-late-grid"><div data-ph-anchor="lateWork">' + textField('late:perWeek', 'Points deducted per week late', String(perWeek), {
+      numeric: true, badge: lateBadge, cls: 'set-in-num', suffix: 'points per week',
+      help: 'On a 100-point score; 0 turns the late penalty off. Default 10.'
+    }) + lockNoteHtml(course, 'totals') + '</div>';
+    var ex = util.fix(2 * perWeek);
+    var part = course.assessments.filter(function (a) { return a.maxScore !== 100 && a.maxScore > 0; })[0];
+    h += '<div class="callout set-formula set-late-rule"><strong>How the late penalty works.</strong> Deducted from the raw score before weighting: ' +
+      'weeks × points per week, scaled by max ÷ 100 when the max is not 100. Never below 0. Tick “Penalty waived” for pre-approved late work.' +
+      '<div class="set-late-example muted">Example: 2 weeks late on a score out of 100: 85 − ' + esc(num(ex)) + ' = ' + esc(num(Math.max(0, util.fix(85 - ex)))) + '.' +
+      (part ? ' On ' + esc(part.name) + ' (max ' + esc(num(part.maxScore)) + '), 1 week late costs ' + esc(num(util.fix(perWeek * part.maxScore / 100))) + ' points.' : '') +
+      ' A team-graded score is late for the whole team; a per-member override (◆) has its own late work.</div></div>';
+    h += '</div>';
+    h += '<h3 class="set-late-h">Late entries in this course</h3>';
+    if (!rows.length) {
+      h += '<p class="muted set-late-none">' + icon('check', 'icon-sm') + ' No late work in this course.</p>';
+    } else {
+      var canGo = !!(GT.app && GT.app.navigate && GT.views.grades);
+      h += '<div class="table-wrap set-late-wrap"><table class="table set-late-table"><thead><tr>' +
+        '<th scope="col">Student or team</th><th scope="col">Assessment</th><th scope="col" class="num">Weeks late</th>' +
+        '<th scope="col">Penalty waived</th><th scope="col" class="num">Penalty</th><th scope="col"><span class="sr-only">Go to the score</span></th></tr></thead><tbody>' +
+        rows.map(function (r, i) {
+          var pen = r.waived ? '<span class="muted">none (waived)</span>'
+            : !(r.penalty > 0) ? '<span class="muted">0</span>'
+            : '−' + esc(num(r.penalty)) + ' points' + (r.scored ? '' : ' <span class="muted small">(once scored)</span>');
+          var target = r.kind === 'team' ? r.team.name + ' (' + r.a.name + ')' : r.a.name + ' of No ' + (typeof r.goto.no === 'number' ? r.goto.no : '?');
+          return '<tr' + (r.waived ? ' class="is-waived"' : '') + '><td>' + lateWho(course, r) + '</td><td>' + esc(r.a.name) + '</td>' +
+            '<td class="num">' + r.weeks + '</td><td>' + (r.waived ? icon('check', 'icon-sm') + ' yes (pre-approved)' : 'no') + '</td>' +
+            '<td class="num">' + pen + '</td><td class="set-late-go">' + (canGo
+              ? '<button type="button" class="btn btn-sm btn-ghost" data-act="late-goto" data-sid="' + esc(r.goto.id) + '" data-aid="' + esc(r.a.id) + '"' +
+                ' data-field="late:goto:' + i + '" aria-label="' + esc('Show ' + target + ' in Grades') + '">Show in Grades' + icon('chevron-right') + '</button>'
+              : '') + '</td></tr>';
+        }).join('') + '</tbody></table></div>';
     }
     return h + '</div>';
   }
@@ -1208,6 +1328,7 @@
         course: courseHtml(course),
         assessments: assessmentsHtml(course),
         calc: calcHtml(course, results),
+        late: lateHtml(course),
         letters: lettersHtml(course, results),
         data: dataHtml()
       };
@@ -2147,6 +2268,9 @@
       case 'del-letter': deleteLetter(b.getAttribute('data-letter')); break;
       case 'reset-letters': resetLetters(); break;
       case 'unlock': unlockScores(); break;
+      case 'late-goto':
+        if (GT.app && GT.app.navigate) GT.app.navigate('grades', { focus: { studentId: b.getAttribute('data-sid'), assessmentId: aid } });
+        break;
       case 'finalize': if (typeof ui.openFinalize === 'function') ui.openFinalize(); break;
       case 'copy-suggested': copySuggested(); break;
       case 'backup': if (a.backup) a.backup(); break;

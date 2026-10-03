@@ -188,6 +188,57 @@ describe('team scores and propagation', () => {
     assert.equal(out[1].studentId, delta.id);
   });
 
+  test('stage 6: late work on a team entry (set, waive, remove): kind late for the team, propagation to members without override, adjusted values follow', () => {
+    const { c, t1, alpha, bravo, charlie } = setup();
+    const P1A = model.findAssessment(c, P1);
+    const adjusted = (s) => calc.scoreDetail(c, s, P1A).adjusted;
+    const total = (s) => calc.studentResult(c, s).total;
+    const before = { alpha: total(alpha), bravo: total(bravo), charlie: total(charlie) };
+    // 1. Team 1 handed Project I in 2 weeks late (what the "Late work…" dialog writes for a team cell).
+    let out = change(c, (co) => model.setTeamScore(co, t1.id, P1, model.withLate(model.getEntry(co.teamScores, t1.id, P1), 2, false)));
+    assert.deepEqual(briefs(out), [
+      ['late', 'Team 1', 'Project I: weeks late', '', '2'],
+      ['propagation', 'Student 01, Alpha', 'Project I', '90', '90 (2 weeks late)'],
+      ['propagation', 'Student 02, Bravo', 'Project I', '90', '90 (2 weeks late)']
+    ]);
+    assert.equal(out[0].teamId, t1.id);
+    assert.equal(out[0].studentId, null);
+    assert.equal(out[0].fieldKey, 'late:' + P1 + '.weeksLate');
+    assert.equal(out[0].note, 'Team score for 3 members');
+    out.slice(1).forEach((e) => assert.equal(e.note, 'From Team 1 team score'));
+    // Members see the adjusted score (90 − 20 = 70): 2 points off a 10% item; the override member (95) keeps hers.
+    assert.equal(adjusted(alpha), 70);
+    assert.equal(adjusted(bravo), 70);
+    assert.equal(adjusted(charlie), 95);
+    assert.equal(total(alpha), util.fix(before.alpha - 2));
+    assert.equal(total(bravo), util.fix(before.bravo - 2));
+    assert.equal(total(charlie), before.charlie);
+    // 2. Waived (pre-approved): one late entry for the team, members back to 90.
+    out = change(c, (co) => model.setTeamScore(co, t1.id, P1, model.withLate(model.getEntry(co.teamScores, t1.id, P1), 2, true)));
+    assert.deepEqual(briefs(out), [
+      ['late', 'Team 1', 'Project I: penalty waived', 'no', 'yes'],
+      ['propagation', 'Student 01, Alpha', 'Project I', '90 (2 weeks late)', '90 (2 weeks late, penalty waived)'],
+      ['propagation', 'Student 02, Bravo', 'Project I', '90 (2 weeks late)', '90 (2 weeks late, penalty waived)']
+    ]);
+    assert.equal(out[0].fieldKey, 'late:' + P1 + '.waived');
+    assert.equal(adjusted(alpha), 90);
+    assert.equal(total(alpha), before.alpha);
+    // 3. Back on time (weeks 0): both fields logged, members back to the plain score.
+    out = change(c, (co) => model.setTeamScore(co, t1.id, P1, model.withLate(model.getEntry(co.teamScores, t1.id, P1), 0, false)));
+    assert.deepEqual(briefs(out), [
+      ['late', 'Team 1', 'Project I: weeks late', '2', ''],
+      ['late', 'Team 1', 'Project I: penalty waived', 'yes', 'no'],
+      ['propagation', 'Student 01, Alpha', 'Project I', '90 (2 weeks late, penalty waived)', '90'],
+      ['propagation', 'Student 02, Bravo', 'Project I', '90 (2 weeks late, penalty waived)', '90']
+    ]);
+    assert.deepEqual(model.getEntry(c.teamScores, t1.id, P1), { value: 90 });
+    // Late info on the override member's own entry is hers alone: no team entry, no propagation.
+    out = change(c, (co) => model.setEntry(co.scores, charlie.id, P1, model.withLate(model.getEntry(co.scores, charlie.id, P1), 1, false)));
+    assert.deepEqual(briefs(out), [['late', 'Student 03, Charlie', 'Project I: weeks late', '', '1']]);
+    assert.equal(out[0].note, 'Per-member override');
+    assert.equal(adjusted(charlie), 85);
+  });
+
   test('late info on a team score: kind late for the team, and members see it through propagation', () => {
     const { c, t2 } = setup();
     const out = change(c, (co) => model.setTeamScore(co, t2.id, P1, { value: 80, weeksLate: 1 }));

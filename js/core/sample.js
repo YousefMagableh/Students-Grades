@@ -27,7 +27,8 @@
     withdrawn: 'Sample note: withdrew mid-semester',
     override: 'Sample note: team agreed in writing to an unequal Project I split',
     lateJoiner: 'Sample note: joined late',
-    excused: 'Sample note: absences excused by the instructor (medical)'
+    excused: 'Sample note: absences excused by the instructor (medical)',
+    lateWork: 'Sample note: Test 1 handed in 1 week late, not pre-approved'
   };
 
   function datasetKey(course) {
@@ -327,13 +328,67 @@
     att.totalsSessionsHeld = sessions.length;
   }
 
+  // ---------------------------------------------------------------- late work (K4, STAGE6 §1)
+
+  /** Exactly two late-work cases, picked with their own random stream ('late') so every other role and
+   * value stays as it was:
+   * 1. one active student's Test 1 (individually graded) 1 week late, penalty applied (not pre-approved);
+   * 2. one team's Project I 1 week late, penalty waived (pre-approved): on the team score when Project I is
+   *    team-graded (it reaches every member without an override), else on each member's own entry.
+   * Students with another role are never picked, and the team avoids the override member when it can.
+   * Returns { test: studentId|null, team: teamId|null }. */
+  function fillLate(ctx, roles) {
+    var course = ctx.course;
+    var rng = ctx.stream('late');
+    var out = { test: null, team: null };
+    var taken = {};
+    roles.withdrawn.concat(roles.incomplete, [roles.override, roles.lateJoiner, roles.streak3, roles.streak4, roles.scattered, roles.excused])
+      .forEach(function (i) { if (i !== null && i !== undefined && course.students[i]) taken[course.students[i].id] = true; });
+
+    var t1 = model.findAssessment(course, 'a_t1');
+    if (t1 && !t1.teamGraded) {
+      var cands = course.students.filter(function (st) {
+        var e = model.getEntry(course.scores, st.id, t1.id);
+        return st.status === 'active' && !taken[st.id] && !!e && typeof e.value === 'number';
+      });
+      if (cands.length) {
+        var who = cands[rng.int(0, cands.length - 1)];
+        model.setEntry(course.scores, who.id, t1.id, model.withLate(model.getEntry(course.scores, who.id, t1.id), 1, false));
+        if (!who.notes) who.notes = NOTES.lateWork;
+        out.test = who.id;
+      }
+    }
+
+    var p1 = model.findAssessment(course, 'a_p1');
+    if (p1 && course.teams.length) {
+      var overrideTeam = roles.override !== null && course.students[roles.override] ? course.students[roles.override].teamId : null;
+      var teams = course.teams.filter(function (t) { return t.id !== overrideTeam; });
+      if (!teams.length) teams = course.teams.slice();
+      var team = teams[rng.int(0, teams.length - 1)];
+      if (p1.teamGraded) {
+        var te = model.getEntry(course.teamScores, team.id, p1.id);
+        if (te) model.setTeamScore(course, team.id, p1.id, model.withLate(te, 1, true));
+      } else {
+        ctx.membersOf[team.id].forEach(function (st) {
+          var e = model.getEntry(course.scores, st.id, p1.id);
+          if (e) model.setEntry(course.scores, st.id, p1.id, model.withLate(e, 1, true));
+        });
+      }
+      out.team = team.id;
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------- entry point
 
   /** Replaces the course's teams, students, scores, team scores and attendance marks/totals with
    * the sample dataset: no final letters, and the scores are not finalized (course.finalized = null).
    * Leaves assessments, settings, placeholders, history, export presets and the attendance
-   * mode/sessions alone, and writes no history (the store logs one bulk entry). */
-  function loadInto(course) {
+   * mode/sessions alone, and writes no history (the store logs one bulk entry).
+   * opts.lateWork: also add the two late-work cases (fillLate; the "Load sample data" button does).
+   * Without it the data has no late work, so the default export keeps the old sheet's layout. */
+  function loadInto(course, opts) {
+    var withLate = !!(opts && opts.lateWork === true);
     var spec = DATASETS[datasetKey(course)];
     var seed = String(course.template) + ':' + String(course.level);
     var stream = function (purpose) { return createRng(seed + '|' + purpose); };
@@ -375,7 +430,12 @@
 
     fillScores(ctx, roles);
     fillAttendance(ctx, roles);
-    return { students: students.length, teams: teams.length };
+    var out = { students: students.length, teams: teams.length };
+    if (withLate) {
+      var late = fillLate(ctx, roles);
+      out.late = (late.test ? 1 : 0) + (late.team ? 1 : 0); // late-work cases added (2 for the templates)
+    }
+    return out;
   }
 
   var api = {

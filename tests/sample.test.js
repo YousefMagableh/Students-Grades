@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const model = require('../js/core/model.js');
 const calc = require('../js/core/calc.js');
 const sample = require('../js/core/sample.js');
+const util = require('../js/core/util.js');
 
 const NATO = [
   'Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Golf', 'Hotel', 'India', 'Juliett',
@@ -513,4 +514,129 @@ test('stage 2b: a drop-down item with another step gets list values (nearest, ti
       if (e) assert.ok(model.isChoiceValue(a, e.value), `${aid} ${e.value}`);
     }
   }
+});
+
+// ---------------------------------------------------------------- stage 6: late work (K4, STAGE6 §1)
+
+/** Every stored entry with late info: [{ map: 'scores'|'teamScores', owner, aid, entry }]. */
+function lateEntries(course) {
+  const out = [];
+  for (const [name, map] of [['scores', course.scores], ['teamScores', course.teamScores]]) {
+    for (const owner of Object.keys(map)) {
+      for (const aid of Object.keys(map[owner])) {
+        const e = map[owner][aid];
+        if (e.weeksLate !== undefined || e.waived !== undefined) out.push({ map: name, owner, aid, entry: e });
+      }
+    }
+  }
+  return out;
+}
+
+const LATE_NOTE = 'Sample note: Test 1 handed in 1 week late, not pre-approved';
+
+test('stage 6: with lateWork, exactly two late cases per dataset (Test 1 late; one team\'s Project I late and waived)', () => {
+  for (const tpl of ['SE4351', 'SE6362']) {
+    const course = model.createCourse(tpl);
+    const r = sample.loadInto(course, { lateWork: true });
+    assert.equal(r.late, 2, tpl);
+    const late = lateEntries(course);
+    assert.equal(late.length, 2, `${tpl}: ${JSON.stringify(late)}`);
+    const t1 = late.find((x) => x.aid === 'a_t1');
+    const p1 = late.find((x) => x.aid === 'a_p1');
+    // 1. One active student's Test 1, 1 week late, penalty applied (not waived).
+    assert.equal(t1.map, 'scores');
+    const s = model.findStudent(course, t1.owner);
+    assert.equal(s.status, 'active');
+    assert.equal(typeof t1.entry.value, 'number');
+    assert.deepEqual(t1.entry, { value: t1.entry.value, weeksLate: 1 });
+    assert.equal(s.notes, LATE_NOTE);
+    // 2. One team's Project I team score, 1 week late, waived (pre-approved).
+    assert.equal(p1.map, 'teamScores');
+    const team = model.findTeam(course, p1.owner);
+    assert.ok(team, tpl);
+    assert.deepEqual(p1.entry, { value: p1.entry.value, weeksLate: 1, waived: true });
+    // The calculation: Test 1 loses 10 points (2.5 total points at 25%); the waived team loses nothing.
+    const res = calc.computeCourse(course);
+    const d = res.byId[s.id].items.a_t1;
+    assert.equal(d.penalty, 10);
+    assert.equal(d.adjusted, Math.max(0, d.raw - 10));
+    const members = model.teamMembers(course, team.id);
+    assert.ok(members.length >= 3);
+    for (const m of members) {
+      const dm = res.byId[m.id].items.a_p1;
+      assert.equal(dm.source, 'team', `${tpl}: the late team has no override`);
+      assert.equal(dm.weeksLate, 1);
+      assert.equal(dm.waived, true);
+      assert.equal(dm.penalty, 0);
+    }
+    // Exactly one student is late on Test 1; the others see the waived team score.
+    assert.equal(course.students.filter((x) => res.byId[x.id].items.a_t1.weeksLate > 0).length, 1);
+  }
+});
+
+test('stage 6: the late cases use their own random stream: every other value, role and total stays the same', () => {
+  for (const tpl of ['SE4351', 'SE6362']) {
+    const plain = model.createCourse(tpl);
+    sample.loadInto(plain);
+    const late = model.createCourse(tpl);
+    sample.loadInto(late, { lateWork: true });
+    const a = snapshot(plain), b = snapshot(late);
+    // Only the late student's note differs (raw scores, sources, teams, marks and status are the same).
+    const changed = b.students.filter((s, i) => JSON.stringify(s) !== JSON.stringify(a.students[i]));
+    assert.equal(changed.length, 1, tpl);
+    assert.equal(changed[0].notes, LATE_NOTE);
+    assert.deepEqual(Object.assign({}, changed[0], { notes: '' }), Object.assign({}, a.students[b.students.indexOf(changed[0])], { notes: '' }));
+    assert.deepEqual(b.teamScores, a.teamScores);
+    // Totals: only the late Test 1 student changes, by exactly 10 × 25 / 100 = 2.5.
+    const ra = calc.computeCourse(plain), rb = calc.computeCourse(late);
+    const diffs = plain.students.map((s, i) => [s.lastName, util.fix(ra.byId[s.id].total - rb.byId[late.students[i].id].total)])
+      .filter((x) => x[1] !== 0);
+    assert.equal(diffs.length, 1, `${tpl}: ${JSON.stringify(diffs)}`);
+    assert.equal(diffs[0][1], 2.5);
+    // Without the option there is no late work at all.
+    assert.deepEqual(lateEntries(plain), []);
+  }
+});
+
+test('stage 6: the late cases are deterministic and never fall on a student with another role', () => {
+  for (const tpl of ['SE4351', 'SE6362', 'custom']) {
+    const pick = () => {
+      const c = model.createCourse(tpl);
+      sample.loadInto(c, { lateWork: true });
+      const late = lateEntries(c);
+      const s = model.findStudent(c, late.find((x) => x.aid === 'a_t1').owner);
+      const t = model.findTeam(c, late.find((x) => x.aid === 'a_p1').owner);
+      return { c, s, t };
+    };
+    const x = pick(), y = pick();
+    assert.equal(x.s.lastName, y.s.lastName, tpl);
+    assert.equal(x.t.name, y.t.name, tpl);
+    const res = calc.computeCourse(x.c);
+    const r = res.byId[x.s.id];
+    assert.equal(r.incomplete, false, `${tpl}: not an incomplete student`);
+    assert.equal(r.overrideCount, 0, `${tpl}: not the override student`);
+    // The waived team is not the team of the per-member override.
+    const [o] = allOverrides(x.c);
+    assert.notEqual(model.findStudent(x.c, o.sid).teamId, x.t.id, tpl);
+  }
+});
+
+test('stage 6: an individually graded Project I gets the waived late work on each member of one team', () => {
+  const course = model.createCourse('SE4351');
+  model.findAssessment(course, 'a_p1').teamGraded = false;
+  sample.loadInto(course, { lateWork: true });
+  const late = lateEntries(course).filter((x) => x.aid === 'a_p1');
+  assert.ok(late.length >= 7 && late.every((x) => x.map === 'scores'));
+  const teams = new Set(late.map((x) => model.findStudent(course, x.owner).teamId));
+  assert.equal(teams.size, 1);
+  late.forEach((x) => assert.deepEqual(x.entry, { value: x.entry.value, weeksLate: 1, waived: true }));
+  assert.equal(lateEntries(course).filter((x) => x.aid === 'a_t1').length, 1);
+});
+
+test('stage 6: the loaded late work survives normalization unchanged', () => {
+  const course = model.createCourse('SE6362');
+  sample.loadInto(course, { lateWork: true });
+  const normalized = model.normalizeCourse(JSON.parse(JSON.stringify(course)));
+  assert.deepEqual(normalized.scores, course.scores);
+  assert.deepEqual(normalized.teamScores, course.teamScores);
 });

@@ -223,6 +223,26 @@
 .set-effect { margin: 10px 0 0; font-size: 13px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
 .set-effect .icon { color: var(--info); }
 
+/* ------------------------------------------------------------------ 4b. late work (K4) */
+
+.set-late-grid { display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 16px 22px; align-items: start; }
+.set-late-grid .set-formula { margin-top: 0; }
+.set-late-example { margin-top: 6px; font-size: 12.5px; }
+.set-late-h { margin: 18px 0 8px; font-size: 13px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.set-late-none { margin: 0; display: flex; align-items: center; gap: 6px; }
+.set-late-none .icon { color: var(--success); }
+.set-late-wrap { max-width: 980px; }
+.set-late-table td { vertical-align: middle; }
+.set-late-table .set-late-no { color: var(--text-muted); font-variant-numeric: tabular-nums; margin-right: 2px; }
+.set-late-table td .icon-sm { width: 13px; height: 13px; vertical-align: -2px; color: var(--success); }
+.set-late-table tr.is-waived td:nth-child(5) { color: var(--text-muted); }
+.set-late-table .set-late-go { text-align: right; white-space: nowrap; width: 1%; }
+.set-late-table .set-late-go .btn .icon { width: 14px; height: 14px; }
+.set-card-sub kbd, .set-late-rule kbd { font-size: 11px; }
+@media (max-width: 720px) {
+  .set-late-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ------------------------------------------------------------------ 5. letter scale */
 
 .set-ls-wrap { max-width: 760px; }
@@ -300,7 +320,7 @@ tr.set-flash > td { animation: set-flash-cell 1.6s var(--ease); }
 
 @media print {
   .set-toc, .set-card-actions, .set-course-actions, .set-data-actions, .set-row-actions, .set-order .btn,
-  .set-ph-actions, .set-privacy, .set-status-actions { display: none !important; }
+  .set-ph-actions, .set-privacy, .set-status-actions, .set-late-go { display: none !important; }
   .set-layout { display: block; }
   .set-card { break-inside: avoid; margin-bottom: 10px; }
 }

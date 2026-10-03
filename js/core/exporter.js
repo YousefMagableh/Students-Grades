@@ -378,7 +378,8 @@
         return '= raw ÷ max × weight (' + a.name + ' ÷ ' + num(a.maxScore) + ' × ' + num(a.weight || 0) + ').' +
           (ppw > 0 ? ' Late work: ' + num(ppw) + ' points per week late (on a 100-point scale) come off the raw score first, never below 0.' : '');
       case 'late':
-        return 'Weeks late. Each week costs ' + num(ppw) + ' points on a 100-point scale (scaled to the max score), unless the penalty was waived.';
+        return 'Weeks late. Each week costs ' + num(ppw) + ' points on a 100-point scale (scaled to the max score), unless the penalty was waived. ' +
+          'Write the weeks as a whole number, "2 (waived)" for pre-approved late work, and leave the cell empty when on time.';
       default:
         break;
     }

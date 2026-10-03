@@ -714,6 +714,77 @@ describe('values', () => {
     assert.equal(plan.counts.invalid, 1);
   });
 
+  test('weeks late (stage 6): typed spellings, a bare "waived", 0 and fractions', () => {
+    const late = (text, start) => {
+      const c = course();
+      const a = c.students[0];
+      if (start) model.setEntry(c.scores, a.id, 'a_t1', model.withLate(model.getEntry(c.scores, a.id, 'a_t1'), start.weeks, start.waived));
+      const { plan } = importRows(c, [['Last Name', 'First Name', 'Test 1: weeks late'], ['Student 01', 'Alpha', text]]);
+      return { e: eff(c, a, 'a_t1'), plan };
+    };
+    // Spellings a person may type: the weeks, a unit, "late", and the waiver.
+    assert.deepEqual(late('1 week').e, { value: 80, weeksLate: 1 });
+    assert.deepEqual(late('2 weeks late').e, { value: 80, weeksLate: 2 });
+    assert.deepEqual(late('3 wk').e, { value: 80, weeksLate: 3 });
+    assert.deepEqual(late('2 waived').e, { value: 80, weeksLate: 2, waived: true });
+    assert.deepEqual(late('2 weeks late, penalty waived').e, { value: 80, weeksLate: 2, waived: true });
+    assert.deepEqual(late('2.0 (Waived)').e, { value: 80, weeksLate: 2, waived: true });
+    // A bare "waived" keeps the stored weeks late and waives the penalty.
+    assert.deepEqual(late('waived', { weeks: 2, waived: false }).e, { value: 80, weeksLate: 2, waived: true });
+    assert.deepEqual(late('(waived)', { weeks: 1, waived: false }).e, { value: 80, weeksLate: 1, waived: true });
+    // ... and is refused without weeks late to keep.
+    const none = late('waived');
+    assert.deepEqual(none.e, { value: 80 });
+    assert.equal(none.plan.counts.invalid, 1);
+    assert.match(none.plan.items[0].issues[0].message, /"waived" needs the weeks late/);
+    // 0 means on time: the late info is removed (a waiver goes with it).
+    assert.deepEqual(late('0', { weeks: 2, waived: true }).e, { value: 80 });
+    // Whole weeks only (util.parseCount): fractions, signs and words are refused and change nothing.
+    for (const bad of ['1.5', '-1', '+2', 'two', '1e1', '2 days']) {
+      const r = late(bad, { weeks: 1, waived: false });
+      assert.deepEqual(r.e, { value: 80, weeksLate: 1 }, bad);
+      assert.equal(r.plan.counts.invalid, 1, bad);
+    }
+  });
+
+  test('weeks late of a team-graded item (stage 6): the late info reaches the team score, waived or not', () => {
+    const c = model.createCourse('SE4351');
+    const t = addTeam(c, 'Team 1');
+    const a = addStudent(c, 'Student 01', 'Alpha', { teamId: t.id });
+    const b = addStudent(c, 'Student 02', 'Bravo', { teamId: t.id });
+    model.setTeamScore(c, t.id, 'a_p1', { value: 90 });
+    importRows(c, [['Last Name', 'First Name', 'Project I', 'Project I: weeks late'], ['Student 01', 'Alpha', '90', '1'], ['Student 02', 'Bravo', '90', '1']]);
+    assert.deepEqual(model.getEntry(c.teamScores, t.id, 'a_p1'), { value: 90, weeksLate: 1 });
+    assert.equal(model.getEntry(c.scores, a.id, 'a_p1'), null, 'no override is created');
+    assert.equal(calc.computeCourse(c).byId[b.id].items.a_p1.adjusted, 80);
+    importRows(c, [['Last Name', 'First Name', 'Project I', 'Project I: weeks late'], ['Student 01', 'Alpha', '90', '1 (waived)'], ['Student 02', 'Bravo', '90', '1 (waived)']]);
+    assert.deepEqual(model.getEntry(c.teamScores, t.id, 'a_p1'), { value: 90, weeksLate: 1, waived: true });
+    assert.equal(calc.computeCourse(c).byId[b.id].items.a_p1.adjusted, 90);
+  });
+
+  test('weeks late round trip (stage 6): the exported late column, waived or not, imports back to the same late work and totals', () => {
+    const c = model.createCourse('SE4351');
+    sample.loadInto(c, { lateWork: true });
+    // One more late entry with a penalty that reaches a whole team, and an override with its own waived late work.
+    model.setTeamScore(c, c.teams[2].id, 'a_p2', model.withLate(model.getEntry(c.teamScores, c.teams[2].id, 'a_p2'), 2, false));
+    const res = calc.computeCourse(c);
+    const keys = exporter.builtInPresets(c)[0].columns;
+    assert.ok(['late:a_p1', 'late:a_p2', 'late:a_t1'].every((k) => keys.includes(k)), keys.join());
+    const sh = exporter.buildSheet(c, res, keys);
+    const rows = [sh.columns.map((x) => x.label)].concat(sh.rows.map((r) => r.map((cell) => (cell.v === null || cell.v === undefined ? '' : String(cell.v)))));
+    const copy = emptyCopy(c);
+    importRows(copy, rows);
+    const res2 = calc.computeCourse(copy);
+    for (const s of c.students) {
+      const t = byName(copy, s.lastName, s.firstName);
+      for (const aid of ['a_p1', 'a_p2', 'a_t1']) {
+        const d1 = res.byId[s.id].items[aid], d2 = res2.byId[t.id].items[aid];
+        assert.deepEqual([d2.weeksLate, d2.waived, d2.penalty], [d1.weeksLate, d1.waived, d1.penalty], s.lastName + ' ' + aid);
+      }
+      assert.equal(res2.byId[t.id].total, res.byId[s.id].total, s.lastName);
+    }
+  });
+
   test('attendance totals: unexcused and excused columns; a total with excused mapped subtracts them', () => {
     const c = model.createCourse('SE4351');
     addStudent(c, 'Student 01', 'Alpha');

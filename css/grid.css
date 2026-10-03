@@ -71,11 +71,6 @@
 }
 .lg-invalid { background: var(--cell-invalid-bg); border-color: color-mix(in srgb, var(--cell-invalid-text) 30%, transparent); }
 .lg-range { background: var(--cell-range-bg); border-color: var(--warn-border); }
-.lg-late { position: relative; }
-.lg-late::after {
-  content: ""; position: absolute; top: 0; right: 0;
-  border-style: solid; border-width: 0 6px 6px 0; border-color: transparent var(--warn) transparent transparent;
-}
 .lg-mk { display: inline-flex; align-items: center; }
 .lg-mk .icon { width: 13px; height: 13px; }
 .grid-legend .mk-order { width: 13px; height: 13px; }
@@ -208,11 +203,44 @@
 }
 .grid-legend .mk-team { height: 14px; }
 .mk-ovr { color: var(--accent); font-size: 11px; }
-.gt-grid td.is-late { position: relative; }
-.gt-grid td.is-late::after {
-  content: ""; position: absolute; top: 0; right: 0;
-  border-style: solid; border-width: 0 7px 7px 0; border-color: transparent var(--warn) transparent transparent;
+/* late work (K4): "L2" = 2 weeks late, penalty applied (warn tint); "L2✓" = waived (muted, the L struck through).
+ * Floats left with the other markers, so the score stays right-aligned. */
+.mk-late {
+  display: inline-block; min-width: 18px; height: 16px; padding: 0 4px; border-radius: 4px;
+  border: 1px solid var(--warn-border); background: var(--warn-bg); color: var(--warn);
+  font-size: 10.5px; font-weight: 700; line-height: 14px; text-align: center; white-space: nowrap;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.01em;
 }
+.mk-late s { text-decoration-thickness: 1.5px; }
+.mk-late.is-waived {
+  border-color: var(--border-strong); background: var(--bg-sunken); color: var(--text-muted); font-weight: 600;
+}
+.gt-grid td.c-raw .mk-late { float: left; margin: 1px 4px 0 -3px; }
+.gt-grid td.c-raw .mk + .mk-late { margin-left: 0; }
+.team-score .mk-late { margin-right: 4px; vertical-align: 1px; }
+.grid-legend .mk-late { vertical-align: 0; }
+.gt-grid tr.row-withdrawn .mk-late:not(.is-waived) { color: var(--withdrawn-text); border-color: var(--border-strong); background: var(--bg-sunken); }
+/* a weighted score after a late penalty: a thin warn line on its left edge (details in the tooltip) */
+.gt-grid td.c-w.is-adjusted { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--warn) 70%, transparent); }
+
+/* "Late work…" dialog */
+.late-dialog .dlg-error { display: none; } /* the inline error under "Weeks late" says it */
+.late-dlg .late-who { margin: 0 0 10px; }
+.late-dlg .callout { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
+.late-dlg .callout > .icon { flex: none; margin-top: 2px; }
+.late-dlg .late-locked > .icon { color: var(--warn); }
+.late-dlg .late-score { margin: 0 0 12px; font-size: 13px; }
+.late-dlg #late-weeks { width: 7em; font-variant-numeric: tabular-nums; }
+.late-dlg #late-weeks.is-invalid { border-color: var(--danger); background: var(--cell-invalid-bg); color: var(--cell-invalid-text); }
+.late-dlg .late-err { margin-top: 4px; font-size: 12.5px; font-weight: 600; color: var(--danger); }
+.late-dlg .late-err:empty { display: none; }
+.late-dlg .late-preview {
+  margin-top: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-sunken); font-size: 13.5px; line-height: 1.5; font-variant-numeric: tabular-nums;
+}
+.late-dlg .late-preview.is-stale { opacity: 0.55; }
+.late-dlg .late-pv-total { margin-top: 4px; color: var(--text-muted); font-size: 12.5px; }
+.late-dlg .late-foot { margin: 10px 0 0; }
 
 /* calculated cells */
 .gt-grid td.ro:not(.g) { background-color: var(--grid-computed); }

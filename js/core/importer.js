@@ -603,15 +603,24 @@
     return hasOwn(STATUS_WORDS, t) ? { kind: 'value', value: STATUS_WORDS[t] } : { kind: 'invalid' };
   }
 
-  /** Weeks late: "2", "2 (waived)", "2 waived"; '' is empty. */
+  // Weeks late as this app exports it ("2", "2 (waived)") or as a person may type it ("2 waived",
+  // "1 week", "2 weeks late, penalty waived"). A whole number of weeks only (util.parseCount).
+  var LATE_RE = /^(\d+(?:\.0*)?)\s*(?:(?:weeks?|wks?)\.?)?\s*(?:late)?\s*,?\s*(\(\s*(?:penalty\s+)?waived\s*\)|(?:penalty\s+)?waived)?$/i;
+  var WAIVED_ONLY_RE = /^\(?\s*(?:penalty\s+)?waived\s*\)?$/i;
+
+  /** Weeks late: { kind: 'empty' } for '', { kind: 'value', weeks, waived } for "2", "2 (waived)",
+   * "2 waived", "1 week late", "2 weeks late, penalty waived"; { kind: 'waived' } for a bare "waived"
+   * ("(waived)", "penalty waived"): the student's weeks late stay and the penalty is waived;
+   * { kind: 'invalid' } otherwise (fractions, signs, text). */
   function parseLate(text) {
     var t = String(text || '').trim();
     if (t === '') return { kind: 'empty' };
-    var m = /^(\d+(?:\.0*)?)\s*(?:\(\s*waived\s*\)|waived)?$/i.exec(t);
+    if (WAIVED_ONLY_RE.test(t)) return { kind: 'waived' };
+    var m = LATE_RE.exec(t);
     if (!m) return { kind: 'invalid' };
     var weeks = util.parseCount(m[1]);
     if (weeks === null) return { kind: 'invalid' };
-    return { kind: 'value', weeks: weeks, waived: /waived/i.test(t) && weeks > 0 };
+    return { kind: 'value', weeks: weeks, waived: !!m[2] && weeks > 0 };
   }
 
   function scoreText(e) {
@@ -1127,10 +1136,18 @@
       }
       if (lateCell !== undefined) {
         var lp = parseLate(lateCell);
-        if (lp.kind === 'invalid') {
+        if (lp.kind === 'waived') {
+          // A bare "waived": the weeks late already stored stay, and the penalty is waived.
+          var keepW = !isNew && cur && cur.weeksLate > 0 ? cur.weeksLate : 0;
+          lp = keepW ? { kind: 'value', weeks: keepW, waived: true } : { kind: 'no-weeks' };
+        }
+        if (lp.kind === 'no-weeks') {
+          counts.invalid++;
+          issue(item, a.name + ': weeks late', lateCell.trim(), '"waived" needs the weeks late, for example "1 (waived)"; ignored');
+        } else if (lp.kind === 'invalid') {
           counts.invalid++;
           issue(item, a.name + ': weeks late', lateCell.trim(), 'Use a whole number of weeks, optionally "(waived)"; ignored');
-        } else if (lp.kind === 'value' || (o.emptyCells === 'clear' && !isNew)) {
+        } else if (lp.kind === 'value' || (lp.kind === 'empty' && o.emptyCells === 'clear' && !isNew)) {
           var weeks = lp.kind === 'value' ? lp.weeks : 0, waived = lp.kind === 'value' ? lp.waived : false;
           var curW = cur && cur.weeksLate > 0 ? cur.weeksLate : 0, curWv = !!(cur && cur.waived && curW);
           var same = weeks === curW && (!weeks || waived === curWv);

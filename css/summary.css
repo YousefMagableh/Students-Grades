@@ -1,1 +1,251 @@
-/* Grade Tracker - printable summary view styles (stage 6). */
+/* Grade Tracker - printable Summary tab (stage 6, STAGE6 §2 and Addendum §3).
+ * On screen: an options bar (.no-print) above a "paper" preview that follows the light/dark theme tokens.
+ * In print: only the paper, black on white, 10-11px text, bordered tables, the table header repeated on every
+ * page, no row split across pages, Letter landscape with 12 mm margins, and never the privacy blur.
+ * Every class is prefixed "sum-" and scoped to this view. */
+
+/* ------------------------------------------------------------------ screen: header and options */
+
+.view-summary { gap: 14px; }
+.sum-screen-head .btn svg { width: 16px; height: 16px; }
+
+.sum-options { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+.sum-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; }
+.sum-opt { font-weight: 550; }
+.sum-hint {
+  display: flex; align-items: flex-start; gap: 8px; margin: 0;
+  font-size: 12.5px; color: var(--text-muted); line-height: 1.45;
+}
+.sum-hint .icon { color: var(--info); margin-top: 1px; }
+.sum-hint strong { color: var(--text); font-weight: 650; }
+
+/* ------------------------------------------------------------------ the paper */
+
+.sum-paper {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow);
+  padding: 28px 32px 22px; font-size: 13px; line-height: 1.4; min-width: 0;
+}
+.sum-paper > * + * { margin-top: 18px; }
+
+/* header */
+.sum-head {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 12px 32px; flex-wrap: wrap;
+  padding-bottom: 12px; border-bottom: 2px solid var(--text);
+}
+.sum-head-main { min-width: 0; }
+.sum-kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+.sum-title { margin: 2px 0 0; font-size: 22px; font-weight: 700; line-height: 1.2; letter-spacing: -0.01em; }
+.sum-title-sep { margin: 0 0.4em; color: var(--text-faint); font-weight: 400; }
+.sum-title-text { font-weight: 600; }
+.sum-meta { margin-top: 3px; color: var(--text-muted); font-size: 13px; }
+.sum-facts {
+  display: grid; grid-template-columns: max-content max-content; gap: 2px 12px; margin: 0;
+  font-size: 12px; text-align: left;
+}
+.sum-facts > div { display: contents; }
+.sum-facts dt { color: var(--text-muted); }
+.sum-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* unconfirmed placeholders line */
+.sum-confirm {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 0;
+  padding: 7px 11px; font-size: 12.5px; line-height: 1.45;
+  background: var(--warn-bg); border: 1px solid var(--warn-border); border-left: 3px solid var(--warn); border-radius: var(--radius-sm);
+}
+.sum-confirm .icon { color: var(--warn); margin-top: 1px; }
+.sum-confirm-ok { background: var(--success-soft); border-color: color-mix(in srgb, var(--success) 35%, transparent); border-left-color: var(--success); }
+.sum-confirm-ok .icon { color: var(--success); }
+.sum-confirm-item { white-space: nowrap; }
+
+/* section headings */
+.sum-h {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; margin: 0 0 7px;
+  font-size: 12px; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text);
+}
+.sum-h4 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; margin: 12px 0 6px; font-size: 12.5px; font-weight: 650; }
+.sum-h-note { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--text-muted); }
+.sum-note { margin: 6px 0 0; font-size: 12px; color: var(--text-muted); }
+.sum-aside { color: var(--text-muted); font-weight: 400; }
+.sum-empty { margin: 0; padding: 14px; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); color: var(--text-muted); text-align: center; }
+.sum-empty-cell { text-align: center !important; color: var(--text-muted); padding: 14px !important; }
+.sum-warn-text { color: var(--danger); font-weight: 650; }
+
+/* weights + settings side by side */
+.sum-two { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 18px 28px; align-items: start; }
+
+/* ------------------------------------------------------------------ tables */
+
+.sum-table-wrap { position: relative; overflow-x: auto; max-width: 100%; }
+.sum-table { border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--text); }
+.sum-table th, .sum-table td { border: 1px solid var(--border-strong); padding: 4px 7px; text-align: left; vertical-align: middle; }
+.sum-table thead th {
+  background: var(--bg-sunken); font-size: 11.5px; font-weight: 650; line-height: 1.25; vertical-align: bottom;
+}
+.sum-table .num { text-align: right; }
+.sum-table thead th.num { text-align: right; }
+
+/* compact key/value tables (weights, settings): horizontal rules only */
+.sum-mini { width: 100%; }
+.sum-mini th, .sum-mini td { border-width: 0 0 1px; border-color: var(--border); padding: 4px 8px 4px 0; }
+.sum-mini thead th { background: none; color: var(--text-muted); border-bottom: 1px solid var(--border-strong); }
+.sum-mini tbody th { font-weight: 600; }
+.sum-mini tfoot th, .sum-mini tfoot td { font-weight: 700; border-bottom: 0; border-top: 1px solid var(--border-strong); }
+.sum-mini td.num, .sum-mini th.num { padding-right: 14px; }
+.sum-kv tbody th { width: 1%; white-space: nowrap; padding-right: 16px; color: var(--text-muted); font-weight: 600; vertical-align: top; }
+.sum-kv tbody td { vertical-align: top; }
+
+/* grade table */
+.sum-grades { width: 100%; }
+.sum-grades thead th { white-space: nowrap; }
+.sum-grades thead th.sum-group {
+  text-align: center; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted);
+}
+.sum-hn { white-space: nowrap; }
+/* Long assessment names (e.g. "Class/Project Participation") wrap instead of widening their column. */
+.sum-grades thead .sum-hn-long { display: inline-block; max-width: 8.5em; white-space: normal; }
+.sum-sub { display: block; font-size: 10.5px; font-weight: 500; color: var(--text-faint); white-space: nowrap; }
+.sum-grades tbody td { white-space: nowrap; }
+.sum-grades tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg-sunken) 55%, transparent); }
+.sum-grades tbody tr:hover td { background: var(--bg-hover); }
+.sum-grades .sum-c-no { color: var(--text-muted); }
+.sum-grades td.sum-c-total { font-weight: 700; }
+.sum-grades .sum-c-letter { text-align: center; }
+.sum-grades td.sum-c-letter { font-weight: 700; }
+.sum-grades thead th.sum-c-letter { text-align: center; }
+.sum-grades td.sum-c-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.sum-grades tr.sum-wd td { color: var(--withdrawn-text); }
+.sum-grades tr.sum-wd td.sum-c-letter { color: var(--text); }
+.sum-grades .sum-group-row th {
+  background: var(--bg-sunken); font-size: 11.5px; font-weight: 650; color: var(--text-muted); padding-top: 5px; padding-bottom: 5px;
+}
+.sum-none { color: var(--text-faint); font-weight: 400; }
+.sum-bad { font-style: italic; color: var(--cell-invalid-text); }
+
+/* markers (explained by the legend) */
+.sum-mk {
+  font-size: 0.74em; font-weight: 700; line-height: 0; margin-left: 2px; vertical-align: super;
+  color: var(--text-muted); cursor: help;
+}
+.sum-mk-warn { color: var(--warn); }
+.sum-mk-bad { color: var(--danger); }
+.sum-mk-waived { color: var(--text-faint); font-weight: 600; }
+.sum-ph { font-size: 0.8em; font-weight: 700; line-height: 0; margin-left: 2px; vertical-align: super; color: var(--warn); cursor: help; }
+
+.sum-legend { display: flex; flex-wrap: wrap; gap: 3px 16px; margin: 7px 0 0; font-size: 11.5px; color: var(--text-muted); }
+.sum-leg { min-width: 0; }
+.sum-leg-sym { display: inline-block; min-width: 1em; font-weight: 700; color: var(--text); text-align: center; }
+.sum-leg-sym.sum-mk-warn { color: var(--warn); }
+.sum-leg-sym.sum-mk-bad { color: var(--danger); }
+.sum-leg-sym.sum-mk-waived { color: var(--text-faint); }
+
+/* statistics */
+.sum-figures th, .sum-figures td { min-width: 76px; }
+.sum-figures td { font-size: 14px; font-weight: 650; padding-top: 6px; padding-bottom: 6px; }
+.sum-figures td .sum-aside { font-size: 12px; }
+.sum-dist th, .sum-dist td { min-width: 38px; text-align: center; }
+.sum-dist tbody th { text-align: left; font-weight: 600; color: var(--text-muted); background: var(--bg-sunken); }
+.sum-dist .sum-zero { color: var(--text-faint); }
+.sum-wrap-plain { display: block; }
+
+/* notes and signatures */
+.sum-lines > div { height: 26px; border-bottom: 1px solid var(--border-strong); }
+.sum-sign-row {
+  display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1.2fr) minmax(0, 3fr) minmax(0, 1.2fr);
+  gap: 14px 24px; margin-top: 30px;
+}
+.sum-sign-line { height: 26px; border-bottom: 1px solid var(--text); }
+.sum-sign-label { margin-top: 4px; font-size: 11.5px; color: var(--text-muted); }
+
+.sum-footer {
+  margin-bottom: 0; padding-top: 8px; border-top: 1px solid var(--border);
+  font-size: 11px; color: var(--text-faint);
+}
+
+/* ------------------------------------------------------------------ smaller screens */
+
+@media (max-width: 900px) {
+  .sum-two { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .sum-paper { padding: 18px 14px 14px; border-radius: var(--radius); }
+  .sum-title { font-size: 19px; }
+  .sum-head { align-items: flex-start; }
+  .sum-sign-row { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+  .sum-opts { gap: 8px 16px; }
+}
+
+/* ------------------------------------------------------------------ print */
+
+/* A named page, so landscape and these margins apply only when the Summary tab is printed. */
+@page summary {
+  size: letter landscape;
+  margin: 12mm;
+  @bottom-left { content: "Confidential: student grades"; font-family: Arial, Helvetica, sans-serif; font-size: 8px; color: #555; }
+  @bottom-right { content: "Page " counter(page) " of " counter(pages); font-family: Arial, Helvetica, sans-serif; font-size: 8px; color: #555; }
+}
+
+@media print {
+  .view-summary {
+    page: summary;
+    /* Light tokens on paper, also when the screen uses the dark theme. */
+    --bg: #fff; --bg-elev: #fff; --bg-sunken: #efefef; --bg-hover: transparent;
+    --border: #a6a6a6; --border-strong: #7a7a7a;
+    --text: #000; --text-muted: #333; --text-faint: #595959;
+    --warn: #7a5200; --warn-bg: #fff; --warn-border: #7a5200;
+    --danger: #a3160c; --success: #155c32; --success-soft: #fff; --info: #000;
+    --cell-invalid-text: #a3160c; --withdrawn-text: #4d4d4d;
+    color-scheme: light;
+    gap: 0;
+    color: #000;
+    font-size: 10.5px;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .view-summary .sum-paper {
+    border: 0; border-radius: 0; box-shadow: none; padding: 0; background: #fff; font-size: 10.5px;
+  }
+  .view-summary .sum-paper > * + * { margin-top: 10px; }
+  .sum-title { font-size: 17px; }
+  .sum-meta, .sum-facts { font-size: 10.5px; }
+  .sum-head { padding-bottom: 7px; border-bottom-width: 1.5px; }
+  .sum-confirm { padding: 4px 8px; font-size: 10px; background: #fff; border: 1px solid #7a5200; border-left-width: 3px; }
+  .sum-confirm .icon { width: 12px; height: 12px; }
+  .sum-h { font-size: 10.5px; margin-bottom: 4px; }
+  .sum-h4 { font-size: 10.5px; margin: 7px 0 4px; }
+  .sum-h-note, .sum-note, .sum-legend { font-size: 9.5px; }
+  .sum-two { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 10px 22px; }
+
+  .sum-table-wrap { overflow: visible !important; }
+  .sum-table { font-size: 10px; }
+  .sum-table th, .sum-table td { padding: 1.5px 4px; border-color: #7a7a7a; }
+  .sum-mini th, .sum-mini td { padding: 1.5px 6px 1.5px 0; border-color: #b3b3b3; }
+  .sum-table thead th { font-size: 9.5px; background: #ececec; }
+  .sum-mini thead th { background: none; }
+  .sum-sub { font-size: 8.5px; color: #4d4d4d; }
+  .sum-grades thead th.sum-group { font-size: 8.5px; }
+  .sum-grades tbody tr:nth-child(even) td { background: #f5f5f5; }
+  .sum-grades .sum-group-row th { background: #ececec; font-size: 9.5px; padding-top: 2px; padding-bottom: 2px; }
+  .sum-figures td { font-size: 11px; padding-top: 3px; padding-bottom: 3px; }
+  .sum-figures td .sum-aside { font-size: 9.5px; }
+  .sum-grades td.sum-c-name { max-width: none; }
+
+  /* Repeat the header row(s) on every page; never split a row across pages. */
+  .view-summary thead { display: table-header-group; }
+  .view-summary tfoot { display: table-row-group; }
+  .view-summary tr { break-inside: avoid; page-break-inside: avoid; }
+  .sum-group-row { break-after: avoid; page-break-after: avoid; }
+  .sum-h, .sum-h4 { break-after: avoid; page-break-after: avoid; }
+  .sum-head, .sum-confirm, .sum-two, .sum-stats, .sum-signoff, .sum-legend { break-inside: avoid; page-break-inside: avoid; }
+
+  .sum-lines > div { height: 20px; }
+  .sum-sign-row { margin-top: 22px; }
+  .sum-sign-line { height: 20px; }
+  .sum-sign-label { font-size: 9.5px; }
+  .sum-footer { font-size: 8.5px; }
+
+  /* Privacy blur is for the screen only. */
+  .view-summary .pii,
+  .privacy-on .view-summary .pii:not(.revealed) { filter: none !important; transition: none !important; color: inherit; text-shadow: none; user-select: auto; cursor: auto; }
+  .sum-mk, .sum-ph { cursor: auto; }
+}

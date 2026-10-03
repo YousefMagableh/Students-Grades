@@ -132,6 +132,36 @@
     return x === null || x === undefined || !isFinite(x) ? '—' : ui.fmt(x);
   }
 
+  /** The late penalty (points) the late info of a score detail carries, also before a score is entered. */
+  function latePenaltyOf(course, a, d) {
+    return d && d.weeksLate > 0 ? calc.latePenalty({ weeksLate: d.weeksLate, waived: d.waived }, a, course.settings) : 0;
+  }
+
+  /** "2 weeks late, −20 points (85 → 65)", "1 week late, penalty waived" ('' when on time). */
+  function lateText(course, a, d) {
+    if (!d || !(d.weeksLate > 0)) return '';
+    var t = plural(d.weeksLate, 'week') + ' late';
+    if (d.waived) return t + ', penalty waived (pre-approved)';
+    var p = latePenaltyOf(course, a, d);
+    if (!(p > 0)) return t + ', no points deducted (0 points per week)';
+    return t + ', −' + util.formatNumber(p, 4) + ' points' +
+      (d.state === 'number' ? ' (' + util.formatNumber(d.raw, 4) + ' → ' + util.formatNumber(d.adjusted, 4) + ')' : ' once a score is entered');
+  }
+
+  /** Students table: the late items of one student ("Test 1 · 2 wk · −20", "Project I · 1 wk · waived"). */
+  function lateCellHtml(course, r) {
+    if (!r || !(r.lateCount > 0)) return '<td class="st-late-cell"><span class="faint" title="No late work">—</span></td>';
+    var chips = course.assessments.map(function (a) {
+      var d = r.items[a.id];
+      if (!d || !(d.weeksLate > 0)) return '';
+      var p = latePenaltyOf(course, a, d);
+      var tail = d.waived ? 'waived' : (p > 0 ? '−' + util.formatNumber(p, 4) : 'no penalty');
+      return '<span class="st-late' + (d.waived ? ' is-waived' : '') + '" title="' + esc(a.name + ': ' + lateText(course, a, d) + (d.source === 'team' ? ' (team score)' : '')) + '">' +
+        esc(a.name) + ' · ' + d.weeksLate + ' wk · ' + esc(tail) + '</span>';
+    }).join('');
+    return '<td class="st-late-cell">' + chips + '</td>';
+  }
+
   function signed(x) {
     if (x === null || x === undefined || !isFinite(x)) return '—';
     if (x === 0) return '0';
@@ -1069,6 +1099,7 @@
       '<td class="st-team">' + (t ? esc(t.name) : '<span class="faint">No team</span>') + '</td>' +
       '<td class="st-status">' + (w ? '<span class="badge">Withdrawn</span>' : '<span class="muted">Active</span>') + '</td>' +
       finalCellHtml(course, s, r) +
+      lateCellHtml(course, r) +
       '<td class="st-notes">' + (s.notes ? '<span class="pii st-notes-text">' + esc(truncate(s.notes, 90)) + '</span>' : '') + '</td>' +
       '<td class="st-actions">' +
       '<button type="button" class="btn btn-ghost btn-icon btn-sm" data-act="details" data-id="' + id + '" data-fk="details:' + id + '" aria-label="Details for ' + ref + '" title="Details">' + icon('user') + '</button>' +
@@ -1139,7 +1170,9 @@
     h += '<div class="table-wrap st-table-wrap"><table class="table st-table"><thead><tr>' +
       sortTh('no', 'No', p, 'num') + sortTh('name', 'Last name', p) + '<th scope="col">First name</th>' +
       sortTh('team', 'Team', p) + sortTh('status', 'Status', p) +
-      '<th scope="col" class="st-final-h" title="Assigned in the Grades tab or in the student details">Final letter</th><th scope="col">Notes</th>' +
+      '<th scope="col" class="st-final-h" title="Assigned in the Grades tab or in the student details">Final letter</th>' +
+      '<th scope="col" class="st-late-h" title="Weeks late and the penalty of each late score. Set in the Grades tab: right-click a score → Late work…, or Ctrl+L">Late work</th>' +
+      '<th scope="col">Notes</th>' +
       '<th scope="col" class="st-actions-h"><span class="sr-only">Actions</span></th></tr></thead><tbody>' +
       list.map(function (s) { return studentRowHtml(course, s, results, locked); }).join('') +
       '</tbody></table></div>';
@@ -1283,7 +1316,10 @@
           ' value="' + esc(entryText(e)) + '" aria-label="' + esc(a.name + ' team score for ' + t.name) + '"' + (title ? ' title="' + esc(title) + '"' : '') +
           (locked ? ' readonly aria-readonly="true"' : '') + ' autocomplete="off" spellcheck="false">';
         return '<td class="ts-cell ' + groupClass(course, a) + '">' + ctrl +
-          (e && e.weeksLate > 0 ? ' <span class="badge badge-info" title="Late work">' + e.weeksLate + ' wk late' + (e.waived ? ', waived' : '') + '</span>' : '') +
+          (e && e.weeksLate > 0 ? ' <span class="st-late' + (e.waived ? ' is-waived' : '') + '" title="' +
+            esc('Late work of the whole team: ' + plural(e.weeksLate, 'week') + ' late' + (e.waived ? ', penalty waived (pre-approved)'
+              : ', −' + util.formatNumber(calc.latePenalty(e, a, course.settings), 4) + ' points') + '. Change it in the Grades tab (Ctrl+L on a member\'s score).') + '">' +
+            e.weeksLate + ' wk · ' + (e.waived ? 'waived' : '−' + esc(util.formatNumber(calc.latePenalty(e, a, course.settings), 4))) + '</span>' : '') +
           (nOv ? ' <span class="ts-ov-mark" title="' + plural(nOv, 'member has', 'members have') + ' a per-member override">◆' + nOv + '</span>' : '') +
           '</td>';
       }).join('');
@@ -2177,20 +2213,38 @@
         flags.push('<span class="badge">Drop-down list: edit in Grades' + (res.source === 'team' ? ' or Team scores' : '') + '</span>');
       }
       if (d.state === 'empty') flags.push('<span class="badge">Empty' + ((a.weight || 0) > 0 ? ' · counted as 0' : '') + '</span>');
-      if (d.weeksLate > 0) flags.push('<span class="badge badge-info">' + d.weeksLate + ' wk late' + (d.waived ? ', waived' : (d.penalty ? ' · −' + esc(fmt(d.penalty)) : '')) + '</span>');
+      // Late work (K4): weeks late, waived or the penalty, and a button to the "Late work…" dialog.
+      var lateCell;
+      if (d.weeksLate > 0) {
+        var lp = latePenaltyOf(course, a, d);
+        lateCell = '<span class="sd-late' + (d.waived ? ' is-waived' : '') + '" title="' + esc(lateText(course, a, d) + (d.source === 'team' ? ' (the team\'s late work)' : '')) + '">' +
+          '<strong>' + esc(plural(d.weeksLate, 'week')) + '</strong> · ' + (d.waived ? 'penalty waived'
+            : lp > 0 ? '−' + esc(util.formatNumber(lp, 4)) + (d.state === 'number' ? ' → ' + esc(util.formatNumber(d.adjusted, 4)) : ' once scored') : 'no penalty') + '</span>';
+      } else {
+        lateCell = '<span class="faint">—</span>';
+      }
+      if (typeof ui.openLateWork === 'function') {
+        lateCell += '<button type="button" class="btn btn-ghost btn-icon btn-sm sd-late-btn no-print" data-sd="late" data-aid="' + esc(a.id) + '"' +
+          ' data-fk="sd-late:' + esc(a.id) + '" aria-label="' + esc('Late work for ' + a.name + (locked ? ' (read-only: scores are finalized)' : '')) + '"' +
+          ' title="Late work… (weeks late, penalty waived)">' + icon('clock') + '</button>';
+      }
+      var wTitle = d.penalty > 0 ? ' title="' + esc('Adjusted after late penalty: (' + util.formatNumber(d.raw, 4) + ' − ' + util.formatNumber(d.penalty, 4) + ') ÷ ' +
+        util.formatNumber(a.maxScore, 4) + ' × ' + util.formatNumber(a.weight, 4)) + '"' : '';
       return '<tr><th scope="row"><span class="sd-swatch ' + groupClass(course, a) + '" aria-hidden="true"></span>' + esc(a.name) + '</th>' +
         '<td class="num">' + esc(a.maxScore) + '</td><td class="num sd-weight">' + weightBadges(course, a) + ' ' + esc(a.weight) + '%</td>' +
         rawCellHtml(course, s, a, d, res, locked) +
-        '<td>' + source + '</td><td class="num">' + esc(fmt(d.weighted)) + '</td><td class="sd-flags">' + flags.join(' ') + '</td></tr>';
+        '<td class="sd-late-cell">' + lateCell + '</td>' +
+        '<td>' + source + '</td><td class="num' + (d.penalty > 0 ? ' sd-adjusted' : '') + '"' + wTitle + '>' + esc(fmt(d.weighted)) + '</td><td class="sd-flags">' + flags.join(' ') + '</td></tr>';
     }).join('');
     var roundingNote = course.settings.rounding === 'integer' ? 'rounded to a whole number' : course.settings.rounding === 'hundredth' ? 'rounded to 0.01' : '';
     h += '<section class="sd-section"><h4 class="section-label">Scores</h4><div class="table-wrap"><table class="table sd-scores"><thead><tr>' +
       '<th scope="col">Assessment</th><th scope="col" class="num">Max ' + ui.placeholderBadge(course, 'maxScores', { compact: true }) + '</th><th scope="col" class="num">Weight</th>' +
-      '<th scope="col" class="num">Raw (as entered)</th><th scope="col">Source</th><th scope="col" class="num">Weighted</th><th scope="col">Flags</th></tr></thead>' +
+      '<th scope="col" class="num">Raw (as entered)</th><th scope="col" title="Weeks late, and the points deducted from the raw score before weighting">Late work</th>' +
+      '<th scope="col">Source</th><th scope="col" class="num">Weighted</th><th scope="col">Flags</th></tr></thead>' +
       '<tbody>' + rowsHtml + '</tbody><tfoot>' +
-      '<tr><th scope="row" colspan="5">Sum of weighted scores</th><td class="num">' + esc(fmt(r.weightedSum)) + '</td><td></td></tr>' +
-      (r.curve ? '<tr><th scope="row" colspan="5">Curve ' + ui.placeholderBadge(course, 'curve', { compact: true }) + '</th><td class="num">' + esc(signed(r.curve)) + '</td><td></td></tr>' : '') +
-      '<tr class="sd-total-row"><th scope="row" colspan="5">Total' + (roundingNote ? ' <span class="muted small">(' + roundingNote + ')</span> ' +
+      '<tr><th scope="row" colspan="6">Sum of weighted scores</th><td class="num">' + esc(fmt(r.weightedSum)) + '</td><td></td></tr>' +
+      (r.curve ? '<tr><th scope="row" colspan="6">Curve ' + ui.placeholderBadge(course, 'curve', { compact: true }) + '</th><td class="num">' + esc(signed(r.curve)) + '</td><td></td></tr>' : '') +
+      '<tr class="sd-total-row"><th scope="row" colspan="6">Total' + (roundingNote ? ' <span class="muted small">(' + roundingNote + ')</span> ' +
         ui.placeholderBadge(course, 'rounding', { compact: true }) : '') + '</th>' +
       '<td class="num"><strong>' + esc(fmt(r.total)) + '</strong></td><td>' + (fi.letter !== null
         ? '<span class="badge ' + (fi.valid ? 'badge-accent' : 'badge-danger') + '" title="Final letter (assigned by hand)">' + esc(fi.letter) + ' · final</span>'
@@ -2291,6 +2345,7 @@
       if (!active || active.id !== courseId) { ui.toast('Switch back to ' + (currentCourse() || {}).code + ' to edit this student.', { type: 'warn' }); return; }
       if (act === 'edit') openStudentForm(studentId);
       else if (act === 'status') toggleStatus(studentId);
+      else if (act === 'late' && typeof ui.openLateWork === 'function') ui.openLateWork(studentId, b.getAttribute('data-aid'));
       else if (act === 'history' && GT.app && GT.app.navigate) {
         // Show the full, filterable log for this student (the dialog lists only the newest 100).
         if (closeDialog) closeDialog(null);

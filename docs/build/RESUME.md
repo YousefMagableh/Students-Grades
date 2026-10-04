@@ -4,8 +4,8 @@ All six stages are built and verified on the branch `claude/grade-tracker-offlin
 
 ## Final state
 
-- Unit tests: **695 of 695 pass** (`npm test`). This includes the new `tests/repo.test.js`, which runs static checks for R1, R2, R8 and the version.
-- Browser smoke test: **79 of 79 checks pass** (`npm run test:e2e`, headless Chromium from `file://`). It passed three runs in a row.
+- Unit tests: **732 of 732 pass** (`npm test`). This includes `tests/repo.test.js` (static checks for R1, R2, R8 and the version) and `tests/storage.test.js` (save conflicts between tabs).
+- Browser smoke test: **103 of 103 checks pass** (`npm run test:e2e`, headless Chromium from `file://`). It passed three runs in a row on 2026-10-04.
   - The run makes zero non-file network requests, and that includes the .xlsx export, which loads ExcelJS from `vendor/`.
   - The run raises no page errors and no console errors.
 
@@ -42,6 +42,17 @@ The traceability table at the end of `docs/REQUIREMENTS.md` maps every requireme
 - **Terminology**: "Overrides (◆)" in Statistics, "Per-member override" in Summary, "Class/Project Participation" in the grid messages, and no "dropped".
 - **Bug fixed**: "Add course" with the SE 6362 template used to create an undergraduate course, because Level kept its default. The template now sets the level.
 - **Docs**: `docs/DESIGN.md` now has sections 11–14, covering the Statistics view, the Summary view, the late-work UI, and the shell polish. Its sample-data, navigate `focus`, import and meeting-view sections are updated too.
+
+## Final review (2026-10-03/04)
+
+Four independent reviews ran on the finished app: requirements acceptance, adversarial semester workflows, code and security, and UX/visual/print. They found:
+
+- 1 high issue: two open tabs could overwrite each other.
+- About 20 medium issues and about 30 low issues.
+
+Four fixers resolved them, and a final verifier re-ran every original repro and added regression checks. One item is only partly met: Grades-tab speed at 300 students (about 0.1 s per edit). It is not an issue for the real class sizes.
+
+The security review found no XSS, no prototype pollution and no CSV injection. Every run made zero network requests.
 
 ## Still open
 

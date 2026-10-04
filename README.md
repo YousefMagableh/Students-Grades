@@ -365,5 +365,7 @@ On a Mac, use Cmd instead of Ctrl.
 - The Excel formulas were checked with two independent formula evaluators and an ExcelJS round trip, not in
   Microsoft Excel itself. Excel recalculates them when the file opens.
 - Printing was checked by generating PDFs in Chromium; the browser's own print dialog was not tested.
+- Speed: with the real class sizes (59 and 10 students) an edit takes about 0.04 s. With a very large class
+  (300 students) an edit in the Grades tab takes about 0.1 s; attendance stays fast at any size.
 - UT Dallas's official grade scales could not be checked from the build environment. The letters come from the
   course request and stay editable in Settings.

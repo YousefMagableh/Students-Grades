@@ -305,6 +305,37 @@ function gridAbsenceMismatches() {
   });
 }
 
+/** Rendered attendance rows that differ from the core: marks, Unexcused/Excused, footer Present/Absent. */
+async function attGridMismatches() {
+  return page.evaluate(() => {
+    const c = GT.store.course(), ses = c.attendance.sessions, bad = [];
+    const held = new Set(GT.attendance.heldSessions(c).map((s) => s.id));
+    document.querySelectorAll('.att-grid tbody tr[data-sid]').forEach((tr) => {
+      const sid = tr.getAttribute('data-sid'), rec = c.attendance.records[sid] || {};
+      ses.forEach((s, j) => { if (tr.cells[3 + j].textContent !== (rec[s.id] || '')) bad.push(sid + ':' + j); });
+      const sm = GT.attendance.summary(c, sid);
+      if (+tr.querySelector('.sr-unx').textContent !== sm.unexcused || +tr.querySelector('.sr-exc').textContent !== sm.excused) bad.push(sid + ':summary');
+    });
+    const f1 = document.querySelector('.att-grid tfoot tr.f1'), f2 = document.querySelector('.att-grid tfoot tr.f2');
+    ses.forEach((s, j) => {
+      if (!held.has(s.id)) return;
+      const n = GT.attendance.sessionCounts(c, s.id);
+      if (+f1.cells[1 + j].textContent !== n.present || +f2.cells[1 + j].textContent !== n.absent) bad.push('foot:' + j);
+    });
+    return bad.slice(0, 10);
+  });
+}
+/** The grid matches the core within a moment (renders run on the next animation frame). */
+async function expectAttGridMatches() {
+  let bad = [];
+  for (let i = 0; i < 20; i++) {
+    bad = await attGridMismatches();
+    if (!bad.length) return;
+    await page.waitForTimeout(50);
+  }
+  assert.deepEqual(bad, []);
+}
+
 // Stage 4 helpers: the Import / Export tab. Downloads and test files go to TMP (outside the repository).
 
 const ExcelJS = require(path.join(ROOT, 'vendor', 'exceljs.min.js'));
@@ -1650,6 +1681,119 @@ async function run() {
     assert.equal(last.newValue, 'confirmed');
   });
 
+  // Final review: the end-of-list hold, a stable meeting order and paste warnings (E2E-2, E2E-3, E2E-5).
+
+  await check('Grades: typing past the last row never overwrites the last student; the next key waits for a move (E2E-2)', async () => {
+    await resetSample();
+    const ids = await rowIds();
+    const n = ids.length;
+    const t1 = await gridCol('raw', 'Test 1');
+    const raw = (a) => page.evaluate((x) => x.map((id) => GT.store.results().byId[id].items.a_t1.raw), a);
+    await gridCell(ids[n - 3], t1).click();
+    await clearToasts();
+    // A quick typist runs one value past the end of the list.
+    for (const v of ['61', '62', '63', '64']) { await page.keyboard.type(v); await page.keyboard.press('Enter'); }
+    await waitToast(/That was the last student in the list\./);
+    await waitToast(/End of the list: that key was not used/);
+    assert.deepEqual(await raw(ids.slice(n - 3)), [61, 62, 63], 'the last student\'s 63 was overwritten');
+    assert.equal(await page.evaluate(() => !!document.querySelector('.gt-grid .cell-editor')), false, 'an editor opened on the held cell');
+    // ArrowDown on the last row cannot move: the hold stays.
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.type('9');
+    assert.equal(await page.evaluate(() => !!document.querySelector('.gt-grid .cell-editor')), false);
+    // Moving away and back ends it; F2 edits the held cell on purpose.
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.type('65');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('F2');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type('6');
+    await page.keyboard.press('Tab');
+    assert.deepEqual(await raw(ids.slice(n - 1)), [66]);
+    // The same in the Meeting view's participation drop-down column (typed list values).
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => document.querySelector('.gt-grid').classList.contains('meeting'));
+    const mids = await rowIds();
+    const pc = await gridCol('raw', 'Class/Project Participation');
+    await gridCell(mids[mids.length - 2], pc).click();
+    for (const v of ['4', '3', '2']) { await page.keyboard.type(v); await page.keyboard.press('Enter'); }
+    await rendered();
+    assert.deepEqual(await page.evaluate((a) => a.map((id) => GT.store.results().byId[id].items.a_part.raw), mids.slice(-2)), [4, 3]);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+  });
+
+  await check('Grades: the row order stays put after a search, the withdrawn filter and a course switch; re-sort still offered (E2E-3, DECISIONS 7)', async () => {
+    await resetSample();
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+    await page.waitForFunction(() => document.querySelector('.gt-grid').classList.contains('meeting'));
+    await waitRowsSorted('total', 'desc');
+    const ids = await rowIds();
+    const pc = await gridCol('raw', 'Class/Project Participation');
+    // Full participation for the 15 lowest rows: their totals rise, the rows keep their places.
+    await gridCell(ids[ids.length - 15], pc).click();
+    for (let i = 0; i < 15; i++) { await page.keyboard.type('5'); await page.keyboard.press('Enter'); }
+    await rendered();
+    const resortShown = () => page.evaluate(() => !document.querySelector('.grid-toolbar .grid-resort').hidden);
+    assert.deepEqual(await rowIds(), ids, 'an edit moved rows');
+    assert.notDeepEqual(await freshOrder('total', 'desc'), ids, 'setup: the order should be stale now');
+    assert.equal(await resortShown(), true);
+    // Search, then Esc.
+    await page.keyboard.press('/');
+    await page.keyboard.type('Student 0');
+    await rendered();
+    assert.ok((await rowIds()).length < ids.length);
+    await page.keyboard.press('Escape');
+    await rendered();
+    assert.deepEqual(await rowIds(), ids, 'clearing the search re-sorted the rows');
+    assert.equal(await resortShown(), true, 'the re-sort button went away after a search');
+    // The withdrawn filter off and on.
+    await page.click('.grid-toolbar [data-act="withdrawn"]');
+    await rendered();
+    await page.click('.grid-toolbar [data-act="withdrawn"]');
+    await rendered();
+    assert.deepEqual(await rowIds(), ids, 'the withdrawn filter re-sorted the rows');
+    // The other course and back: each course keeps its own snapshot.
+    const [c1, c2] = await page.evaluate(() => GT.store.state.courses.map((c) => c.id));
+    await page.selectOption('#course-select', c2);
+    await page.waitForFunction((id) => GT.store.course().id === id && !!document.querySelector('#view .grid-empty'), c2);
+    await page.selectOption('#course-select', c1);
+    await page.waitForFunction((n) => document.querySelectorAll('.gt-grid tbody tr.gr').length === n, ids.length);
+    assert.deepEqual(await rowIds(), ids, 'a course switch re-sorted the rows');
+    assert.equal(await resortShown(), true);
+    // "Order changed: re-sort" sorts again.
+    await page.click('.grid-toolbar [data-act="resort"]');
+    await waitRowsSorted('total', 'desc');
+    assert.equal(await resortShown(), false);
+    await page.click('.grid-grades-bar [data-act="meeting"]');
+  });
+
+  await check('Grades: a paste with junk says how many values are not numbers or out of range, as a warning (E2E-5)', async () => {
+    await resetSample();
+    const ids = await rowIds();
+    const t1 = await gridCol('raw', 'Test 1');
+    await gridCell(ids[0], t1).click();
+    await clearToasts();
+    // Test 1 and Test 2 for 8 rows: abc, 88,5, N/A, — and =A1 are not numbers; 105, -5 and 1e3 (1000) are outside 0–100.
+    const rows = [['abc', '70'], ['105', '-5'], ['1e3', ' 85 '], ['88,5', '90.5'], ['N/A', '60'], ['—', '60'], ['=A1', '50'], ['88%', '91']];
+    await pasteText(rows.map((r) => r.join('\t')).join('\r\n') + '\r\n');
+    await waitToast(/Pasted 16 cells\./);
+    const t = await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((x) => ({ warn: x.classList.contains('warn'), text: x.textContent })).find((x) => /Pasted 16 cells/.test(x.text)));
+    assert.equal(t.warn, true, 'the paste toast is not a warning: ' + t.text);
+    assert.match(t.text, /5 values are not numbers \(shown in red, counted as 0\)\./);
+    assert.match(t.text, /3 values are outside 0–100 \(shown in yellow\)\./);
+    // The values are stored as typed (red / yellow cells), like a typed value.
+    const e = await page.evaluate((a) => a.map((id) => GT.model.getEntry(GT.store.course().scores, id, 'a_t1')), ids.slice(0, 3));
+    assert.deepEqual(e.map((x) => x.text || x.value), ['abc', 105, 1000]);
+    // A clean paste stays a plain success.
+    await clearToasts();
+    await gridCell(ids[10], t1).click();
+    await pasteText('70\r\n71\r\n');
+    await waitToast(/Pasted 2 cells\./);
+    const clean = await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].filter((x) => /Pasted 2 cells/.test(x.textContent)).map((x) => x.className + ': ' + x.textContent.trim()));
+    assert.deepEqual(clean.map((x) => /success/.test(x) && /Pasted 2 cells\.$/.test(x)), [true], clean.join(' | '));
+  });
+
   // ---------------------------------------------------------------- stage 3: attendance
 
   await check('Attendance: SE 4351 has 26 sessions and a 59 x 26 marking grid that renders in under 30 ms', async () => {
@@ -2655,6 +2799,116 @@ async function run() {
     await page.waitForFunction((id) => GT.store.course().students.filter((s) => s.finalLetter !== null).map((s) => s.id).join() === id, manual);
   });
 
+  await check('Export (review E2E-6): a withdrawn student without a final letter gets "W" in Letter Grade (static, with a note) in the .xlsx and the CSV, as on the Summary; read back, "W" is no letter', async () => {
+    await resetSample();
+    await gotoView('exchange');
+    const app = await appRows();
+    const x = await downloadFrom('#xc-dl-xlsx', 'e2e6');
+    const { ws, header } = await readXlsx(x.file);
+    const lc = header.indexOf('Letter Grade') + 1, stc = header.indexOf('Status') + 1;
+    const wd = [], bad = [];
+    app.forEach((s, i) => {
+      const cell = ws.getRow(i + 2).getCell(lc);
+      if (s.status === 'withdrawn') { wd.push([cell.formula || null, cell.value, noteText(cell.note), ws.getRow(i + 2).getCell(stc).value]); return; }
+      // Formula parity for everyone else: the nested IF on the Total, cached with the app's letter.
+      if (!String(cell.formula).startsWith('IF(') || cell.value.result !== s.letter) bad.push(s.last + ': ' + JSON.stringify(cell.value));
+    });
+    assert.deepEqual(bad.slice(0, 5), []);
+    assert.deepEqual(wd, [[null, 'W', 'Withdrawn: no letter grade', 'Withdrawn'], [null, 'W', 'Withdrawn: no letter grade', 'Withdrawn']]);
+    assert.match(noteText(ws.getRow(1).getCell(lc).note), / W: withdrawn, no letter grade\./);
+    const c = await downloadFrom('#xc-dl-csv', 'e2e6');
+    const rows = csvCore.parse(fs.readFileSync(c.file, 'utf8'));
+    const li = rows[0].indexOf('Letter Grade'), si = rows[0].indexOf('Status');
+    assert.deepEqual(rows.slice(1).filter((r) => r[si] === 'Withdrawn').map((r) => r[li]), ['W', 'W']);
+    // The Summary says the same.
+    await gotoView('summary');
+    await page.waitForFunction(() => document.querySelectorAll('.sum-grades tr.sum-wd').length === 2);
+    assert.deepEqual(await page.$$eval('.sum-grades tr.sum-wd td.sum-c-letter', (tds) => tds.map((td) => td.textContent.trim())), ['W', 'W']);
+    // Read back into the same course: "W" is no letter (no change, no "not a letter of the scale").
+    for (const file of [x.file, c.file]) {
+      await gotoView('exchange');
+      await page.setInputFiles('#xc-file', file);
+      await page.locator('#xc-next-2').waitFor();
+      await page.click('#xc-next-2');
+      await page.locator('#xc-next-3').waitFor();
+      const st = await page.evaluate(() => GT.views.exchange.importState());
+      if (st.mapping[li] !== 'finalLetter') {
+        // The .xlsx Letter Grade column of formulas is left unmapped (suggestions): map it by hand.
+        await page.selectOption('#xc-map-' + li, 'finalLetter');
+      }
+      await page.click('#xc-next-3');
+      await page.locator('#xc-import-btn').waitFor();
+      const counts = (await page.evaluate(() => GT.views.exchange.importState())).counts;
+      assert.deepEqual([counts.lettersWithdrawn, counts.lettersSkipped, counts.changes], [2, 0, 0], path.basename(file));
+      await page.click('#xc-imp-body [data-act="imp-restart"]');
+      await page.locator('#xc-pick').waitFor();
+    }
+  });
+
+  await check('Statistics (review CODE-3): a toast\'s Undo undoes only its own step: never another course\'s step, never a newer change', async () => {
+    await resetSample();
+    // Course B gets the sample and one edit of its own (the latest step of its undo stack).
+    await page.evaluate(() => {
+      const [A, B] = GT.store.state.courses;
+      GT.store.setActiveCourse(B.id);
+      GT.store.transact('Load sample data', (c) => GT.sample.loadInto(c, {}), { source: 'sample', historyMode: 'bulk' });
+      GT.store.transact('Edit Test 1', (c) => GT.model.setEntry(c.scores, c.students[0].id, 'a_t1', { value: 33 }));
+      GT.store.setActiveCourse(A.id);
+    });
+    await gotoStats();
+    await clearToasts();
+    const state = () => page.evaluate(() => {
+      const [A, B] = GT.store.state.courses;
+      return { finals: A.students.filter((s) => s.finalLetter !== null).length, cutB: A.settings.letterScale.find((x) => x.letter === 'B').min,
+        bT1: B.scores[B.students[0].id].a_t1.value };
+    });
+    const toastUndo = (text) => page.locator('#toasts .toast', { hasText: text }).locator('button', { hasText: 'Undo' }).click();
+    // 1. "Use these as final letters…" in A, switch to B, then the toast's Undo: nothing is undone anywhere.
+    await page.click('[data-act="sb-final"]');
+    const dlg = page.locator('dialog[open]');
+    await dlg.waitFor();
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await dlg.waitFor({ state: 'detached' });
+    await waitToast(/set from the planner/);
+    const s1 = await state();
+    assert.ok(s1.finals > 0);
+    await page.selectOption('#course-select', await page.evaluate(() => GT.store.state.courses[1].id));
+    await page.waitForFunction(() => GT.store.course().id === GT.store.state.courses[1].id);
+    await toastUndo('set from the planner');
+    await waitToast(/Not undone/);
+    assert.deepEqual(await state(), s1, 'B keeps its Test 1 edit, A keeps its final letters');
+    // 2. Back in A: "Apply cutoffs", then a newer change, then the old toast's Undo: the newer change stays.
+    await page.selectOption('#course-select', await page.evaluate(() => GT.store.state.courses[0].id));
+    await gotoStats();
+    await clearToasts();
+    const idx = await page.evaluate(() => GT.views.stats.sandbox().findIndex((x) => x.letter === 'B'));
+    await page.fill('[data-sb="' + idx + '"]', '84');
+    await page.waitForFunction((i) => GT.views.stats.sandbox()[i].min === 84, idx);
+    await page.click('[data-act="sb-apply"]');
+    await dlg.waitFor();
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await dlg.waitFor({ state: 'detached' });
+    await waitToast(/Cutoffs applied/);
+    await page.evaluate(() => GT.store.transact('Edit Test 2', (c) => GT.model.setEntry(c.scores, c.students[1].id, 'a_t2', { value: 12 })));
+    await toastUndo('Cutoffs applied');
+    await waitToast(/Not undone/);
+    assert.equal((await state()).cutB, 84);
+    assert.equal(await page.evaluate(() => GT.store.undoLabel()), 'Edit Test 2', 'the newer change is still the latest step');
+    // 3. Right after the step, the toast's Undo works.
+    await page.evaluate(() => GT.store.undo()); // the Test 2 edit
+    await clearToasts();
+    await page.fill('[data-sb="' + idx + '"]', '85');
+    await page.waitForFunction((i) => GT.views.stats.sandbox()[i].min === 85, idx);
+    await page.click('[data-act="sb-apply"]');
+    await dlg.waitFor();
+    await dlg.locator('.dlg-foot .btn-primary').click();
+    await dlg.waitFor({ state: 'detached' });
+    await waitToast(/Cutoffs applied/);
+    assert.equal((await state()).cutB, 85);
+    await toastUndo('Cutoffs applied');
+    await page.waitForFunction(() => GT.store.course().settings.letterScale.find((x) => x.letter === 'B').min === 84);
+  });
+
   // ---------------------------------------------------------------- stage 6: late work, Summary tab, polish
 
   await check('Late work (Ctrl+L): 1 week late lowers the total by weight × 10 / 100; "penalty waived" restores it; undo works; History has "late" entries', async () => {
@@ -3598,6 +3852,213 @@ async function run() {
     await ready();
     assert.equal(await page.evaluate((id) => GT.model.getEntry(GT.store.course().scores, id, 'a_t1').value, sid), 12,
       'the typed score was lost on reload');
+  });
+
+  // Final review: attendance windowing and patching, roll-call history, Settings, headers, Students, Import / Export.
+
+  await check('Attendance (CODE-5): marks and Undo patch the grid in place (rows kept); summary and footer match the core', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    await page.locator('.att-grid tbody tr[data-sid]').nth(0).locator('td').nth(3 + 4).click();
+    await page.evaluate(() => { document.querySelector('.att-grid tbody').rows[20].__keep = 1; });
+    // Rows 0-3 of session 4 get a mark they do not have yet.
+    const keys = await page.evaluate(() => {
+      const c = GT.store.course(), id = c.attendance.sessions[4].id;
+      return [...document.querySelectorAll('.att-grid tbody tr[data-sid]')].slice(0, 4).map((tr) => ((c.attendance.records[tr.getAttribute('data-sid')] || {})[id] === 'A' ? 'e' : 'a'));
+    });
+    const h0 = await historyCount();
+    for (const k of keys) await page.keyboard.press(k);
+    await page.waitForFunction((n) => GT.store.course().history.length === n + 4, h0);
+    await expectAttGridMatches();
+    await page.evaluate(() => { GT.store.undo(); GT.store.undo(); });
+    await expectAttGridMatches();
+    assert.equal(await page.evaluate(() => document.querySelector('.att-grid tbody').rows[20].__keep), 1, 'the body was rebuilt');
+    assert.equal(await page.locator('.att-grid tbody tr.att-pad').count(), 0, 'a 59-student class renders every row');
+  });
+
+  await check('Attendance (CODE-5): 300 students x 40 sessions render a window of rows; keyboard, a 100-row range, the end-of-list hold, scrolling and undo stay correct', async () => {
+    await resetSample();
+    await page.evaluate(() => {
+      GT.store.transact('Big class', (c) => {
+        c.students = []; c.teams = []; c.scores = {}; c.teamScores = {};
+        for (let i = 0; i < 300; i++) c.students.push(GT.model.createStudent({ no: i + 1, lastName: 'Big ' + String(i + 1).padStart(3, '0'), firstName: 'F' + i, status: i % 37 === 0 ? 'withdrawn' : 'active' }));
+        const sessions = GT.model.generateSessions({ start: '2026-08-25', end: '2027-02-28', weekdays: [2, 4] }).slice(0, 40);
+        c.attendance.mode = 'per-session'; c.attendance.sessions = sessions; c.attendance.records = {};
+        c.students.forEach((s, i) => sessions.forEach((ses, j) => GT.attendance.setMark(c, s.id, ses.id, (i + j) % 9 === 0 ? 'A' : 'P')));
+      }, { historyMode: 'bulk' });
+    });
+    await gotoView('attendance');
+    await page.locator('.att-grid tbody tr.att-pad').first().waitFor({ state: 'attached' });
+    const n = await page.locator('.att-grid tbody tr[data-sid]').count();
+    assert.ok(n >= 30 && n < 120, 'rows rendered: ' + n);
+    const ids = await page.evaluate(() => GT.store.course().students.slice().sort(GT.calc.compareByName).map((s) => s.id));
+    const active = () => page.evaluate(() => { const td = document.querySelector('#att-active'); return td ? td.parentNode.getAttribute('data-sid') + ':' + (td.cellIndex - 3) : null; });
+    await page.locator('.att-grid tbody tr[data-sid]').nth(0).locator('td').nth(3 + 2).click();
+    for (let i = 0; i < 150; i++) await page.keyboard.press('ArrowDown');
+    assert.equal(await active(), ids[150] + ':2');
+    // End of the list: the next mark key after marking the last row is ignored.
+    await page.keyboard.press('Control+End');
+    assert.equal(await active(), ids[299] + ':39');
+    await page.keyboard.press('e');
+    await page.keyboard.press('a');
+    assert.equal(await page.evaluate((sid) => { const c = GT.store.course(); return (c.attendance.records[sid] || {})[c.attendance.sessions[39].id]; }, ids[299]), 'E');
+    // A range over 101 rows, most of them not rendered: E sets every active student, withdrawn skipped.
+    await page.keyboard.press('Home');
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.down('Shift');
+    for (let i = 0; i < 100; i++) await page.keyboard.press('ArrowUp');
+    await page.keyboard.up('Shift');
+    await page.keyboard.press('e');
+    const r = await page.evaluate((list) => {
+      const c = GT.store.course(), id = c.attendance.sessions[0].id;
+      return list.filter((sid) => GT.model.findStudent(c, sid).status === 'active' && (c.attendance.records[sid] || {})[id] !== 'E').length;
+    }, ids.slice(198, 299));
+    assert.equal(r, 0);
+    await expectAttGridMatches();
+    await page.evaluate(() => { document.querySelector('.att-wrap').scrollTop = 0; });
+    await page.waitForFunction((sid) => !!document.querySelector('.att-grid tbody tr[data-sid="' + sid + '"]'), ids[0]);
+    await page.evaluate(() => GT.store.undo());
+    await expectAttGridMatches();
+    // Printing renders every row.
+    await page.evaluate(() => window.dispatchEvent(new Event('beforeprint')));
+    assert.equal(await page.locator('.att-grid tbody tr[data-sid]').count(), 300);
+    await page.evaluate(() => window.dispatchEvent(new Event('afterprint')));
+    assert.ok(await page.locator('.att-grid tbody tr[data-sid]').count() < 120);
+  });
+
+  await check('Attendance (CODE-6): one roll call is one History entry with every mark; Undo still goes mark by mark', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    const sesId = await page.evaluate(() => { const s = GT.store.course().attendance.sessions[4]; GT.store.transact('Clear', (c) => GT.attendance.clearSession(c, s.id)); return s.id; });
+    const h0 = await historyCount();
+    await page.evaluate((id) => { GT.views.attendance.openRollCall(id); }, sesId);
+    await page.locator('dialog[open] .rc-row.is-current .rc-b').first().focus();
+    for (const k of ['p', 'a', 'p', 'e', 'p']) await page.keyboard.press(k);
+    await page.waitForFunction((id) => GT.attendance.markCount(GT.store.course(), id) === 5, sesId);
+    const added = await historySince(h0);
+    assert.equal(added.length, 1, 'one entry for the roll call');
+    assert.equal(added[0].newValue, '5 marks');
+    assert.equal(added[0].details.length, 5);
+    await page.locator('dialog[open] .dlg-foot .btn-primary').click();
+    await page.waitForFunction(() => !document.querySelector('dialog[open]'));
+    await page.click('#btn-undo');
+    await page.waitForFunction((id) => GT.attendance.markCount(GT.store.course(), id) === 4, sesId);
+    await expectAttGridMatches();
+  });
+
+  await check('Attendance (CODE-9, UX-4): aria-labels say "Student No N", never a name; withdrawn marks are readable', async () => {
+    await resetSample();
+    await gotoAttendanceGrid();
+    await page.locator('.att-grid tbody tr[data-sid]').nth(3).locator('td').nth(5).click();
+    assert.match(await page.locator('#att-active').getAttribute('aria-label'), /^Student No \d+, /);
+    const wd = await page.evaluate(() => {
+      const tr = document.querySelector('.att-grid tbody tr.wd');
+      const td = tr && tr.querySelector('td.m');
+      return td ? { opacity: getComputedStyle(td).opacity, color: getComputedStyle(td).color, wdText: (() => { const s = document.createElement('span'); s.style.color = 'var(--withdrawn-text)'; document.body.appendChild(s); const c = getComputedStyle(s).color; s.remove(); return c; })() } : null;
+    });
+    assert.ok(wd, 'a withdrawn row with a mark');
+    assert.equal(wd.opacity, '1');
+    assert.equal(wd.color, wd.wdText);
+    await page.click('.att-mode[data-mode="totals"]');
+    await page.locator('table.att-totals tbody input').first().waitFor();
+    const labels = await page.$$eval('table.att-totals tbody input', (els) => els.map((e) => e.getAttribute('aria-label')));
+    assert.ok(labels.length && labels.every((l) => / for Student No \d+$/.test(l)), labels[0]);
+  });
+
+  await check('Settings (UX-2): the assessments row fits at 1280 px: Split… and Delete are in view without scrolling', async () => {
+    await resetSample();
+    await page.setViewportSize({ width: 1280, height: 860 });
+    try {
+      await gotoView('settings');
+      const r = await page.evaluate(() => {
+        const wrap = document.querySelector('.set-asmt-wrap'), wr = wrap.getBoundingClientRect();
+        const out = [...wrap.querySelectorAll('[data-act="split"], [data-act="del-asmt"]')].filter((b) => b.getBoundingClientRect().right > wr.right + 0.5).length;
+        return { scrolls: wrap.scrollWidth > wrap.clientWidth + 1, out };
+      });
+      assert.deepEqual(r, { scrolls: false, out: 0 });
+    } finally {
+      await page.setViewportSize({ width: 1280, height: 860 }); // the run's default size
+    }
+  });
+
+  await check('Settings (UX-25, CODE-7): the passing-letter help is one sentence; letters named "constructor"/"toString" count from 0', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.transact('Rename', (c) => { c.settings.letterScale.forEach((x) => { if (x.letter === 'B') x.letter = 'constructor'; if (x.letter === 'C') x.letter = 'toString'; }); }));
+    await gotoView('settings');
+    const t = await page.evaluate(() => document.querySelector('#set-h-letters').closest('.card, section').innerText);
+    assert.equal((t.match(/at or above/g) || []).length, 1);
+    assert.ok(!/native code/.test(t));
+    const cells = await page.$$eval('.set-ls-table tbody tr', (trs) => trs.filter((tr) => /^(constructor|toString)$/.test(tr.getAttribute('data-letter'))).map((tr) => tr.cells[3].textContent + '/' + tr.cells[4].textContent));
+    assert.ok(cells.length === 2 && cells.every((x) => /^\d+\/\d+$/.test(x)), JSON.stringify(cells));
+  });
+
+  await check('Settings (CONTRACT §2): a weight typed without Enter survives a reload (leave hook)', async () => {
+    await resetSample();
+    await page.evaluate(() => GT.store.flush());
+    await gotoView('settings');
+    const w = page.locator('.view-settings input[data-field="a:a_t1:weight"]');
+    await w.click();
+    await w.fill('27');
+    await page.reload();
+    await ready();
+    assert.equal(await page.evaluate(() => GT.store.course().assessments.find((a) => a.id === 'a_t1').weight), 27);
+  });
+
+  await check('Headers (UX-16/17): the title is the tab name, the subtitle starts "<code> · <title> · <term>"; "Last Name / First Name"', async () => {
+    await resetSample();
+    const want = await page.evaluate(() => { const c = GT.store.course(); return [c.code, c.title, c.term].filter(Boolean).join(' · '); });
+    for (const v of ['students', 'attendance', 'settings', 'exchange']) {
+      await gotoView(v);
+      const h = await page.evaluate((id) => {
+        const ph = document.querySelector('#view .view-root .page-header');
+        return { h1: ph.querySelector('h1').textContent.trim(), sub: ph.querySelector('.sub').textContent.trim(), tab: document.querySelector('#tab-' + id + ' span').textContent.trim() };
+      }, v);
+      assert.equal(h.h1, h.tab, v);
+      assert.ok(h.sub === want || h.sub.startsWith(want + ' · '), v + ': ' + h.sub); // the course line, then the view's own details
+    }
+    await gotoView('students');
+    assert.deepEqual(await page.$$eval('.st-table thead th', (t) => t.slice(1, 3).map((x) => x.textContent.trim())), ['Last Name', 'First Name']);
+    await gotoView('attendance');
+    assert.deepEqual(await page.$$eval('.att-grid thead th.sc', (t) => t.map((x) => x.textContent.trim())), ['No', 'Last Name', 'First Name']);
+  });
+
+  await check('Students (UX-1): No cells are plain text; no rule of css/students.css reaches the Statistics view', async () => {
+    await resetSample();
+    await gotoView('students');
+    const no = await page.evaluate(() => { const td = document.querySelector('.st-table tbody td.st-no'); const cs = getComputedStyle(td); return +cs.fontWeight; });
+    assert.ok(no < 600, 'No cell is bold: ' + no);
+    const css = fs.readFileSync(path.join(ROOT, 'css', 'students.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    const sels = [];
+    let buf = '';
+    for (const ch of css) {
+      if (ch === '{') { const t = buf.trim(); if (t && !t.startsWith('@')) sels.push(t); buf = ''; } else if (ch === '}' || ch === ';') buf = ''; else buf += ch;
+    }
+    await gotoView('stats');
+    const hits = await page.evaluate((list) => list.filter((s) => { try { return [...document.querySelectorAll(s)].some((el) => el.closest('.view-stats')); } catch (e) { return false; } }), sels);
+    assert.deepEqual(hits, []);
+  });
+
+  await check('Import / Export (UX-21, UX-22): no Git sentence; the "Changes" heading uses the tile\'s count, plus the course setting', async () => {
+    await resetSample();
+    await gotoView('exchange');
+    assert.ok(!/git/i.test(await page.locator('.xc-reminder').innerText()));
+    const rows = await page.evaluate(() => GT.store.course().students.filter((s) => s.status === 'active').slice(0, 3).map((s) => [s.no, s.lastName, s.firstName]));
+    const file = path.join(TMP, 'views-ux22.csv');
+    fs.writeFileSync(file, ['No,Last Name,First Name,Test 1,No of Absence'].concat(rows.map((r, i) => r.join(',') + ',' + (11 + i) + ',' + i)).join('\n') + '\n');
+    await page.setInputFiles('#xc-file', file);
+    await page.locator('#xc-next-2').waitFor();
+    await page.click('#xc-next-2');
+    await page.locator('#xc-next-3').waitFor();
+    await page.locator('label', { hasText: 'Switch attendance' }).locator('input[type=checkbox]').check();
+    await page.click('#xc-next-3');
+    await page.locator('#xc-import-btn').waitFor();
+    const r = await page.evaluate(() => ({
+      n: GT.views.exchange.importState().counts.changes,
+      tile: [...document.querySelectorAll('.xc-count')].some((t) => /course setting/.test(t.textContent)),
+      h: [...document.querySelectorAll('.xc-sub-h')].map((x) => x.textContent.trim()).find((t) => /^Changes/.test(t))
+    }));
+    assert.ok(r.tile, 'the attendance-mode tile');
+    assert.equal(r.h, 'Changes (' + r.n + ' + 1 course setting)');
   });
 
   await check('delete all data (typed confirmation) empties storage, also after a reload', async () => {

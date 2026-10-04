@@ -376,9 +376,9 @@
       out.push(t);
     };
     add('no', 'No', 'Student');
-    add('lastName', 'Last name', 'Student');
-    add('firstName', 'First name', 'Student');
-    add('fullName', 'Full name ("Last, First" or "First Last")', 'Student');
+    add('lastName', 'Last Name', 'Student');
+    add('firstName', 'First Name', 'Student');
+    add('fullName', 'Full Name ("Last, First" or "First Last")', 'Student');
     add('team', 'Team', 'Student');
     add('status', 'Status (active / withdrawn)', 'Student');
     add('notes', 'Notes', 'Student');
@@ -791,7 +791,7 @@
     }
     var nameMapped = cols.lastName !== undefined || cols.firstName !== undefined || cols.fullName !== undefined;
     if (o.matchBy === 'no' && cols.no === undefined) errors.push('Map a column to No to match students by No.');
-    if (o.matchBy === 'name' && !nameMapped) errors.push('Map the name columns (Last name and First name, or Full name) to match students by name.');
+    if (o.matchBy === 'name' && !nameMapped) errors.push('Map the name columns (Last Name and First Name, or Full Name) to match students by name.');
 
     var counts = { update: 0, 'new': 0, skip: 0, changes: 0, overrides: 0, invalid: 0, blocked: 0, notOnList: 0, lettersSkipped: 0,
       lettersAsSuggestion: 0, lettersFromOtherColumn: 0, lettersNotImported: 0, lettersWithdrawn: 0, duplicateNos: 0, teamsCreated: 0,
@@ -1500,8 +1500,8 @@
     };
     var val = function (s, k) { return s ? s[k] : ''; };
     add('No', 'info', before && typeof before.no === 'number' ? before.no : '', typeof after.no === 'number' ? after.no : '');
-    add('Last name', 'info', val(before, 'lastName'), after.lastName);
-    add('First name', 'info', val(before, 'firstName'), after.firstName);
+    add('Last Name', 'info', val(before, 'lastName'), after.lastName);
+    add('First Name', 'info', val(before, 'firstName'), after.firstName);
     add('Team', 'info', before ? teamNameOf(beforeCourse, before) : '', teamNameOf(afterCourse, after));
     add('Status', 'info', before ? (before.status === 'withdrawn' ? 'Withdrawn' : 'Active') : '', after.status === 'withdrawn' ? 'Withdrawn' : 'Active');
     add('Notes', 'info', val(before, 'notes'), after.notes);

@@ -241,6 +241,8 @@ describe('targets and guessMapping', () => {
     assert.equal(label('weighted:a_p1'), 'Weighted Project I (converted to raw = value ÷ weight × max)');
     assert.equal(label('absencesTotal'), 'Total absences (stored as unexcused)');
     assert.equal(label('finalLetter'), 'Final letter');
+    // The name columns are written as every view writes them (UX-17).
+    assert.deepEqual(['lastName', 'firstName', 'fullName'].map(label), ['Last Name', 'First Name', 'Full Name ("Last, First" or "First Last")']);
     assert.ok(t.filter((x) => x.score).every((x) => importer.isScoreTarget(x.key)));
     assert.ok(importer.isAttendanceTarget('absencesTotal'));
     assert.ok(!importer.isScoreTarget('finalLetter'));
@@ -514,6 +516,9 @@ describe('matching students', () => {
     const nos = c.students.map((s) => s.no);
     assert.equal(new Set(nos).size, nos.length);
     assert.deepEqual(['Fakeperson', 'Testname', 'Dummy'].map((l) => c.students.find((s) => s.lastName === l).no), [60, 61, 62]);
+    // A new student's preview lists the name fields as every view names them (UX-17).
+    assert.deepEqual(plan.items[0].changes.filter((x) => x.kind === 'info').map((x) => [x.field, x.newValue]).slice(0, 3),
+      [['No', '60'], ['Last Name', 'Fakeperson'], ['First Name', 'Ann']]);
   });
 
   test('summary rows under the data (review E2E-10) are skipped, not added as students', () => {
@@ -547,7 +552,7 @@ describe('matching students', () => {
     const c = course();
     const p = importer.plan(c, [['Test 1'], ['80']], 0, ['raw:a_t1'], {});
     assert.equal(p.items.length, 0);
-    assert.match(p.errors[0], /Map the name columns/);
+    assert.equal(p.errors[0], 'Map the name columns (Last Name and First Name, or Full Name) to match students by name.');
     assert.throws(() => importer.apply(c, p), /Map the name columns/);
     const q = importer.plan(c, [['Name', 'Test 1'], ['Student 01, Alpha', '80']], 0, ['fullName', 'raw:a_t1'], { matchBy: 'no' });
     assert.match(q.errors[0], /Map a column to No/);

@@ -1235,19 +1235,10 @@
     remap();
   }
 
-  /** The name columns as every view writes them (UX-17: "Last Name / First Name"), whatever the importer calls them. */
-  var NAME_TARGET_LABELS = { lastName: 'Last Name', firstName: 'First Name', fullName: 'Full Name ("Last, First" or "First Last")' };
-  var NAME_FIELD_LABELS = { 'Last name': 'Last Name', 'First name': 'First Name', 'Full name': 'Full Name' };
-
+  /** The mapping targets of the importer (it names the name columns as every view does, UX-17: "Last Name / First Name"). */
   function targetList(course) {
     var list = safeCall('importer', 'targetsFor', [course], []);
-    list = (Array.isArray(list) ? list : []).filter(function (t) { return t && typeof t.key === 'string'; }).map(function (t) {
-      if (!util.hasOwn(NAME_TARGET_LABELS, t.key) || t.label === NAME_TARGET_LABELS[t.key]) return t;
-      var c = {};
-      Object.keys(t).forEach(function (k) { c[k] = t[k]; });
-      c.label = NAME_TARGET_LABELS[t.key];
-      return c;
-    });
+    list = (Array.isArray(list) ? list : []).filter(function (t) { return t && typeof t.key === 'string'; });
     if (!list.some(function (t) { return t.key === 'ignore'; })) list.unshift({ key: 'ignore', label: 'Do not import' });
     return list;
   }
@@ -1798,7 +1789,7 @@
       var a = model.findAssessment(course, m[2]);
       if (a) return m[1] === 'raw' ? a.name : m[1] === 'weighted' ? a.name + ' (weighted)' : a.name + ': weeks late';
     }
-    return util.hasOwn(NAME_FIELD_LABELS, k) ? NAME_FIELD_LABELS[k] : k;
+    return k;
   }
 
   function valueHtml(v) {

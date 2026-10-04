@@ -544,9 +544,12 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   saves. When IndexedDB fails mid-session the data moves to localStorage with the IndexedDB stamp as its base.
 - `GT.store.state` (AppState), `GT.store.course()` (active course), `GT.store.results()` (memoized
   `calc.computeCourse` for the active course, invalidated on change).
-- `GT.store.transact(label, mutator, { source = 'edit', courseId, historyMode = 'diff'|'bulk'|'none' })`:
-  snapshot (course without history) → `mutator(course)` → history diff appended → undo push → redo clear →
-  `updatedAt` → debounced save → notify subscribers.
+- `GT.store.transact(label, mutator, { source = 'edit', courseId, historyMode = 'diff'|'bulk'|'none', note,
+  undoable = true, mergeKey })`: conflict guard (throws while read-only, below) → snapshot (course without
+  history) → `mutator(course)` (it throws: the course is restored and the error rethrown) → history diff
+  appended (or, with `mergeKey`, folded into the last entry, section 4) → undo push → redo clear →
+  `updatedAt` → debounced save → notify subscribers (`{ type: 'transact', …, merged }`). A transaction that
+  changes nothing is not logged, pushed or saved.
 - `GT.store.undo()`, `redo()`, `canUndo()`, `canRedo()` — per course, in memory, capped at 200 steps.
   Undo/redo append history entries (source `'undo'`/`'redo'`); history itself is never rolled back.
   Each undo step remembers its `historyMode`: undoing or redoing a `'bulk'` step (e.g. loading sample data)
@@ -564,8 +567,10 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
   `clearAll` throw a conflict error before changing anything; `undo`/`redo` return false (`canUndo` false);
   `annotateHistory` returns false; `flush`/`flushOnLeave` do nothing. UI-only settings (`setUi`, `setMeta`,
   `setActiveCourse`) still change on screen but are not saved. `GT.store.readOnly()` tells views. Only a
-  reload (`init`) leaves the state. UI-only changes are saved through the same compare-and-swap, so a theme or
-  tab click in a stale tab fails into the conflict instead of writing old data back.
+  reload (`init`) leaves the state (or a Delete all data that was already waiting for a running save when
+  the conflict came: `GT.storage.clear()` stores a new stamp, so the tab owns the stored data again).
+  UI-only changes are saved through the same compare-and-swap, so a theme or tab click in a stale tab fails
+  into the conflict instead of writing old data back.
 - `GT.store.hasUnsavedData()`: course data changed in this tab that is neither saved nor kept by an emergency
   copy (UI-only settings do not count; while read-only, every change not saved before the conflict counts).
   app.js warns before the page closes when it is true (failed save, saving paused, conflict) or when the
@@ -609,7 +614,16 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
     function twice is a no-op) on `pagehide`, on `visibilitychange` → hidden and on `beforeunload`, BEFORE
     `store.flushOnLeave()`. A view uses it to commit an edit that is still being typed (the grid's open
     editor, a focused Settings input). Views load before app.js, so they register on their first render,
-    guarded by `if (GT.app && typeof GT.app.registerLeaveHook === 'function')`.
+    once, guarded by `if (GT.app && typeof GT.app.registerLeaveHook === 'function')`. Registered hooks:
+    - Grades (`grid.js`): an open cell editor is committed the way a click elsewhere commits it (an open
+      drop-down list closes without a choice); the cell keeps the focus.
+    - Settings (`settings.js`): the focused field is committed the way leaving it commits it, when its value
+      changed (or differs from a refused value shown with its error).
+    - Attendance (`attendance.js`): a focused threshold, streak-rule, "Sessions held so far" or totals-only
+      input whose value changed is committed the way leaving the field commits it (the search box excluded).
+    - Students & Teams (`students.js`): every team-score input (or drop-down being browsed) whose value
+      differs from the saved one is committed; a conflict error (read-only tab) is ignored.
+    Each hook does nothing when nothing was typed, so leaving with no pending edit changes nothing.
   - Other tabs (BroadcastChannel `grade-tracker`): messages `{ type: 'hello' | 'here' | 'goodbye' | 'saved',
     id, stamp }`. `saved` (after every successful save, with the new stamp) makes a tab whose stamp differs
     run `store.checkConflict()`; `goodbye` (on `pagehide`) removes that tab from the "also open in another
@@ -634,6 +648,10 @@ oldValue, newValue, note }` — values are display strings (`''` = empty), names
 ### 6.1 Final grades in the UI (STAGE2B, DECISIONS 2, 5–8)
 
 - **Grades grid** (`js/ui/grid.js`):
+  - Rendering (CODE-5, E2E-7): every row is built as parts (strings). When the header markup and the rows in
+    order are the same as last time and no editor is open, only the cells, team rows and footer whose
+    markup changed are patched in place, so focus, the selection and the ▾ button stay; any other change
+    (columns, order, grouping, filter) rebuilds the table. Cells are focused with `preventScroll`.
   - Columns: "Suggested" (read-only `r.letter` from the cutoffs, with the placeholder badge) and "Final
     letter" (drop-down of `model.scaleLetters` plus "(none)"; markers: a dot when `letterDiffers`, a warning
     icon for a student in `orderIssues`, red when `finalLetterValid` is false).
@@ -814,7 +832,24 @@ Off mode: `summary()` returns `null`. Switching modes never deletes records, tot
   F per syllabus", "3 in a row: 1 letter drop"; "(warning only)" is in screen-reader text, the tooltip, the
   header and the Warnings card). Threshold highlights: `.over` with the tooltip "Above the unexcused-absence
   threshold (N)" (Total: the total-absence threshold). Footer: per-session counts over active students.
-  The body is one innerHTML string (`lastRenderMs()` measures it).
+- Rendering (CODE-5): a full build writes the header, the body and the footer as markup (`lastRenderMs()`
+  measures the render). After a mark, an undo or a roll-call mark, when the rows, the sessions, the summary
+  setting, the thresholds and the session headers are unchanged and at most `PATCH_MIN_CELLS` (600) or a
+  quarter of the mark cells differ, the grid is **patched**: only the changed mark cells, the row classes,
+  the summary cells and the header and footer cells whose content changed are written; the body rows stay
+  the same elements. A changed No, name or status, a search, another session list or a larger change
+  rebuilds it. The table keeps the keyboard focus (`aria-activedescendant` on `#att-active`).
+- **Row windowing for large classes**: with more than `VIRT_MIN_ROWS` (120) rows in the grid, only the rows
+  near the visible part are in the DOM: the window is the visible rows plus `WIN_PAD` (30) rows above and
+  below, between two spacer rows (`tr.att-pad`, `aria-hidden`) whose heights (rows × the measured row
+  height) keep the scroll bar and every position true. Scrolling within `WIN_EDGE` (10) rows of either end of
+  the window moves it (one `requestAnimationFrame` per scroll burst); keyboard moves and jumps
+  (`navigate('attendance', { studentId })`, Ctrl+End) move it to the active row first. Selections and
+  ranges work on the data, not the DOM: a range over rows outside the window sets every active student in
+  it (withdrawn rows skipped) and is decorated when those rows are shown; `aria-activedescendant` is removed
+  while the active cell is outside the window. `beforeprint` renders every row and `afterprint` restores the
+  window, so printing shows the whole class. The real classes (59 and 10 students) are never windowed. The
+  Warnings card's items use `content-visibility: auto` for the same reason.
 - Session manager (dialog): list with mark counts, add (a second session on a date needs a label), edit,
   delete, and "Generate…" prefilled with Fall 2026 Tue/Thu (2026-09-03 to 2026-12-08, skipping 11-24 and
   11-26), merged through `mergeSessions(existing, generated, course)`.
@@ -919,13 +954,15 @@ values (0–5 in steps of 0.5); counted as entered"; a manual letter "Final lett
 a plain (static) Letter Grade suggestion "Suggestion from the cutoffs: B+" and, on a second line, "No final letter
 assigned yet." (review V4R2-1: the importer compares the cell with the letter in its note, 9.1, so a letter
 the instructor types over it in the spreadsheet is recognized; typing into a cell keeps its note);
+a withdrawn student's "W" in Letter Grade "Withdrawn: no letter grade" (8.3);
 a Total whose formula holds fixed numbers (items with neither column exported) "Fixed numbers in this formula:
 Project II 19.4, Class/Project Participation 4; curve +2.5." (the Total header note names those items too).
 Late notes use the penalty of 8.3 also for an empty or invalid score ("2 weeks late, −20 points").
 Header notes: raw "Out of 100. Team-graded: …"; weighted "= raw ÷ max × weight (Project I ÷ 100 × 10). Late
 work: …"; Total "= sum of weighted + curve (2.5), rounding: nearest 0.01. …"; Letter Grade and Suggested
 the cutoff list ("A+ ≥ 97, A ≥ 93, …, F below 60") plus "PLACEHOLDER: not confirmed by the instructor" while
-the `letterScale` placeholder is unconfirmed.
+the `letterScale` placeholder is unconfirmed; Letter Grade adds " W: withdrawn, no letter grade." when a
+withdrawn student without a final letter is exported.
 
 Widths: `clamp(max(header length, longest value) + 2, 5, 40)` (numbers measured as displayed with the
 course's decimals), names at least 14. Tints by assessment position, header and body of its raw, weighted
@@ -967,6 +1004,12 @@ as it does in the app, where the entry keeps its weeks late. Every literal is wr
   "Final letter assigned by the instructor", suggestions with the note "Suggestion from the cutoffs:
   <letter>" (8.2); when no final letter exists yet, the nested-IF formula (without a Total column: the static
   suggestion with that note). The default preset keeps this single letter column.
+- **Withdrawn students in Letter Grade** (review E2E-6): a withdrawn student **without** a final letter gets
+  the static value `"W"` (`exporter.WITHDRAWN_LETTER`) with the note "Withdrawn: no letter grade"
+  (`WITHDRAWN_LETTER_NOTE`), never the cutoff formula or the suggestion, in the .xlsx and the CSV alike, as
+  on the Summary tab and in the Grades grid. A withdrawn student who has a final letter keeps it (the rules
+  above). The Suggested Letter column is unchanged (the formula, as for everyone). On import, 9.1 and 9.3
+  read this "W" back as "no letter".
 - Rank, percentile, difference from the average, missing scores and the attendance columns are static.
 
 Parity is tested (`tests/exporter.test.js`): for the SE4351 and SE6362 samples in every rounding mode, with
@@ -1041,7 +1084,9 @@ needed). Tests: `tests/importer.test.js`.
   (`editedLetterCells`, review V4R2-1): a cell whose text is no longer the letter of its "Suggestion from the
   cutoffs: <letter>" note (case, spaces and dash variants ignored; typing into a cell keeps its note), and a
   plain value below row 1 in a column of letter formulas (formulas with a text result) or of such notes, i.e.
-  typed or pasted over the formula or over the noted cell. A letter column with such cells is left out of
+  typed or pasted over the formula or over the noted cell. A cell with the note "Withdrawn: no letter grade"
+  (8.3) is listed only when it no longer says "W" (a letter typed over it); its "W" is not a letter, and the
+  note alone does not make the column a column of suggestions. A letter column with such cells is left out of
   `formulaColumns`, so `guessMapping` maps it; its formulas and unchanged suggestions stay suggestions. A
   suggestion left unchanged after a score was changed in the spreadsheet (the recalculated Total no longer
   gives it) is still recognized as the export's suggestion, and so are the file's suggestions when the
@@ -1203,6 +1248,14 @@ workbook written by Grade Tracker).
   the suggestion the file's letter came from; so a total that differs here (weeks late left out, another
   curve, or a file without score columns such as "Names, total and letter") never turns the old suggestion
   into a final letter, and a final letter that happens to equal the new suggestion is kept.
+- **"W" of a withdrawn student** (review E2E-6, 8.3): in a Grade Tracker letter column (the cases above:
+  `finalLetterCells` given, or the "Letter Grade" heuristics), a cell that says "W", is not in
+  `finalLetterCells` and is on a withdrawn student's row (its Status cell says Withdrawn or, without a Status
+  column, the matched student is withdrawn) reads as an empty cell: no final letter, no "not a letter of the
+  scale" issue. Each is counted in `lettersWithdrawn`, with one note ("Column "Letter Grade": "W" marks 2
+  withdrawn students without a letter grade, so they are read as empty (no final letter)."). The empty-cell
+  rule applies as for any empty letter cell, so importing an export back changes nothing. A "W" on an active
+  student's row, or in a column that is not from Grade Tracker, is checked against the scale as usual.
 - **Letters in the other letter columns** (review V4R3-1): a Grade Tracker file can have several letter
   columns (the "Everything" preset: "Letter Grade", "Suggested Letter (cutoffs)" and "Final Letter"), and only
   one is mapped ("Final Letter" wins). The cells of `finalLetterCells` in a column that is not read (letters
@@ -1258,11 +1311,11 @@ workbook written by Grade Tracker).
 Result: `{ items: [{ rowIndex, action: 'update' | 'new' | 'skip', reason?, studentId?, name, changes: [{
 field, oldValue, newValue, kind, blocked?, reason?, override?, invalid?, outOfRange?, notOnList? }], issues:
 [{ field, value, message }] }], counts: { update, new, skip, changes, overrides, invalid, blocked, notOnList,
-lettersSkipped, lettersAsSuggestion, lettersFromOtherColumn, lettersNotImported, duplicateNos, teamsCreated,
-scoresEmptied, kept, unchanged, propagated, totalsDiffer },
+lettersSkipped, lettersAsSuggestion, lettersFromOtherColumn, lettersNotImported, lettersWithdrawn, duplicateNos,
+teamsCreated, scoresEmptied, kept, unchanged, propagated, totalsDiffer },
 propagated: [{ studentId, name, changes }], notes, errors, options, finalized, headerIndex, columns,
-attendanceMapped }`. `rowIndex` is the index in `rows` (row number − 1). Change fields: No, Last name, First
-name, Team, Status, Notes, "<assessment>", "<assessment>: weeks late", Final letter, Unexcused absences,
+attendanceMapped }`. `rowIndex` is the index in `rows` (row number − 1). Change fields: No, Last Name, First
+Name, Team, Status, Notes, "<assessment>", "<assessment>: weeks late", Final letter, Unexcused absences,
 Excused absences; a change may carry `emptiedByMove`. `overrides` counts members who get a new override
 (team-graded columns and team moves); `propagated` lists students missing from the file whose score changes
 through a new team score.
